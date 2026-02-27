@@ -2687,38 +2687,263 @@ function AdminEssayExams({ toast }) {
 }
 
 // ── Admin Handouts ───────────────────────────────────────────────────
+// ─── Shared file-upload helpers ──────────────────────────────────────
+const FILE_TYPES = {
+  "application/pdf":                                    { ext:"pdf",  icon:"📄", label:"PDF"   },
+  "application/msword":                                 { ext:"doc",  icon:"📝", label:"Word"  },
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                                                        { ext:"docx", icon:"📝", label:"Word"  },
+  "application/vnd.ms-powerpoint":                      { ext:"ppt",  icon:"📊", label:"PPT"   },
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+                                                        { ext:"pptx", icon:"📊", label:"PPT"   },
+  "image/jpeg":                                         { ext:"jpg",  icon:"🖼️", label:"Image" },
+  "image/png":                                          { ext:"png",  icon:"🖼️", label:"Image" },
+  "image/gif":                                          { ext:"gif",  icon:"🖼️", label:"Image" },
+  "image/webp":                                         { ext:"webp", icon:"🖼️", label:"Image" },
+};
+const ACCEPTED_TYPES = Object.keys(FILE_TYPES).join(",");
+const fileIcon  = (mime) => FILE_TYPES[mime]?.icon  || "📎";
+const fileLabel = (mime) => FILE_TYPES[mime]?.label || "File";
+
+function readFileAsDataURL(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload  = e => res(e.target.result);
+    r.onerror = () => rej(new Error("Read failed"));
+    r.readAsDataURL(file);
+  });
+}
+
+// FileViewer: renders PDF in iframe, images inline, others as download
+function FileViewer({ handout }) {
+  if (!handout.fileData) {
+    if (handout.fileUrl) return (
+      <div style={{textAlign:"center",padding:20}}>
+        <a href={handout.fileUrl} target="_blank" rel="noreferrer"
+          style={{background:"var(--accent)",color:"white",padding:"10px 22px",borderRadius:10,textDecoration:"none",fontWeight:700}}>
+          🔗 Open Link
+        </a>
+      </div>
+    );
+    return <div style={{fontSize:13,color:"var(--text3)",textAlign:"center",padding:30}}>No file attached.</div>;
+  }
+  const mime = handout.fileMime || "";
+  const isImage = mime.startsWith("image/");
+  const isPdf   = mime === "application/pdf";
+  return (
+    <div>
+      <div style={{background:"var(--bg4)",borderRadius:10,padding:"8px 14px",marginBottom:10,display:"flex",alignItems:"center",gap:10,fontSize:12,color:"var(--text3)"}}>
+        <span style={{fontSize:18}}>{fileIcon(mime)}</span>
+        <span style={{flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{handout.fileName}</span>
+        <a href={handout.fileData} download={handout.fileName}
+          style={{background:"var(--accent)",color:"white",padding:"5px 14px",borderRadius:8,textDecoration:"none",fontSize:12,fontWeight:700,flexShrink:0}}
+          onClick={e=>e.stopPropagation()}>
+          ⬇️ Download
+        </a>
+      </div>
+      {isPdf && (
+        <iframe src={handout.fileData} title={handout.title}
+          style={{width:"100%",height:"65vh",border:"1px solid var(--border)",borderRadius:10,display:"block"}} />
+      )}
+      {isImage && (
+        <img src={handout.fileData} alt={handout.title}
+          style={{width:"100%",maxHeight:"65vh",objectFit:"contain",borderRadius:10,border:"1px solid var(--border)"}} />
+      )}
+      {!isPdf && !isImage && (
+        <div style={{background:"var(--bg4)",borderRadius:10,padding:"40px 20px",textAlign:"center",color:"var(--text3)"}}>
+          <div style={{fontSize:48,marginBottom:12}}>{fileIcon(mime)}</div>
+          <div style={{fontSize:14,marginBottom:16}}>Preview not available for {fileLabel(mime)} files</div>
+          <a href={handout.fileData} download={handout.fileName}
+            style={{background:"var(--accent)",color:"white",padding:"10px 22px",borderRadius:10,textDecoration:"none",fontWeight:700}}>
+            ⬇️ Download to view
+          </a>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// UploadDropzone: reusable drag-and-drop file picker
+function UploadDropzone({ fileData, fileName, fileMime, onChange, uploading }) {
+  const [drag, setDrag] = useState(false);
+  const handleFile = async (file) => {
+    if (!FILE_TYPES[file.type]) return onChange(null, null, null, "Unsupported file type. Accepted: PDF, Word, PPT, Images");
+    if (file.size > 15 * 1024 * 1024) return onChange(null, null, null, "File must be under 15MB");
+    try {
+      const data = await readFileAsDataURL(file);
+      onChange(data, file.name, file.type, null);
+    } catch { onChange(null, null, null, "Failed to read file"); }
+  };
+  return (
+    <label
+      onDragOver={e=>{e.preventDefault();setDrag(true);}}
+      onDragLeave={()=>setDrag(false)}
+      onDrop={e=>{e.preventDefault();setDrag(false);const f=e.dataTransfer.files[0];if(f)handleFile(f);}}
+      style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:8,
+        padding:"20px 14px",border:`2px dashed ${drag?"var(--accent)":fileData?"var(--success)":"var(--border2)"}`,
+        borderRadius:12,cursor:"pointer",background:drag?"rgba(62,142,149,.08)":fileData?"rgba(74,222,128,.06)":"var(--bg4)",
+        transition:"all .2s",minHeight:90,textAlign:"center"}}>
+      {uploading ? (
+        <><span style={{fontSize:28}}>⏳</span><span style={{fontSize:12,color:"var(--text3)"}}>Processing…</span></>
+      ) : fileData ? (
+        <><span style={{fontSize:28}}>{fileIcon(fileMime)}</span>
+          <span style={{fontSize:13,color:"var(--success)",fontWeight:600,wordBreak:"break-all"}}>{fileName}</span>
+          <span style={{fontSize:11,color:"var(--text3)"}}>Click to change</span>
+        </>
+      ) : (
+        <><span style={{fontSize:28}}>📁</span>
+          <span style={{fontSize:13,color:"var(--text3)"}}>Drag & drop or click to upload</span>
+          <span style={{fontSize:11,color:"var(--text3)"}}>PDF · Word · PPT · Images · max 15 MB</span>
+        </>
+      )}
+      <input type="file" accept={ACCEPTED_TYPES} style={{display:"none"}} onChange={e=>{const f=e.target.files[0];if(f)handleFile(f);}} />
+    </label>
+  );
+}
+
 function AdminHandouts({ toast }) {
   const [handouts, setHandouts] = useHydratedShared("nv-handouts", "handouts", []);
   const classes = useShared("classes", DEFAULT_CLASSES);
+  const [showModal, setShowModal] = useState(false);
+  const [edit, setEdit] = useState(null);
+  const [viewItem, setViewItem] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [form, setForm] = useState({title:"",description:"",classId:"",course:""});
+  const [fileData, setFileData] = useState(null);
+  const [fileName, setFileName] = useState("");
+  const [fileMime, setFileMime] = useState("");
 
-  const del = (id) => { const u=handouts.filter(h=>h.id!==id); setHandouts(u); saveShared("handouts",u); toast("Deleted","success"); };
-  const clearAll = () => { if(!confirm("Delete ALL handouts?"))return; setHandouts([]); saveShared("handouts",[]); toast("All handouts cleared","warn"); };
+  const openAdd = () => {
+    setEdit(null); setForm({title:"",description:"",classId:"",course:""});
+    setFileData(null); setFileName(""); setFileMime(""); setShowModal(true);
+  };
+  const openEdit = (h) => {
+    setEdit(h.id); setForm({title:h.title,description:h.description||"",classId:h.classId||"",course:h.course||""});
+    setFileData(h.fileData||null); setFileName(h.fileName||""); setFileMime(h.fileMime||""); setShowModal(true);
+  };
+
+  const handleFile = (data, name, mime, err) => {
+    if (err) return toast(err, "error");
+    setFileData(data); setFileName(name); setFileMime(mime);
+  };
+
+  const save = () => {
+    if (!form.title.trim()) return toast("Title required", "error");
+    const base = { ...form, id: edit || Date.now(), uploadedBy:"admin", date: new Date().toLocaleDateString(),
+      fileData: fileData||null, fileName: fileName||"", fileMime: fileMime||"" };
+    const u = edit ? handouts.map(h=>h.id===edit?base:h) : [...handouts, base];
+    setHandouts(u); setShowModal(false);
+    toast(edit ? "Handout updated!" : "Handout uploaded!", "success");
+  };
+
+  const del = (id) => {
+    if (!confirm("Delete this handout?")) return;
+    const u = handouts.filter(h=>h.id!==id); setHandouts(u); toast("Deleted","success");
+  };
+
+  const selCls = classes.find(c=>c.id===form.classId);
 
   return (
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
         <div className="sec-title">📄 All Handouts ({handouts.length})</div>
-        {handouts.length>0&&<button className="btn btn-danger btn-sm" onClick={clearAll}>🗑️ Clear All</button>}
+        <div style={{display:"flex",gap:8}}>
+          <button className="btn btn-accent" onClick={openAdd}>+ Upload Handout</button>
+          {handouts.length>0&&<button className="btn btn-danger btn-sm" onClick={()=>{if(!confirm("Delete ALL handouts?"))return;setHandouts([]);toast("All cleared","warn");}}>🗑️ Clear All</button>}
+        </div>
       </div>
-      {handouts.length===0?<div style={{textAlign:"center",padding:"40px",color:"var(--text3)",fontFamily:"'DM Mono',monospace",fontSize:13}}>No handouts uploaded by users yet.</div>:(
-        <div className="card" style={{padding:0,overflow:"hidden"}}>
-          <table className="tbl">
-            <thead><tr><th>Title</th><th>Class</th><th>Course</th><th>Date</th><th>Action</th></tr></thead>
-            <tbody>
-              {handouts.map(h=>{
-                const c=classes.find(x=>x.id===h.classId);
-                return (
-                  <tr key={h.id}>
-                    <td style={{fontWeight:600}}>{h.title}</td>
-                    <td><span className="tag tag-accent">{c?.label||"General"}</span></td>
-                    <td style={{fontSize:12,color:"var(--text3)"}}>{h.course||"—"}</td>
-                    <td style={{fontSize:12,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{h.date}</td>
-                    <td><button className="btn btn-sm btn-danger" onClick={()=>del(h.id)}>🗑️</button></td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+
+      {handouts.length===0 ? (
+        <div style={{textAlign:"center",padding:"50px 20px",color:"var(--text3)"}}>
+          <div style={{fontSize:48,marginBottom:12}}>📭</div>
+          <div style={{fontFamily:"'DM Mono',monospace",fontSize:13}}>No handouts yet. Upload the first one!</div>
+        </div>
+      ) : (
+        <div className="grid2">
+          {handouts.map(h=>{
+            const c=classes.find(x=>x.id===h.classId);
+            return (
+              <div key={h.id} className="card" style={{cursor:"pointer",borderLeft:`3px solid ${c?.color||"var(--accent)"}`}}
+                onClick={()=>setViewItem(h)}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                    {c&&<span className="tag tag-accent">{c.label}</span>}
+                    {h.course&&<span className="tag">{h.course}</span>}
+                    {h.fileData&&<span className="tag" style={{borderColor:"var(--accent2)",color:"var(--accent2)"}}>{fileIcon(h.fileMime)} {fileLabel(h.fileMime)}</span>}
+                  </div>
+                  <div style={{display:"flex",gap:4,flexShrink:0}} onClick={e=>e.stopPropagation()}>
+                    <button className="btn btn-sm" onClick={()=>openEdit(h)}>✏️</button>
+                    <button className="btn btn-sm btn-danger" onClick={()=>del(h.id)}>🗑️</button>
+                  </div>
+                </div>
+                <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:14,marginBottom:4}}>{h.title}</div>
+                {h.description&&<div style={{fontSize:12,color:"var(--text2)",marginBottom:6,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden"}}>{h.description}</div>}
+                {!h.fileData&&!h.description&&<div style={{fontSize:12,color:"var(--text3)"}}>Text notes</div>}
+                <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:8}}>
+                  {h.date} · by {h.uploadedBy?.split("@")[0]||"admin"}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {showModal&&(
+        <div className="modal-overlay" onClick={()=>setShowModal(false)}>
+          <div className="modal" style={{maxWidth:520}} onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">{edit?"Edit Handout":"Upload Handout"}</div>
+              <button className="modal-close" onClick={()=>setShowModal(false)}>✕</button>
+            </div>
+            <label className="lbl">Title *</label>
+            <input className="inp" placeholder="e.g. Week 3 – Pharmacokinetics" value={form.title} onChange={e=>setForm({...form,title:e.target.value})} />
+            <label className="lbl">Description</label>
+            <textarea className="inp" rows={2} style={{resize:"vertical"}} value={form.description} onChange={e=>setForm({...form,description:e.target.value})} />
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <div>
+                <label className="lbl">Class</label>
+                <select className="inp" value={form.classId} onChange={e=>setForm({...form,classId:e.target.value,course:""})}>
+                  <option value="">All classes</option>
+                  {classes.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="lbl">Course</label>
+                <select className="inp" value={form.course} onChange={e=>setForm({...form,course:e.target.value})} disabled={!selCls}>
+                  <option value="">General</option>
+                  {(selCls?.courses||[]).map(c=><option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+            </div>
+            <label className="lbl" style={{marginTop:4}}>Attach File (optional)</label>
+            <UploadDropzone fileData={fileData} fileName={fileName} fileMime={fileMime} onChange={handleFile} uploading={uploading} />
+            <div style={{display:"flex",gap:8,marginTop:14}}>
+              <button className="btn btn-accent" style={{flex:1}} onClick={save}>
+                {edit?"💾 Save Changes":"📤 Upload & Publish"}
+              </button>
+              <button className="btn" onClick={()=>setShowModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewItem&&(
+        <div className="modal-overlay" onClick={()=>setViewItem(null)}>
+          <div className="modal" style={{maxWidth:800,width:"95vw"}} onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">{viewItem.title}</div>
+              <button className="modal-close" onClick={()=>setViewItem(null)}>✕</button>
+            </div>
+            <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+              {classes.find(c=>c.id===viewItem.classId)&&<span className="tag tag-accent">{classes.find(c=>c.id===viewItem.classId).label}</span>}
+              {viewItem.course&&<span className="tag">{viewItem.course}</span>}
+              <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginLeft:"auto"}}>
+                {viewItem.date} · by {viewItem.uploadedBy?.split("@")[0]||"admin"}
+              </div>
+            </div>
+            {viewItem.description&&<div style={{fontSize:13,color:"var(--text2)",marginBottom:14,lineHeight:1.6}}>{viewItem.description}</div>}
+            <FileViewer handout={viewItem} />
+          </div>
         </div>
       )}
     </div>
@@ -2782,54 +3007,49 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
   const classes = useShared("classes", DEFAULT_CLASSES);
   const [handouts, setHandouts] = useHydratedShared("nv-handouts", "handouts", []);
   const [showAdd, setShowAdd] = useState(false);
-  const [title, setTitle] = useState(""); const [note, setNote] = useState("");
-  const [selClass, setSelClass] = useState(selectedClass?.id||""); const [selCourse, setSelCourse] = useState("");
-  const [filter, setFilter] = useState(""); const [viewItem, setViewItem] = useState(null);
-  const [pdfFile, setPdfFile] = useState(null); const [pdfName, setPdfName] = useState("");
-  const [uploadType, setUploadType] = useState("text"); // "text" | "pdf"
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [selClass, setSelClass] = useState(selectedClass?.id||"");
+  const [selCourse, setSelCourse] = useState("");
+  const [filter, setFilter] = useState("");
+  const [viewItem, setViewItem] = useState(null);
+  const [fileData, setFileData] = useState(null);
+  const [fileName, setFileName] = useState("");
+  const [fileMime, setFileMime] = useState("");
+  const [uploading] = useState(false);
 
   const pushNotification = (item) => {
     const notifs = ls("nv-notifications", []);
-    const notif = {
-      id: Date.now(),
-      type: "handout",
-      title: `New handout: ${item.title}`,
-      body: `${currentUser.split("@")[0]} added a new ${item.pdfName?"PDF ":""}handout${item.course?` in ${item.course}`:""}`,
-      from: currentUser,
-      date: new Date().toLocaleDateString(),
-      time: new Date().toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}),
-      read: false,
-      handoutId: item.id,
-    };
-    saveMyData("notifications","nv-notifications",[notif, ...notifs]);
+    saveMyData("notifications","nv-notifications",[{
+      id:Date.now(), type:"handout",
+      title:`New handout: ${item.title}`,
+      body:`${currentUser.split("@")[0]} uploaded ${item.fileName?`a ${fileLabel(item.fileMime)} file`:"notes"}${item.course?` for ${item.course}`:""}`,
+      from:currentUser, date:new Date().toLocaleDateString(),
+      time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),
+      read:false, handoutId:item.id
+    }, ...notifs]);
   };
 
-  const handlePdfChange = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    if (file.type !== "application/pdf") return toast("Please select a PDF file", "error");
-    if (file.size > 10 * 1024 * 1024) return toast("PDF must be under 10MB", "error");
-    const reader = new FileReader();
-    reader.onload = (ev) => { setPdfFile(ev.target.result); setPdfName(file.name); };
-    reader.readAsDataURL(file);
+  const handleFile = (data, name, mime, err) => {
+    if (err) return toast(err, "error");
+    setFileData(data); setFileName(name); setFileMime(mime);
   };
 
   const save = () => {
     if (!title.trim()) return toast("Enter a title","error");
-    if (uploadType === "pdf" && !pdfFile) return toast("Select a PDF file","error");
     const item = {
-      id: Date.now(), title, note, classId: selClass, course: selCourse,
-      date: new Date().toLocaleDateString(), uploadedBy: currentUser,
-      ...(uploadType === "pdf" ? { pdfData: pdfFile, pdfName } : {})
+      id:Date.now(), title, description, classId:selClass, course:selCourse,
+      date:new Date().toLocaleDateString(), uploadedBy:currentUser,
+      fileData:fileData||null, fileName:fileName||"", fileMime:fileMime||""
     };
-    const u=[...handouts, item]; setHandouts(u); saveShared("handouts",u);
+    const u=[...handouts,item]; setHandouts(u);
     pushNotification(item);
-    setTitle(""); setNote(""); setPdfFile(null); setPdfName(""); setUploadType("text");
+    setTitle(""); setDescription(""); setFileData(null); setFileName(""); setFileMime("");
     setShowAdd(false); toast("Handout published! Students notified. ✅","success");
   };
 
-  const del=(id)=>{const u=handouts.filter(h=>h.id!==id);setHandouts(u);saveShared("handouts",u);toast("Deleted","info");};
-  const filtered=handouts.filter(h=>h.title.toLowerCase().includes(filter.toLowerCase())||h.course?.toLowerCase().includes(filter.toLowerCase()));
+  const del=(id)=>{ setHandouts(handouts.filter(h=>h.id!==id)); toast("Deleted","info"); };
+  const filtered=handouts.filter(h=>h.title.toLowerCase().includes(filter.toLowerCase())||(h.course||"").toLowerCase().includes(filter.toLowerCase()));
   const cls=classes.find(c=>c.id===selClass);
 
   return (
@@ -2838,32 +3058,42 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
         <div><div className="sec-title">📄 All Handouts</div><div className="sec-sub">{handouts.length} handouts stored</div></div>
         {isLecturer && <button className="btn btn-accent" onClick={()=>setShowAdd(true)}>+ Upload Handout</button>}
       </div>
-      <div className="search-wrap"><span className="search-ico">🔍</span><input placeholder="Search handouts..." value={filter} onChange={e=>setFilter(e.target.value)} /></div>
+      <div className="search-wrap"><span className="search-ico">🔍</span><input placeholder="Search handouts…" value={filter} onChange={e=>setFilter(e.target.value)} /></div>
+
       {filtered.length===0 ? (
-        <div style={{textAlign:"center",padding:"60px 20px",color:"var(--text3)"}}><div style={{fontSize:48,marginBottom:12}}>📭</div><div style={{fontFamily:"'DM Mono',monospace",fontSize:13}}>No handouts yet!</div></div>
+        <div style={{textAlign:"center",padding:"60px 20px",color:"var(--text3)"}}>
+          <div style={{fontSize:48,marginBottom:12}}>📭</div>
+          <div style={{fontFamily:"'DM Mono',monospace",fontSize:13}}>No handouts yet!</div>
+        </div>
       ) : (
         <div className="grid2">
           {filtered.map(h=>{
             const c=classes.find(x=>x.id===h.classId);
             return (
-              <div key={h.id} className="card" style={{cursor:"pointer"}} onClick={()=>setViewItem(h)}>
+              <div key={h.id} className="card" style={{cursor:"pointer",borderLeft:`3px solid ${c?.color||"var(--accent)"}`}} onClick={()=>setViewItem(h)}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
-                  <div style={{display:"flex",gap:6,alignItems:"center"}}>
-                    <div className="tag tag-accent">{c?.label||"General"}</div>
-                    {h.pdfName && <span className="tag" style={{borderColor:"var(--danger)",color:"var(--danger)",background:"rgba(248,113,113,.08)"}}>📄 PDF</span>}
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                    {c&&<div className="tag tag-accent">{c.label}</div>}
+                    {h.fileData&&<span className="tag" style={{borderColor:"var(--accent2)",color:"var(--accent2)"}}>{fileIcon(h.fileMime)} {fileLabel(h.fileMime)}</span>}
+                    {/* legacy PDF support */}
+                    {!h.fileData&&h.pdfName&&<span className="tag" style={{borderColor:"var(--danger)",color:"var(--danger)"}}>📄 PDF</span>}
                   </div>
                   {isLecturer && <button className="btn btn-sm btn-danger" onClick={e=>{e.stopPropagation();del(h.id);}}>✕</button>}
                 </div>
                 <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15,marginBottom:4}}>{h.title}</div>
                 {h.course&&<div style={{fontSize:11,color:"var(--text3)",marginBottom:6}}>{h.course}</div>}
-                {h.pdfName ? (
+                {h.fileData ? (
+                  <div style={{fontSize:12,color:"var(--text3)",display:"flex",alignItems:"center",gap:6}}>
+                    {fileIcon(h.fileMime)} {h.fileName}
+                  </div>
+                ) : h.pdfName ? (
                   <div style={{fontSize:12,color:"var(--text3)",display:"flex",alignItems:"center",gap:6}}>📎 {h.pdfName}</div>
                 ) : (
-                  <div style={{fontSize:12,color:"var(--text2)",lineHeight:1.5,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden"}}>{h.note||"No content"}</div>
+                  <div style={{fontSize:12,color:"var(--text2)",lineHeight:1.5,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden"}}>{h.note||h.description||"No content"}</div>
                 )}
                 <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:8,display:"flex",justifyContent:"space-between"}}>
                   <span>{h.date}</span>
-                  {h.uploadedBy && <span>by {h.uploadedBy.split("@")[0]}</span>}
+                  {h.uploadedBy&&<span>by {h.uploadedBy.split("@")[0]}</span>}
                 </div>
               </div>
             );
@@ -2871,46 +3101,39 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
         </div>
       )}
 
-      {showAdd && (
+      {/* Upload Modal (lecturers only) */}
+      {showAdd&&(
         <div className="modal-overlay" onClick={()=>setShowAdd(false)}>
-          <div className="modal" onClick={e=>e.stopPropagation()}>
+          <div className="modal" style={{maxWidth:520}} onClick={e=>e.stopPropagation()}>
             <div className="modal-head"><div className="modal-title">Upload Handout</div><button className="modal-close" onClick={()=>setShowAdd(false)}>✕</button></div>
-            <label className="lbl">Title</label>
+            <label className="lbl">Title *</label>
             <input className="inp" placeholder="e.g. Chapter 3 Notes" value={title} onChange={e=>setTitle(e.target.value)} />
-            <label className="lbl">Class</label>
-            <select className="inp" value={selClass} onChange={e=>{setSelClass(e.target.value);setSelCourse("");}}>
-              <option value="">Select class...</option>
-              {classes.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
-            </select>
-            {cls&&(<><label className="lbl">Course</label>
-            <select className="inp" value={selCourse} onChange={e=>setSelCourse(e.target.value)}>
-              <option value="">Select course...</option>
-              {cls.courses.map(c=><option key={c} value={c}>{c}</option>)}
-            </select></>)}
-            <label className="lbl">Content Type</label>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:13}}>
-              {["text","pdf"].map(t=>(
-                <div key={t} onClick={()=>setUploadType(t)} style={{padding:"10px",border:`1px solid ${uploadType===t?"var(--accent)":"var(--border)"}`,borderRadius:9,cursor:"pointer",textAlign:"center",background:uploadType===t?"rgba(62,142,149,.12)":"transparent",fontSize:13,color:uploadType===t?"var(--accent)":"var(--text3)",transition:"all .2s"}}>
-                  {t==="text"?"📝 Text Notes":"📄 PDF File"}
-                </div>
-              ))}
-            </div>
-            {uploadType === "text" ? (
-              <><label className="lbl">Content</label>
-              <textarea className="inp" rows={5} style={{resize:"vertical"}} placeholder="Paste or type notes..." value={note} onChange={e=>setNote(e.target.value)} /></>
-            ) : (
-              <div style={{marginBottom:13}}>
-                <label className="lbl">PDF File (max 10MB)</label>
-                <label style={{display:"flex",alignItems:"center",gap:10,padding:"12px 14px",border:"2px dashed var(--border2)",borderRadius:10,cursor:"pointer",background:"var(--bg4)",transition:"all .2s"}}>
-                  <span style={{fontSize:24}}>📄</span>
-                  <div style={{flex:1}}>
-                    {pdfName ? <span style={{color:"var(--accent)",fontSize:13}}>{pdfName}</span> : <span style={{color:"var(--text3)",fontSize:13}}>Click to select PDF...</span>}
-                  </div>
-                  <input type="file" accept=".pdf" style={{display:"none"}} onChange={handlePdfChange} />
-                </label>
+            <label className="lbl">Description</label>
+            <textarea className="inp" rows={2} style={{resize:"vertical"}} value={description} onChange={e=>setDescription(e.target.value)} />
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <div>
+                <label className="lbl">Class</label>
+                <select className="inp" value={selClass} onChange={e=>{setSelClass(e.target.value);setSelCourse("");}}>
+                  <option value="">Select class…</option>
+                  {classes.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
+                </select>
               </div>
+              <div>
+                <label className="lbl">Course</label>
+                <select className="inp" value={selCourse} onChange={e=>setSelCourse(e.target.value)} disabled={!cls}>
+                  <option value="">General</option>
+                  {(cls?.courses||[]).map(c=><option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+            </div>
+            <label className="lbl" style={{marginTop:4}}>Attach File</label>
+            <UploadDropzone fileData={fileData} fileName={fileName} fileMime={fileMime} onChange={handleFile} uploading={uploading} />
+            {fileData&&(
+              <button className="btn btn-sm btn-danger" style={{marginTop:6}} onClick={()=>{setFileData(null);setFileName("");setFileMime("");}}>
+                ✕ Remove file
+              </button>
             )}
-            <div style={{display:"flex",gap:8}}>
+            <div style={{display:"flex",gap:8,marginTop:14}}>
               <button className="btn btn-accent" style={{flex:1}} onClick={save}>📤 Publish & Notify Students</button>
               <button className="btn" onClick={()=>setShowAdd(false)}>Cancel</button>
             </div>
@@ -2918,7 +3141,8 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
         </div>
       )}
 
-      {viewItem && (
+      {/* View Modal */}
+      {viewItem&&(
         <div className="modal-overlay" onClick={()=>setViewItem(null)}>
           <div className="modal" style={{maxWidth:800,width:"95vw"}} onClick={e=>e.stopPropagation()}>
             <div className="modal-head">
@@ -2927,59 +3151,26 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
             </div>
             <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
               {viewItem.course&&<div className="tag tag-accent">{viewItem.course}</div>}
-              {viewItem.pdfName&&<div className="tag" style={{borderColor:"var(--danger)",color:"var(--danger)"}}>📄 PDF</div>}
+              {viewItem.fileData&&<div className="tag" style={{borderColor:"var(--accent2)",color:"var(--accent2)"}}>{fileIcon(viewItem.fileMime)} {fileLabel(viewItem.fileMime)}</div>}
+              {!viewItem.fileData&&viewItem.pdfName&&<div className="tag" style={{borderColor:"var(--danger)",color:"var(--danger)"}}>📄 PDF</div>}
               <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginLeft:"auto"}}>
                 Added {viewItem.date}{viewItem.uploadedBy&&` · by ${viewItem.uploadedBy.split("@")[0]}`}
               </div>
             </div>
-            {viewItem.pdfData ? (
-              <div>
-                <div style={{background:"var(--bg4)",borderRadius:10,padding:"8px 12px",marginBottom:10,display:"flex",alignItems:"center",gap:10,fontSize:12,color:"var(--text3)"}}>
-                  <span>📄</span>
-                  <span style={{flex:1}}>{viewItem.pdfName}</span>
-                  <a href={viewItem.pdfData} download={viewItem.pdfName}
-                    style={{background:"var(--accent)",color:"white",padding:"5px 14px",borderRadius:8,textDecoration:"none",fontSize:12,fontWeight:700,display:"inline-flex",alignItems:"center",gap:5}}
-                    onClick={e=>e.stopPropagation()}>
-                    ⬇️ Download
-                  </a>
-                </div>
-                <iframe
-                  src={viewItem.pdfData}
-                  style={{width:"100%",height:"65vh",border:"1px solid var(--border)",borderRadius:10,display:"block"}}
-                  title={viewItem.title}
-                />
-              </div>
+            {viewItem.description&&<div style={{fontSize:13,color:"var(--text2)",marginBottom:14,lineHeight:1.6}}>{viewItem.description}</div>}
+            {/* Render new-style file or legacy pdfData */}
+            {viewItem.fileData ? (
+              <FileViewer handout={viewItem} />
+            ) : viewItem.pdfData ? (
+              <FileViewer handout={{...viewItem, fileData:viewItem.pdfData, fileName:viewItem.pdfName, fileMime:"application/pdf"}} />
             ) : (
               <div style={{maxHeight:"65vh",overflowY:"auto",padding:"4px 0"}}>
-                <div style={{fontSize:14,lineHeight:1.9,color:"var(--text2)",whiteSpace:"pre-wrap"}}>{viewItem.note||"No content."}</div>
+                <div style={{fontSize:14,lineHeight:1.9,color:"var(--text2)",whiteSpace:"pre-wrap"}}>{viewItem.note||viewItem.description||"No content."}</div>
               </div>
             )}
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-function Results({ toast }) {
-  const [results, setResults] = useHydratedUser("nv-results", "results", []);
-  const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({subject:"",score:"",total:"",type:"",date:""});
-  const save=()=>{if(!form.subject||!form.score)return toast("Fill required fields","error");const item={...form,id:Date.now(),pct:Math.round((+form.score/+(form.total||100))*100)};const u=[...results,item];setResults(u);saveMyData("results","nv-results",u);setForm({subject:"",score:"",total:"",type:"",date:""});setShowAdd(false);toast("Result saved!","success");};
-  return(
-    <div>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}>
-        <div><div className="sec-title">📊 Results</div><div className="sec-sub">Track your scores</div></div>
-        <button className="btn btn-accent" onClick={()=>setShowAdd(true)}>+ Add Result</button>
-      </div>
-      {results.length===0?<div style={{textAlign:"center",padding:"60px 20px",color:"var(--text3)"}}><div style={{fontSize:48}}>📊</div><div style={{fontFamily:"'DM Mono',monospace",fontSize:13,marginTop:12}}>No results yet!</div></div>:(
-        <div className="card" style={{padding:0,overflow:"hidden"}}>
-          <table className="tbl"><thead><tr><th>Subject</th><th>Type</th><th>Score</th><th>%</th><th>Date</th><th></th></tr></thead>
-          <tbody>{results.map(r=><tr key={r.id}><td style={{fontWeight:600}}>{r.subject}</td><td><span className="tag">{r.type||"Test"}</span></td><td>{r.score}/{r.total||100}</td><td><span className={`tag ${r.pct>=70?"tag-success":r.pct>=50?"tag-warn":"tag-danger"}`}>{r.pct}%</span></td><td style={{fontSize:12,color:"var(--text3)"}}>{r.date}</td><td><button className="btn btn-sm btn-danger" onClick={()=>{const u=results.filter(x=>x.id!==r.id);setResults(u);saveMyData("results","nv-results",u);}}>✕</button></td></tr>)}</tbody>
-          </table>
-        </div>
-      )}
-      {showAdd&&<div className="modal-overlay" onClick={()=>setShowAdd(false)}><div className="modal" onClick={e=>e.stopPropagation()}><div className="modal-head"><div className="modal-title">Add Result</div><button className="modal-close" onClick={()=>setShowAdd(false)}>✕</button></div>{["subject","score","total","type","date"].map(f=><div key={f}><label className="lbl">{f==="total"?"Total Marks":f}</label><input className="inp" type={f==="score"||f==="total"?"number":"text"} value={form[f]} onChange={e=>setForm({...form,[f]:e.target.value})} /></div>)}<div style={{display:"flex",gap:8}}><button className="btn btn-accent" style={{flex:1}} onClick={save}>Save</button><button className="btn" onClick={()=>setShowAdd(false)}>Cancel</button></div></div></div>}
     </div>
   );
 }
@@ -3980,454 +4171,170 @@ function LecturerSetExam({ toast, currentUser }) {
 function LecturerHandouts({ toast, currentUser }) {
   const [handouts, setHandouts] = useHydratedShared("nv-handouts", "handouts", []);
   const classes = useShared("classes", DEFAULT_CLASSES);
-  const [form, setForm] = useState({title:"",description:"",classId:"",fileUrl:"",fileType:"pdf"});
   const [showModal, setShowModal] = useState(false);
   const [edit, setEdit] = useState(null);
+  const [viewItem, setViewItem] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [form, setForm] = useState({title:"",description:"",classId:"",course:""});
+  const [fileData, setFileData] = useState(null);
+  const [fileName, setFileName] = useState("");
+  const [fileMime, setFileMime] = useState("");
 
   const myHandouts = handouts.filter(h=>h.uploadedBy===currentUser);
 
+  const openAdd = () => {
+    setEdit(null); setForm({title:"",description:"",classId:"",course:""});
+    setFileData(null); setFileName(""); setFileMime(""); setShowModal(true);
+  };
+  const openEdit = (h) => {
+    setEdit(h.id); setForm({title:h.title,description:h.description||"",classId:h.classId||"",course:h.course||""});
+    setFileData(h.fileData||null); setFileName(h.fileName||""); setFileMime(h.fileMime||""); setShowModal(true);
+  };
+
+  const handleFile = (data, name, mime, err) => {
+    if (err) return toast(err, "error");
+    setFileData(data); setFileName(name); setFileMime(mime);
+  };
+
+  const pushNotification = (h) => {
+    const notifs = ls("nv-notifications", []);
+    saveMyData("notifications","nv-notifications",[{
+      id:Date.now(), type:"handout",
+      title:`New handout: ${h.title}`,
+      body:`${currentUser.split("@")[0]} uploaded ${h.fileName ? `a ${fileLabel(h.fileMime)} file` : "notes"}${h.course?` for ${h.course}`:""}`,
+      from:currentUser, date:new Date().toLocaleDateString(),
+      time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),
+      read:false, handoutId:h.id
+    }, ...notifs]);
+  };
+
   const save = () => {
     if (!form.title.trim() || !form.classId) return toast("Title and class required","error");
+    const base = { ...form, uploadedBy:currentUser, date:new Date().toLocaleDateString(),
+      fileData:fileData||null, fileName:fileName||"", fileMime:fileMime||"" };
     let u;
     if (edit!==null) {
-      u = handouts.map(h=>h.id===edit?{...h,...form}:h); toast("Handout updated","success");
+      u = handouts.map(h=>h.id===edit?{...h,...base}:h); toast("Handout updated!","success");
     } else {
-      const h = {...form, id:Date.now(), uploadedBy:currentUser, date:new Date().toLocaleDateString()};
-      u = [...handouts, h]; toast("Handout uploaded!","success");
+      const h = {...base, id:Date.now()};
+      u = [...handouts, h]; pushNotification(h);
+      toast("Handout published! Students notified. ✅","success");
     }
-    setHandouts(u); saveShared("handouts",u); setShowModal(false); setEdit(null); setForm({title:"",description:"",classId:"",fileUrl:"",fileType:"pdf"});
+    setHandouts(u); setShowModal(false);
+    setEdit(null); setForm({title:"",description:"",classId:"",course:""});
+    setFileData(null); setFileName(""); setFileMime("");
   };
 
   const del = (id) => {
     if (!window.confirm("Delete this handout?")) return;
-    const u = handouts.filter(h=>h.id!==id); setHandouts(u); saveShared("handouts",u); toast("Deleted","success");
+    setHandouts(handouts.filter(h=>h.id!==id)); toast("Deleted","info");
   };
+
+  const selCls = classes.find(c=>c.id===form.classId);
 
   return (
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
         <div className="sec-title">📄 My Handouts ({myHandouts.length})</div>
-        <button className="btn btn-accent" onClick={()=>{setShowModal(true);setEdit(null);setForm({title:"",description:"",classId:"",fileUrl:"",fileType:"pdf"});}}>+ Upload Handout</button>
+        <button className="btn btn-accent" onClick={openAdd}>+ Upload Handout</button>
       </div>
+
       {myHandouts.length===0 ? (
         <div className="card" style={{textAlign:"center",padding:40,color:"var(--text3)"}}>
-          <div style={{fontSize:40,marginBottom:10}}>📄</div>
-          <div>No handouts yet. Upload your first one!</div>
+          <div style={{fontSize:40,marginBottom:10}}>📁</div>
+          <div style={{marginBottom:12}}>No handouts yet. Upload your first one!</div>
+          <button className="btn btn-accent" onClick={openAdd}>+ Upload Now</button>
         </div>
       ) : (
         <div className="grid2">
           {myHandouts.map(h=>{
             const cls = classes.find(c=>c.id===h.classId);
             return (
-              <div key={h.id} className="card" style={{borderLeft:`3px solid ${cls?.color||"var(--accent)"}`,animation:"fadeUp .3s ease"}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
-                  <div style={{flex:1}}>
-                    <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)",marginBottom:4}}>{cls?.label||h.classId} · {h.date}</div>
-                    <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15,marginBottom:4}}>{h.title}</div>
-                    {h.description&&<div style={{fontSize:12,color:"var(--text2)",marginBottom:6}}>{h.description}</div>}
-                    {h.fileUrl&&<a href={h.fileUrl} target="_blank" rel="noreferrer" className="btn btn-sm btn-accent" style={{textDecoration:"none",display:"inline-block",marginTop:4}}>📎 View File</a>}
+              <div key={h.id} className="card" style={{cursor:"pointer",borderLeft:`3px solid ${cls?.color||"var(--accent)"}`}}
+                onClick={()=>setViewItem(h)}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                    {cls&&<span className="tag tag-accent">{cls.label}</span>}
+                    {h.course&&<span className="tag" style={{fontSize:10}}>{h.course}</span>}
+                    {h.fileData&&<span className="tag" style={{borderColor:"var(--accent2)",color:"var(--accent2)"}}>{fileIcon(h.fileMime)} {fileLabel(h.fileMime)}</span>}
                   </div>
-                  <div style={{display:"flex",gap:5,flexShrink:0,marginLeft:10}}>
-                    <button className="btn btn-sm" onClick={()=>{setEdit(h.id);setForm({title:h.title,description:h.description||"",classId:h.classId,fileUrl:h.fileUrl||"",fileType:h.fileType||"pdf"});setShowModal(true);}}>✏️</button>
+                  <div style={{display:"flex",gap:4,flexShrink:0}} onClick={e=>e.stopPropagation()}>
+                    <button className="btn btn-sm" onClick={()=>openEdit(h)}>✏️</button>
                     <button className="btn btn-sm btn-danger" onClick={()=>del(h.id)}>🗑️</button>
                   </div>
                 </div>
+                <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:14,marginBottom:4}}>{h.title}</div>
+                {h.description&&<div style={{fontSize:12,color:"var(--text2)",marginBottom:4,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden"}}>{h.description}</div>}
+                {!h.fileData&&!h.description&&<div style={{fontSize:12,color:"var(--text3)"}}>Text notes</div>}
+                <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:8}}>{h.date}</div>
               </div>
             );
           })}
         </div>
       )}
+
+      {/* Upload / Edit Modal */}
       {showModal&&(
         <div className="modal-overlay" onClick={()=>setShowModal(false)}>
-          <div className="modal" onClick={e=>e.stopPropagation()}>
-            <div className="modal-head"><div className="modal-title">{edit?"Edit Handout":"Upload Handout"}</div><button className="modal-close" onClick={()=>setShowModal(false)}>✕</button></div>
-            <label className="lbl">Title</label>
+          <div className="modal" style={{maxWidth:520}} onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">{edit?"Edit Handout":"Upload Handout"}</div>
+              <button className="modal-close" onClick={()=>setShowModal(false)}>✕</button>
+            </div>
+            <label className="lbl">Title *</label>
             <input className="inp" placeholder="e.g. Lecture 3 – Pharmacokinetics" value={form.title} onChange={e=>setForm({...form,title:e.target.value})} />
             <label className="lbl">Description (optional)</label>
             <textarea className="inp" rows={2} style={{resize:"vertical"}} value={form.description} onChange={e=>setForm({...form,description:e.target.value})} />
-            <label className="lbl">Class</label>
-            <select className="inp" value={form.classId} onChange={e=>setForm({...form,classId:e.target.value})}>
-              <option value="">Select class...</option>
-              {classes.map(c=><option key={c.id} value={c.id}>{c.label} — {c.desc}</option>)}
-            </select>
-            <label className="lbl">File URL (Google Drive, Dropbox, etc.)</label>
-            <input className="inp" placeholder="https://drive.google.com/..." value={form.fileUrl} onChange={e=>setForm({...form,fileUrl:e.target.value})} />
-            <label className="lbl">File Type</label>
-            <select className="inp" value={form.fileType} onChange={e=>setForm({...form,fileType:e.target.value})}>
-              {["pdf","doc","ppt","image","video","other"].map(t=><option key={t}>{t}</option>)}
-            </select>
-            <div style={{display:"flex",gap:8}}>
-              <button className="btn btn-accent" style={{flex:1}} onClick={save}>Save</button>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <div>
+                <label className="lbl">Class *</label>
+                <select className="inp" value={form.classId} onChange={e=>setForm({...form,classId:e.target.value,course:""})}>
+                  <option value="">Select class…</option>
+                  {classes.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="lbl">Course</label>
+                <select className="inp" value={form.course} onChange={e=>setForm({...form,course:e.target.value})} disabled={!selCls}>
+                  <option value="">General</option>
+                  {(selCls?.courses||[]).map(c=><option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+            </div>
+            <label className="lbl" style={{marginTop:4}}>Attach File</label>
+            <UploadDropzone fileData={fileData} fileName={fileName} fileMime={fileMime} onChange={handleFile} uploading={uploading} />
+            {fileData&&(
+              <button className="btn btn-sm btn-danger" style={{marginTop:6}} onClick={()=>{setFileData(null);setFileName("");setFileMime("");}}>
+                ✕ Remove file
+              </button>
+            )}
+            <div style={{display:"flex",gap:8,marginTop:14}}>
+              <button className="btn btn-accent" style={{flex:1}} onClick={save}>
+                {edit?"💾 Save Changes":"📤 Publish & Notify Students"}
+              </button>
               <button className="btn" onClick={()=>setShowModal(false)}>Cancel</button>
             </div>
           </div>
         </div>
       )}
-    </div>
-  );
-}
 
-function LecturerMCQ({ toast, currentUser }) {
-  const classes = useShared("classes", DEFAULT_CLASSES);
-  const [banks, setBanks] = useHydratedShared("nv-pq", "pq", DEFAULT_PQ);
-  const [selBank, setSelBank] = useState(null);
-  const [showBankModal, setShowBankModal] = useState(false);
-  const [editBank, setEditBank] = useState(null);
-  const [editQ, setEditQ] = useState(null);
-  const [inputMode, setInputMode] = useState("single");
-  const [pasteText, setPasteText] = useState("");
-  const [answerKeyText, setAnswerKeyText] = useState("");
-  const [parsed, setParsed] = useState([]);
-  const [parseError, setParseError] = useState("");
-  const [bankForm, setBankForm] = useState({subject:"",year:"",classId:""});
-  const [qForm, setQForm] = useState({q:"",options:["","","",""],ans:0});
-  const [showQModal, setShowQModal] = useState(false);
-
-  // Only show banks this lecturer created OR ones with no createdBy
-  const myBanks = banks.filter(b=>b.createdBy===currentUser||!b.createdBy);
-
-  const parseAnswerKeyText = (text) => {
-    if (!text.trim()) return null;
-    // Try inline: 1.B 2.C or 1)B 2)C
-    const inlineMatches = [...text.matchAll(/(\d+)[.)]\s*([A-Da-d])/g)];
-    if (inlineMatches.length) return inlineMatches.map(m=>({num:+m[1], ans:"ABCD".indexOf(m[2].toUpperCase())}));
-    // Try one letter per line: B\nC\nA
-    const letterLines = text.split("\n").map(l=>l.trim()).filter(l=>/^[A-Da-d]$/.test(l));
-    if (letterLines.length) return letterLines.map((l,i)=>({num:i+1, ans:"ABCD".indexOf(l.toUpperCase())}));
-    return null;
-  };
-
-  const doParse = () => {
-    setParseError(""); setParsed([]);
-    if (!pasteText.trim()) { setParseError("Please paste questions in the left column first."); return; }
-    const result = parseMCQText(pasteText);
-    if (result.type==="answerkey") { setParseError("Left column looks like an answer key — paste full questions with options on the left."); return; }
-    if (!result.questions.length) { setParseError("Could not parse questions. Check the format guide in the left column."); return; }
-    let qs = result.questions;
-    // If answer key column has content, override/fill answers
-    if (answerKeyText.trim()) {
-      const key = parseAnswerKeyText(answerKeyText);
-      if (key && key.length) {
-        qs = applyAnswerKey(qs, key);
-      } else {
-        setParseError("Questions parsed OK but could not read the answer key — check right column format. Questions imported with answers from the question text.");
-      }
-    }
-    setParsed(qs);
-  };
-
-  const doImport = () => {
-    if (!selBank) return toast("Select a bank first","error");
-    const updated = banks.map(b=>b.id===selBank?{...b,questions:[...b.questions,...parsed]}:b);
-    setBanks(updated); saveShared("pq",updated);
-    toast(`${parsed.length} questions imported into "${currentBank?.subject}"!`,"success");
-    setPasteText(""); setAnswerKeyText(""); setParsed([]); setParseError("");
-  };
-
-  const doApplyAnswerKey = () => {
-    if (!selBank) return toast("Select a bank first","error");
-    setParseError("");
-    const key = parseAnswerKeyText(answerKeyText);
-    if (!key || !key.length) { setParseError("Could not parse. Use: 1.B 2.C 3.A  or one letter per line."); return; }
-    const updated = banks.map(b=>b.id===selBank?{...b,questions:applyAnswerKey(b.questions,key)}:b);
-    setBanks(updated); saveShared("pq",updated);
-    toast(`Applied ${key.length} answers!`,"success"); setAnswerKeyText(""); setInputMode("single");
-  };
-
-  const saveBank = () => {
-    if (!bankForm.subject) return toast("Subject required","error");
-    let u;
-    if (editBank!==null) { u=banks.map((b,i)=>i===editBank?{...b,...bankForm}:b); toast("Updated","success"); }
-    else { u=[...banks,{...bankForm,id:Date.now(),questions:[],createdBy:currentUser}]; toast("Bank created","success"); }
-    setBanks(u); saveShared("pq",u); setShowBankModal(false); setEditBank(null); setBankForm({subject:"",year:"",classId:""});
-  };
-
-  const delBank = (id) => {
-    if(!confirm("Delete this bank?")) return;
-    const u=banks.filter(b=>b.id!==id); setBanks(u); saveShared("pq",u);
-    if(selBank===id) setSelBank(null); toast("Deleted","success");
-  };
-
-  const saveQ = () => {
-    if (!qForm.q) return toast("Question required","error");
-    const updated = banks.map(b=>{
-      if (b.id!==selBank) return b;
-      let qs;
-      if (editQ!==null) { qs=b.questions.map((q,i)=>i===editQ?{...qForm}:q); toast("Updated","success"); }
-      else { qs=[...b.questions,{...qForm}]; toast("Question added","success"); }
-      return {...b,questions:qs};
-    });
-    setBanks(updated); saveShared("pq",updated); setShowQModal(false); setEditQ(null); setQForm({q:"",options:["","","",""],ans:0});
-  };
-
-  const delQ = (bankId,qIdx) => { const u=banks.map(b=>b.id===bankId?{...b,questions:b.questions.filter((_,i)=>i!==qIdx)}:b); setBanks(u); saveShared("pq",u); toast("Deleted","success"); };
-  const currentBank = banks.find(b=>b.id===selBank);
-
-  return (
-    <div>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
-        <div className="sec-title">📝 My MCQ Banks ({myBanks.length})</div>
-        <button className="btn btn-accent" onClick={()=>{setShowBankModal(true);setEditBank(null);setBankForm({subject:"",year:"",classId:""});}}>+ New Bank</button>
-      </div>
-
-      <div className="grid2" style={{marginBottom:20}}>
-        {myBanks.map((b,i)=>{
-          const cls = classes.find(c=>c.id===b.classId);
-          return (
-            <div key={b.id} className="card" style={{cursor:"pointer",border:selBank===b.id?"1px solid var(--warn)":"1px solid var(--border)",background:selBank===b.id?"rgba(251,146,60,.06)":"var(--card)",transition:"all .2s"}} onClick={()=>{setSelBank(b.id);setInputMode("paste");setParsed([]);setPasteText("");setAnswerKeyText("");}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
-                <div>
-                  {cls&&<span style={{fontSize:10,fontFamily:"'DM Mono',monospace",color:cls.color,background:`${cls.color}20`,padding:"1px 7px",borderRadius:4,marginBottom:5,display:"inline-block"}}>{cls.label}</span>}
-                  <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15}}>{b.subject}</div>
-                  <div style={{fontSize:12,color:"var(--text3)",marginTop:3}}>{b.year}{b.year?" · ":""}{b.questions.length} questions</div>
-                </div>
-                <div style={{display:"flex",gap:5,flexShrink:0}}>
-                  <button className="btn btn-sm" onClick={e=>{e.stopPropagation();setEditBank(banks.indexOf(b));setBankForm({subject:b.subject,year:b.year||"",classId:b.classId||""});setShowBankModal(true);}}>✏️</button>
-                  <button className="btn btn-sm btn-danger" onClick={e=>{e.stopPropagation();delBank(b.id);}}>🗑️</button>
-                </div>
+      {/* View Modal */}
+      {viewItem&&(
+        <div className="modal-overlay" onClick={()=>setViewItem(null)}>
+          <div className="modal" style={{maxWidth:800,width:"95vw"}} onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">{viewItem.title}</div>
+              <button className="modal-close" onClick={()=>setViewItem(null)}>✕</button>
+            </div>
+            <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+              {classes.find(c=>c.id===viewItem.classId)&&<span className="tag tag-accent">{classes.find(c=>c.id===viewItem.classId).label}</span>}
+              {viewItem.course&&<span className="tag">{viewItem.course}</span>}
+              <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginLeft:"auto"}}>
+                {viewItem.date}
               </div>
             </div>
-          );
-        })}
-        {myBanks.length===0&&<div className="card" style={{textAlign:"center",padding:30,color:"var(--text3)",gridColumn:"1/-1"}}>No MCQ banks yet. Create your first one!</div>}
-      </div>
-
-      {selBank && !currentBank && null}
-      {currentBank && <div style={{fontSize:12,color:"var(--warn)",fontFamily:"'DM Mono',monospace",marginBottom:10,display:"flex",alignItems:"center",gap:6}}>
-        <span>▼ Managing:</span><b>{currentBank.subject}</b><span style={{color:"var(--text3)"}}>· {currentBank.questions.length} questions</span>
-      </div>}
-
-      {currentBank&&(
-        <div>
-          {/* ── Mode tabs ── */}
-          <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap"}}>
-            {[{k:"paste",icon:"📋",label:"Paste Questions & Answers"},{k:"single",icon:"➕",label:"Add Single Question"}].map(({k,icon,label})=>(
-              <button key={k} onClick={()=>{setInputMode(k);setParsed([]);setParseError("");}}
-                style={{padding:"9px 18px",borderRadius:8,border:`2px solid ${inputMode===k?"var(--warn)":"var(--border)"}`,background:inputMode===k?"rgba(251,146,60,.14)":"transparent",color:inputMode===k?"var(--warn)":"var(--text2)",fontWeight:700,fontSize:13,cursor:"pointer",transition:"all .2s",display:"flex",alignItems:"center",gap:6}}>
-                {icon} {label}{inputMode===k&&<span style={{fontSize:10,background:"var(--warn)",color:"#000",borderRadius:4,padding:"1px 5px",marginLeft:4}}>ACTIVE</span>}
-              </button>
-            ))}
-          </div>
-
-          {/* ══════════════════════════════════════════════
-              PASTE MODE — two columns side by side
-          ══════════════════════════════════════════════ */}
-          {inputMode==="paste"&&(
-            <div style={{background:"var(--bg3)",borderRadius:14,border:"1px solid var(--border)",overflow:"hidden",marginBottom:16}}>
-
-              {/* Header */}
-              <div style={{background:"linear-gradient(90deg,rgba(251,146,60,.14),rgba(234,179,8,.06))",borderBottom:"1px solid var(--border)",padding:"12px 18px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10}}>
-                <div>
-                  <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:15,color:"var(--warn)"}}>📋 Paste & Auto-Parse — {currentBank.subject}</div>
-                  <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:2}}>Paste questions on the left · paste answers on the right · click Parse to preview · then Import</div>
-                </div>
-                <div style={{display:"flex",gap:8,alignItems:"center"}}>
-                  {parsed.length>0&&(
-                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:12,color:"var(--success)",background:"rgba(74,222,128,.1)",border:"1px solid rgba(74,222,128,.3)",borderRadius:6,padding:"3px 10px"}}>
-                      ✓ {parsed.length} parsed
-                    </span>
-                  )}
-                  <button className="btn btn-accent" style={{fontWeight:700}} onClick={doParse}>🔍 Parse</button>
-                  {parsed.length>0&&<button className="btn btn-success" style={{fontWeight:700}} onClick={doImport}>✅ Import {parsed.length} Questions</button>}
-                </div>
-              </div>
-
-              {/* Two columns */}
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr"}}>
-
-                {/* LEFT — Questions */}
-                <div style={{borderRight:"1px solid var(--border)"}}>
-                  <div style={{padding:"10px 16px",borderBottom:"1px solid var(--border)",background:"var(--bg4)",display:"flex",alignItems:"center",gap:8}}>
-                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--warn)",fontWeight:700,textTransform:"uppercase",letterSpacing:".08em"}}>Questions</span>
-                    <span style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>· paste questions with options below</span>
-                  </div>
-                  <div style={{padding:"10px 14px",borderBottom:"1px solid var(--border)",background:"rgba(251,146,60,.04)"}}>
-                    <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)",lineHeight:1.9}}>
-                      <b style={{color:"var(--warn)"}}>Accepted formats (any):</b><br/>
-                      <span style={{color:"var(--accent)"}}>Q: What is normal SpO2?</span><br/>
-                      A: 85-90%{"  "}B: 95-100%{"  "}C: 80%{"  "}D: 99%<br/>
-                      ANS: B{"  "}← include answer here OR paste separately on right<br/>
-                      <br/>
-                      <span style={{color:"var(--accent)"}}>1. Which organ produces insulin?</span><br/>
-                      A) Liver{"  "}B) Kidney{"  "}C) Pancreas{"  "}D) Spleen<br/>
-                      Answer: C{"  "}← optional<br/>
-                      <br/>
-                      <b>Separate questions with a blank line</b>
-                    </div>
-                  </div>
-                  <textarea
-                    style={{width:"100%",minHeight:320,background:"var(--bg2)",border:"none",borderBottom:"none",padding:"14px 16px",color:"var(--text)",fontSize:12,fontFamily:"'DM Mono',monospace",lineHeight:1.8,outline:"none",resize:"vertical",boxSizing:"border-box"}}
-                    placeholder={"Q: What is the normal adult temperature?\nA: 35.0C\nB: 36.1-37.2C\nC: 38.5C\nD: 40.0C\n\nQ: Which organ produces insulin?\nA: Liver\nB: Kidney\nC: Pancreas\nD: Spleen\n\n1. Normal adult SpO2 range?\nA) 85-90%\nB) 95-100%\nC) 80-85%\nD) 90-95%"}
-                    value={pasteText}
-                    onChange={e=>{setPasteText(e.target.value);setParsed([]);setParseError("");}}
-                  />
-                </div>
-
-                {/* RIGHT — Answers */}
-                <div>
-                  <div style={{padding:"10px 16px",borderBottom:"1px solid var(--border)",background:"var(--bg4)",display:"flex",alignItems:"center",gap:8}}>
-                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--success)",fontWeight:700,textTransform:"uppercase",letterSpacing:".08em"}}>Answer Key</span>
-                    <span style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>· optional if already in questions</span>
-                  </div>
-                  <div style={{padding:"10px 14px",borderBottom:"1px solid var(--border)",background:"rgba(74,222,128,.03)"}}>
-                    <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)",lineHeight:1.9}}>
-                      <b style={{color:"var(--success)"}}>Accepted formats (any):</b><br/>
-                      <span style={{color:"var(--accent)"}}>1.B 2.C 3.A 4.D 5.B</span>{"  "}← inline<br/>
-                      <br/>
-                      <span style={{color:"var(--accent)"}}>1) B</span><br/>
-                      <span style={{color:"var(--accent)"}}>2) C</span>{"  "}← numbered lines<br/>
-                      <br/>
-                      <span style={{color:"var(--accent)"}}>B</span><br/>
-                      <span style={{color:"var(--accent)"}}>C</span>{"  "}← one letter per line<br/>
-                      <span style={{color:"var(--accent)"}}>A</span>{"  "}   maps to Q1, Q2, Q3...<br/>
-                      <br/>
-                      <b>Leave blank if answers are in questions</b>
-                    </div>
-                  </div>
-                  <textarea
-                    style={{width:"100%",minHeight:320,background:"var(--bg2)",border:"none",padding:"14px 16px",color:"var(--text)",fontSize:12,fontFamily:"'DM Mono',monospace",lineHeight:1.8,outline:"none",resize:"vertical",boxSizing:"border-box"}}
-                    placeholder={"1.B 2.C 3.A\n\n— or —\n\n1) B\n2) C\n3) A\n\n— or —\n\nB\nC\nA"}
-                    value={answerKeyText}
-                    onChange={e=>{setAnswerKeyText(e.target.value);setParseError("");}}
-                  />
-                </div>
-              </div>
-
-              {/* Parse error */}
-              {parseError&&(
-                <div style={{padding:"10px 16px",background:"rgba(239,68,68,.08)",borderTop:"1px solid rgba(239,68,68,.2)",color:"var(--danger)",fontSize:12,fontFamily:"'DM Mono',monospace"}}>
-                  ⚠️ {parseError}
-                </div>
-              )}
-
-              {/* Preview panel */}
-              {parsed.length>0&&(
-                <div style={{borderTop:"1px solid var(--border)",background:"var(--bg4)"}}>
-                  <div style={{padding:"10px 16px",borderBottom:"1px solid var(--border)",fontFamily:"'DM Mono',monospace",fontSize:11,color:"var(--success)",fontWeight:700}}>
-                    ✓ PREVIEW — {parsed.length} questions parsed · review before importing
-                  </div>
-                  <div style={{maxHeight:280,overflowY:"auto",padding:"8px 12px",display:"grid",gap:6}}>
-                    {parsed.map((p,i)=>(
-                      <div key={i} style={{background:"var(--bg3)",borderRadius:8,padding:"10px 12px",border:"1px solid var(--border)"}}>
-                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8,marginBottom:6}}>
-                          <div style={{fontWeight:600,fontSize:12,flex:1,color:"var(--text)"}}>{i+1}. {p.q}</div>
-                          <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:700,color:"var(--success)",background:"rgba(74,222,128,.12)",border:"1px solid rgba(74,222,128,.25)",borderRadius:5,padding:"1px 8px",flexShrink:0}}>ANS: {"ABCD"[p.ans]}</span>
-                        </div>
-                        <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
-                          {p.options.map((o,oi)=>(
-                            <span key={oi} style={{fontSize:10,padding:"2px 7px",borderRadius:4,background:oi===p.ans?"rgba(74,222,128,.15)":"rgba(255,255,255,.04)",border:`1px solid ${oi===p.ans?"var(--success)":"var(--border)"}`,color:oi===p.ans?"var(--success)":"var(--text3)"}}>
-                              {"ABCD"[oi]}. {o}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  <div style={{padding:"12px 16px",borderTop:"1px solid var(--border)",display:"flex",gap:8}}>
-                    <button className="btn btn-success" style={{fontWeight:700}} onClick={doImport}>✅ Import All {parsed.length} Questions into "{currentBank.subject}"</button>
-                    <button className="btn" onClick={()=>{setParsed([]);setPasteText("");setAnswerKeyText("");setParseError("");}}>🗑️ Clear</button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* ══════════════════════════════════════════════
-              SINGLE ADD MODE
-          ══════════════════════════════════════════════ */}
-          {inputMode==="single"&&(
-            <div style={{background:"var(--bg3)",borderRadius:14,border:"1px solid var(--border)",overflow:"hidden",marginBottom:16}}>
-              <div style={{background:"linear-gradient(90deg,rgba(62,142,149,.12),transparent)",borderBottom:"1px solid var(--border)",padding:"12px 18px"}}>
-                <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:15,color:"var(--accent)"}}>➕ Add Single Question</div>
-                <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:2}}>Type one question manually with options and correct answer</div>
-              </div>
-              <div style={{padding:18}}>
-                <label className="lbl">Question</label>
-                <textarea className="inp" rows={2} style={{resize:"vertical"}} placeholder="Type your question..." value={qForm.q} onChange={e=>setQForm({...qForm,q:e.target.value})} />
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:8}}>
-                  {["A","B","C","D"].map((l,i)=>(
-                    <div key={l} style={{display:"flex",gap:8,alignItems:"center"}}>
-                      <button onClick={()=>setQForm({...qForm,ans:i})} style={{width:32,height:32,borderRadius:8,border:`2px solid ${qForm.ans===i?"var(--success)":"var(--border)"}`,background:qForm.ans===i?"rgba(74,222,128,.15)":"transparent",cursor:"pointer",fontSize:12,fontWeight:700,flexShrink:0,color:qForm.ans===i?"var(--success)":"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{l}</button>
-                      <input className="inp" style={{marginBottom:0,flex:1}} placeholder={`Option ${l}`} value={qForm.options[i]} onChange={e=>{const o=[...qForm.options];o[i]=e.target.value;setQForm({...qForm,options:o});}} />
-                    </div>
-                  ))}
-                </div>
-                <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginBottom:14}}>
-                  Click the letter button to mark as correct answer · Currently: <b style={{color:"var(--success)"}}>Option {"ABCD"[qForm.ans]}</b>
-                </div>
-                <button className="btn btn-accent" style={{fontWeight:700}} onClick={saveQ}>➕ Add Question</button>
-              </div>
-            </div>
-          )}
-
-          {/* ── Question list ── */}
-          <div style={{background:"var(--bg3)",borderRadius:14,border:"1px solid var(--border)",overflow:"hidden"}}>
-            <div style={{padding:"12px 18px",borderBottom:"1px solid var(--border)",background:"var(--bg4)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-              <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:14}}>{currentBank.subject}</div>
-              <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:"var(--text3)"}}>{currentBank.questions.length} questions total</span>
-            </div>
-            {currentBank.questions.length===0 ? (
-              <div style={{textAlign:"center",color:"var(--text3)",padding:40,fontFamily:"'DM Mono',monospace",fontSize:12}}>
-                <div style={{fontSize:32,marginBottom:8}}>📋</div>
-                No questions yet — use Paste Questions & Answers or Add Single Question above
-              </div>
-            ) : (
-              <div style={{padding:12,display:"grid",gap:8}}>
-                {currentBank.questions.map((q,qi)=>(
-                  <div key={qi} style={{background:"var(--bg2)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--border)"}}>
-                    <div style={{display:"flex",justifyContent:"space-between",gap:10}}>
-                      <div style={{flex:1}}>
-                        <div style={{fontWeight:600,fontSize:13,marginBottom:8,color:"var(--text)"}}>{qi+1}. {q.q}</div>
-                        <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
-                          {q.options.map((opt,oi)=>(
-                            <span key={oi} style={{fontSize:11,padding:"3px 9px",borderRadius:5,background:oi===q.ans?"rgba(74,222,128,.15)":"rgba(255,255,255,.04)",border:`1px solid ${oi===q.ans?"var(--success)":"var(--border)"}`,color:oi===q.ans?"var(--success)":"var(--text3)"}}>
-                              {"ABCD"[oi]}. {opt}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                      <div style={{display:"flex",flexDirection:"column",gap:5,flexShrink:0}}>
-                        <button className="btn btn-sm" onClick={()=>{setEditQ(qi);setQForm({...q});setShowQModal(true);}}>✏️</button>
-                        <button className="btn btn-sm btn-danger" onClick={()=>delQ(currentBank.id,qi)}>🗑️</button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {showBankModal&&(
-        <div className="modal-overlay" onClick={()=>setShowBankModal(false)}>
-          <div className="modal" onClick={e=>e.stopPropagation()}>
-            <div className="modal-head"><div className="modal-title">{editBank!==null?"Edit Bank":"New MCQ Bank"}</div><button className="modal-close" onClick={()=>setShowBankModal(false)}>✕</button></div>
-            <label className="lbl">Subject / Title</label><input className="inp" placeholder="e.g. Pharmacology Mid-Semester" value={bankForm.subject} onChange={e=>setBankForm({...bankForm,subject:e.target.value})} />
-            <label className="lbl">Year / Label (optional)</label><input className="inp" placeholder="e.g. 2024" value={bankForm.year} onChange={e=>setBankForm({...bankForm,year:e.target.value})} />
-            <label className="lbl">Target Class</label>
-            <select className="inp" value={bankForm.classId||""} onChange={e=>setBankForm({...bankForm,classId:e.target.value})}>
-              <option value="">All Students (Past Questions)</option>
-              {classes.map(c=><option key={c.id} value={c.id}>{c.label} — {c.desc}</option>)}
-            </select>
-            <div style={{display:"flex",gap:8}}><button className="btn btn-accent" style={{flex:1}} onClick={saveBank}>Save</button><button className="btn" onClick={()=>setShowBankModal(false)}>Cancel</button></div>
-          </div>
-        </div>
-      )}
-
-      {showQModal&&(
-        <div className="modal-overlay" onClick={()=>setShowQModal(false)}>
-          <div className="modal" onClick={e=>e.stopPropagation()}>
-            <div className="modal-head"><div className="modal-title">{editQ!==null?"Edit":"Add"} Question</div><button className="modal-close" onClick={()=>setShowQModal(false)}>✕</button></div>
-            <label className="lbl">Question</label><textarea className="inp" rows={3} style={{resize:"vertical"}} value={qForm.q} onChange={e=>setQForm({...qForm,q:e.target.value})} />
-            {["A","B","C","D"].map((l,i)=>(
-              <div key={l}><label className="lbl">Option {l}</label><input className="inp" value={qForm.options[i]} onChange={e=>{const o=[...qForm.options];o[i]=e.target.value;setQForm({...qForm,options:o});}} /></div>
-            ))}
-            <label className="lbl">Correct Answer</label>
-            <select className="inp" value={qForm.ans} onChange={e=>setQForm({...qForm,ans:+e.target.value})}>
-              {["A","B","C","D"].map((l,i)=><option key={l} value={i}>Option {l}: {qForm.options[i]}</option>)}
-            </select>
-            <div style={{display:"flex",gap:8}}><button className="btn btn-accent" style={{flex:1}} onClick={saveQ}>Save</button><button className="btn" onClick={()=>setShowQModal(false)}>Cancel</button></div>
+            {viewItem.description&&<div style={{fontSize:13,color:"var(--text2)",marginBottom:14,lineHeight:1.6}}>{viewItem.description}</div>}
+            <FileViewer handout={viewItem} />
           </div>
         </div>
       )}
