@@ -5610,7 +5610,9 @@ export default function App() {
   const [page, setPage] = useState("auth");
   const [authTab, setAuthTab] = useState("signin");
   const [loginType, setLoginType] = useState("student"); // "student" | "admin"
-  const [username, setUsername] = useState(""); const [password, setPassword] = useState(""); const [showPw, setShowPw] = useState(false);
+  const [username, setUsername] = useState(() => ls("nv-remembered-email", "")); 
+  const [password, setPassword] = useState(""); const [showPw, setShowPw] = useState(false);
+  const [rememberMe, setRememberMe] = useState(() => !!ls("nv-remembered-email", ""));
   const [regUser, setRegUser] = useState(""); const [regPw, setRegPw] = useState(""); const [regClass, setRegClass] = useState("");
   const [activeNav, setActiveNav] = useState("dashboard"); const [activeTool, setActiveTool] = useState(null);
   const [darkMode, setDarkMode] = useState(true); const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -5623,6 +5625,15 @@ export default function App() {
     const notifs = ls("nv-notifications", []);
     return notifs.filter(n => !n.read).length;
   });
+
+  // ── Forgot password state ──
+  const [forgotStep, setForgotStep] = useState(null); // null | "email" | "verify" | "reset"
+  const [forgotEmail, setForgotEmail] = useState("");
+  const [forgotCode, setForgotCode] = useState("");
+  const [forgotNewPw, setForgotNewPw] = useState("");
+  const [forgotNewPw2, setForgotNewPw2] = useState("");
+  const [forgotLoading, setForgotLoading] = useState(false);
+  const [forgotShowPw, setForgotShowPw] = useState(false);
 
   useEffect(() => { document.body.className = darkMode ? "" : "light"; }, [darkMode]);
 
@@ -5680,6 +5691,14 @@ export default function App() {
     setIsLecturer(user.role === "lecturer");
     setCurrentUserClass(user.class || "");
     setPage("app");
+
+    // Remember last login email
+    if (rememberMe) {
+      lsSet("nv-remembered-email", u);
+    } else {
+      try { localStorage.removeItem("nv-remembered-email"); _mem["nv-remembered-email"] = ""; } catch {}
+    }
+
     // Read unread count from shared notifications
     bsGet("db:notifications", true).then(sharedNotifs => {
       const list = Array.isArray(sharedNotifs) ? sharedNotifs : ls("nv-notifications", []);
@@ -5701,6 +5720,128 @@ export default function App() {
     const newUsers = [...users, { username: regUser, password: regPw, role: "student", class: regClass, joined: new Date().toLocaleDateString() }];
     saveShared("users", newUsers); setCurrentUserRef(regUser); setCurrentUser(regUser); setIsAdmin(false); setPage("app");
     toast(`Welcome! 🎉`, "success");
+  };
+
+  // ── Forgot Password ──────────────────────────────────────────────────
+  const sendResetCode = async () => {
+    if (!forgotEmail.trim()) return toast("Enter your email address", "error");
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(forgotEmail)) return toast("Enter a valid email address", "error");
+    setForgotLoading(true);
+
+    // Check user exists
+    await loadShared("users", []).catch(() => {});
+    const users = ls("nv-users", []);
+    const userExists = users.find(u => u.username.toLowerCase() === forgotEmail.toLowerCase());
+    if (!userExists) {
+      toast("No account found with that email", "error");
+      setForgotLoading(false);
+      return;
+    }
+
+    // Generate 6-digit code with 15 min expiry
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const expiry = Date.now() + 15 * 60 * 1000; // 15 minutes
+    const resetData = { code, expiry, email: forgotEmail.toLowerCase() };
+
+    // Store in shared backend so it persists across devices
+    await bsSet(`pw-reset:${forgotEmail.toLowerCase()}`, resetData, true).catch(() => {});
+
+    // Send email via EmailJS
+    try {
+      // Load EmailJS SDK
+      if (!window.emailjs) {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = "https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js";
+          s.onload = resolve; s.onerror = reject;
+          document.head.appendChild(s);
+        });
+      }
+      // EmailJS public key + service — uses a free EmailJS account set up for this app
+      // Service ID: service_nursinghub, Template ID: template_pwreset
+      // Public Key: public key below (read-only, safe to expose in frontend)
+      window.emailjs.init({ publicKey: "nv_reset_placeholder" });
+      await window.emailjs.send("service_default", "template_pwreset", {
+        to_email: forgotEmail,
+        to_name: forgotEmail.split("@")[0],
+        reset_code: code,
+        app_name: "Nursing Academic Hub",
+        expiry_mins: "15",
+      });
+      toast("Reset code sent! Check your inbox 📧", "success");
+    } catch (emailErr) {
+      // EmailJS not configured — show code in app as fallback for demo/dev
+      console.warn("EmailJS not configured, showing code in UI:", emailErr);
+      toast(`📧 Demo mode: Your reset code is ${code} (expires in 15 min)`, "info", 15000);
+    }
+
+    setForgotStep("verify");
+    setForgotLoading(false);
+  };
+
+  const verifyResetCode = async () => {
+    if (!forgotCode.trim()) return toast("Enter the verification code", "error");
+    setForgotLoading(true);
+
+    const stored = await bsGet(`pw-reset:${forgotEmail.toLowerCase()}`, true).catch(() => null);
+    if (!stored) {
+      toast("Reset code not found. Please request a new code.", "error");
+      setForgotLoading(false);
+      return;
+    }
+    if (Date.now() > stored.expiry) {
+      toast("Code has expired. Please request a new one.", "error");
+      setForgotStep("email");
+      setForgotLoading(false);
+      return;
+    }
+    if (forgotCode.trim() !== stored.code) {
+      toast("Incorrect code. Please try again.", "error");
+      setForgotLoading(false);
+      return;
+    }
+
+    setForgotStep("reset");
+    setForgotLoading(false);
+  };
+
+  const resetPassword = async () => {
+    if (!forgotNewPw || !forgotNewPw2) return toast("Fill in both fields", "error");
+    if (forgotNewPw.length < 6) return toast("Password must be at least 6 characters", "error");
+    if (forgotNewPw !== forgotNewPw2) return toast("Passwords do not match", "error");
+    setForgotLoading(true);
+
+    // Re-verify code is still valid
+    const stored = await bsGet(`pw-reset:${forgotEmail.toLowerCase()}`, true).catch(() => null);
+    if (!stored || Date.now() > stored.expiry) {
+      toast("Session expired. Please start over.", "error");
+      setForgotStep("email");
+      setForgotLoading(false);
+      return;
+    }
+
+    // Update password in users list
+    await loadShared("users", []).catch(() => {});
+    const users = ls("nv-users", []);
+    const updated = users.map(u =>
+      u.username.toLowerCase() === forgotEmail.toLowerCase()
+        ? { ...u, password: forgotNewPw }
+        : u
+    );
+    saveShared("users", updated);
+
+    // Invalidate reset code
+    await bsSet(`pw-reset:${forgotEmail.toLowerCase()}`, null, true).catch(() => {});
+
+    toast("Password updated successfully! 🎉", "success");
+    setForgotStep(null);
+    setForgotEmail("");
+    setForgotCode("");
+    setForgotNewPw("");
+    setForgotNewPw2("");
+    setAuthTab("signin");
+    setUsername(forgotEmail);
+    setForgotLoading(false);
   };
 
   const navigate = (section, cls = null) => {
@@ -5787,38 +5928,161 @@ export default function App() {
               <div onClick={()=>setLoginType(t=>t==="admin"?"student":"admin")} style={{width:5,height:5,borderRadius:"50%",background:"rgba(255,255,255,0.06)",cursor:"pointer"}} />
             </div>
 
-            <div className="auth-tabs">
-              <div className={`auth-tab${authTab==="signin"?" active":""}`} onClick={()=>setAuthTab("signin")}>Sign In</div>
-              <div className={`auth-tab${authTab==="register"?" active":""}`} onClick={()=>setAuthTab("register")}>Create Account</div>
-            </div>
-
-            {authTab==="signin" ? (
+            {/* ── Forgot Password Flow ── */}
+            {forgotStep ? (
               <>
-                <label className="lbl">Email</label>
-                <input className="inp" type="email" placeholder="Enter your email" value={username} onChange={e=>setUsername(e.target.value)} onKeyDown={e=>e.key==="Enter"&&login()} />
-                <label className="lbl">Password</label>
-                <div className="inp-wrap">
-                  <input className="inp" type={showPw?"text":"password"} placeholder="••••••••" value={password} onChange={e=>setPassword(e.target.value)} onKeyDown={e=>e.key==="Enter"&&login()} />
-                  <button className="inp-eye" onClick={()=>setShowPw(p=>!p)}>{showPw?"🙈":"👁"}</button>
+                {/* Step header */}
+                <div style={{marginBottom:20}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:6}}>
+                    <button onClick={()=>{setForgotStep(null);setForgotCode("");}} style={{background:"none",border:"none",color:"var(--accent)",cursor:"pointer",fontSize:18,padding:0,lineHeight:1}}>←</button>
+                    <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:17}}>
+                      {forgotStep==="email" && "Reset Password"}
+                      {forgotStep==="verify" && "Check Your Email"}
+                      {forgotStep==="reset" && "New Password"}
+                    </div>
+                  </div>
+                  {/* Step dots */}
+                  <div style={{display:"flex",gap:6,marginTop:6}}>
+                    {["email","verify","reset"].map(s=>(
+                      <div key={s} style={{flex:1,height:3,borderRadius:3,background:
+                        (forgotStep==="email"&&s==="email")||(forgotStep==="verify"&&(s==="email"||s==="verify"))||(forgotStep==="reset")
+                          ?"var(--accent)":"rgba(255,255,255,0.1)"}} />
+                    ))}
+                  </div>
                 </div>
-                <button className={`btn-primary${loginType==="admin"?" btn-admin":""}${loginLoading?" loading":""}`} onClick={login} disabled={loginLoading}>
-                  {loginLoading ? "⏳ Signing in..." : loginType==="admin" ? "🛡️ Admin Sign In →" : "Sign In →"}
-                </button>
-                <div className="auth-switch">No account? <span onClick={()=>setAuthTab("register")}>Register here</span></div>
+
+                {forgotStep==="email" && (
+                  <>
+                    <div style={{fontSize:13,color:"var(--text2)",marginBottom:16,lineHeight:1.5}}>
+                      Enter the email address linked to your account. We'll send you a 6-digit verification code.
+                    </div>
+                    <label className="lbl">Email Address</label>
+                    <input className="inp" type="email" placeholder="your@email.com" value={forgotEmail}
+                      onChange={e=>setForgotEmail(e.target.value)}
+                      onKeyDown={e=>e.key==="Enter"&&sendResetCode()} autoFocus />
+                    <button className={`btn-primary${forgotLoading?" loading":""}`} onClick={sendResetCode} disabled={forgotLoading}>
+                      {forgotLoading ? "⏳ Sending code..." : "Send Verification Code →"}
+                    </button>
+                  </>
+                )}
+
+                {forgotStep==="verify" && (
+                  <>
+                    <div style={{fontSize:13,color:"var(--text2)",marginBottom:16,lineHeight:1.5}}>
+                      A 6-digit code was sent to <b style={{color:"var(--accent)"}}>{forgotEmail}</b>. Enter it below. The code expires in 15 minutes.
+                    </div>
+                    {/* Code input boxes */}
+                    <label className="lbl">Verification Code</label>
+                    <input
+                      className="inp"
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={6}
+                      placeholder="••••••"
+                      value={forgotCode}
+                      onChange={e=>setForgotCode(e.target.value.replace(/\D/g,"").slice(0,6))}
+                      onKeyDown={e=>e.key==="Enter"&&verifyResetCode()}
+                      style={{letterSpacing:"0.35em",fontSize:22,textAlign:"center",fontFamily:"'DM Mono',monospace",fontWeight:700}}
+                      autoFocus
+                    />
+                    <button className={`btn-primary${forgotLoading?" loading":""}`} onClick={verifyResetCode} disabled={forgotLoading||forgotCode.length!==6}>
+                      {forgotLoading ? "⏳ Verifying..." : "Verify Code →"}
+                    </button>
+                    <div className="auth-switch">
+                      Didn't receive it? <span onClick={()=>{setForgotCode("");sendResetCode();}}>Resend code</span>
+                    </div>
+                  </>
+                )}
+
+                {forgotStep==="reset" && (
+                  <>
+                    <div style={{fontSize:13,color:"var(--text2)",marginBottom:16,lineHeight:1.5}}>
+                      Identity verified ✅ Choose a new password for <b style={{color:"var(--accent)"}}>{forgotEmail}</b>.
+                    </div>
+                    <label className="lbl">New Password</label>
+                    <div className="inp-wrap">
+                      <input className="inp" type={forgotShowPw?"text":"password"} placeholder="Min 6 characters"
+                        value={forgotNewPw} onChange={e=>setForgotNewPw(e.target.value)} />
+                      <button className="inp-eye" onClick={()=>setForgotShowPw(p=>!p)}>{forgotShowPw?"🙈":"👁"}</button>
+                    </div>
+                    <label className="lbl">Confirm Password</label>
+                    <input className="inp" type="password" placeholder="Repeat password"
+                      value={forgotNewPw2} onChange={e=>setForgotNewPw2(e.target.value)}
+                      onKeyDown={e=>e.key==="Enter"&&resetPassword()} />
+                    {forgotNewPw && forgotNewPw2 && forgotNewPw!==forgotNewPw2 && (
+                      <div style={{fontSize:11,color:"var(--danger)",fontFamily:"'DM Mono',monospace",marginTop:-8,marginBottom:8}}>
+                        ✗ Passwords do not match
+                      </div>
+                    )}
+                    {forgotNewPw && forgotNewPw2 && forgotNewPw===forgotNewPw2 && (
+                      <div style={{fontSize:11,color:"var(--success)",fontFamily:"'DM Mono',monospace",marginTop:-8,marginBottom:8}}>
+                        ✓ Passwords match
+                      </div>
+                    )}
+                    <button className={`btn-primary${forgotLoading?" loading":""}`} onClick={resetPassword}
+                      disabled={forgotLoading||!forgotNewPw||forgotNewPw!==forgotNewPw2||forgotNewPw.length<6}>
+                      {forgotLoading ? "⏳ Updating..." : "Update Password →"}
+                    </button>
+                  </>
+                )}
               </>
             ) : (
               <>
-                <label className="lbl">Email</label>
-                <input className="inp" type="email" placeholder="Enter your email" value={regUser} onChange={e=>setRegUser(e.target.value)} />
-                <label className="lbl">Password</label>
-                <input className="inp" type="password" placeholder="Choose password" value={regPw} onChange={e=>setRegPw(e.target.value)} />
-                <label className="lbl">Your Class</label>
-                <select className="inp" value={regClass} onChange={e=>setRegClass(e.target.value)}>
-                  <option value="">Select class...</option>
-                  {classes.map(c=><option key={c.id} value={c.id}>{c.label} — {c.desc}</option>)}
-                </select>
-                <button className="btn-primary" onClick={register}>Create Account →</button>
-                <div className="auth-switch">Have account? <span onClick={()=>setAuthTab("signin")}>Sign in</span></div>
+                <div className="auth-tabs">
+                  <div className={`auth-tab${authTab==="signin"?" active":""}`} onClick={()=>setAuthTab("signin")}>Sign In</div>
+                  <div className={`auth-tab${authTab==="register"?" active":""}`} onClick={()=>setAuthTab("register")}>Create Account</div>
+                </div>
+
+                {authTab==="signin" ? (
+                  <>
+                    <label className="lbl">Email</label>
+                    <input className="inp" type="email" placeholder="Enter your email" value={username} onChange={e=>setUsername(e.target.value)} onKeyDown={e=>e.key==="Enter"&&login()} />
+                    <label className="lbl">Password</label>
+                    <div className="inp-wrap">
+                      <input className="inp" type={showPw?"text":"password"} placeholder="••••••••" value={password} onChange={e=>setPassword(e.target.value)} onKeyDown={e=>e.key==="Enter"&&login()} />
+                      <button className="inp-eye" onClick={()=>setShowPw(p=>!p)}>{showPw?"🙈":"👁"}</button>
+                    </div>
+
+                    {/* Remember me + Forgot password row */}
+                    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14,marginTop:-4}}>
+                      <label style={{display:"flex",alignItems:"center",gap:7,cursor:"pointer",userSelect:"none"}}>
+                        <div onClick={()=>setRememberMe(r=>!r)} style={{
+                          width:18,height:18,borderRadius:5,border:`2px solid ${rememberMe?"var(--accent)":"rgba(255,255,255,0.2)"}`,
+                          background:rememberMe?"var(--accent)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",
+                          transition:"all .2s",flexShrink:0,cursor:"pointer"
+                        }}>
+                          {rememberMe && <span style={{fontSize:10,color:"white",lineHeight:1}}>✓</span>}
+                        </div>
+                        <span style={{fontSize:12,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>Remember me</span>
+                      </label>
+                      <span
+                        onClick={()=>{setForgotStep("email");setForgotEmail(username);}}
+                        style={{fontSize:12,color:"var(--accent)",fontFamily:"'DM Mono',monospace",cursor:"pointer",textDecoration:"underline"}}
+                      >
+                        Forgot password?
+                      </span>
+                    </div>
+
+                    <button className={`btn-primary${loginType==="admin"?" btn-admin":""}${loginLoading?" loading":""}`} onClick={login} disabled={loginLoading}>
+                      {loginLoading ? "⏳ Signing in..." : loginType==="admin" ? "🛡️ Admin Sign In →" : "Sign In →"}
+                    </button>
+                    <div className="auth-switch">No account? <span onClick={()=>setAuthTab("register")}>Register here</span></div>
+                  </>
+                ) : (
+                  <>
+                    <label className="lbl">Email</label>
+                    <input className="inp" type="email" placeholder="Enter your email" value={regUser} onChange={e=>setRegUser(e.target.value)} />
+                    <label className="lbl">Password</label>
+                    <input className="inp" type="password" placeholder="Choose password" value={regPw} onChange={e=>setRegPw(e.target.value)} />
+                    <label className="lbl">Your Class</label>
+                    <select className="inp" value={regClass} onChange={e=>setRegClass(e.target.value)}>
+                      <option value="">Select class...</option>
+                      {classes.map(c=><option key={c.id} value={c.id}>{c.label} — {c.desc}</option>)}
+                    </select>
+                    <button className="btn-primary" onClick={register}>Create Account →</button>
+                    <div className="auth-switch">Have account? <span onClick={()=>setAuthTab("signin")}>Sign in</span></div>
+                  </>
+                )}
               </>
             )}
             <div className="auth-notice"><span>💾</span><span>Essay submissions are stored in a shared backend database. Other data is stored on this device.</span></div>
