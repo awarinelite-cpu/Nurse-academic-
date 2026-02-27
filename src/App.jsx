@@ -1,8 +1,18 @@
 import React, { useState, useEffect } from "react";
 
-// ─── LOCAL STORAGE HELPERS ───────────────────────────────────────────
-const ls = (k, d) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } };
-const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+// ─── LOCAL STORAGE HELPERS (with in-memory fallback for artifact env) ─
+const _mem = {};
+const _lsAvail = (() => { try { localStorage.setItem("__t","1"); localStorage.removeItem("__t"); return true; } catch { return false; } })();
+const ls = (k, d) => {
+  try {
+    if (_lsAvail) { const v = localStorage.getItem(k); if (v) { const p = JSON.parse(v); _mem[k] = p; return p; } }
+    return _mem[k] !== undefined ? _mem[k] : d;
+  } catch { return _mem[k] !== undefined ? _mem[k] : d; }
+};
+const lsSet = (k, v) => {
+  _mem[k] = v;
+  try { if (_lsAvail) localStorage.setItem(k, JSON.stringify(v)); } catch {}
+};
 
 // ─── BACKEND STORAGE (window.storage - persistent across devices) ────
 // shared:true  = all users see this data (admin-managed content)
@@ -39,6 +49,7 @@ const SK = {
   announcements: ["nv-announcements", "db:announcements"],
   handouts:      ["nv-handouts",      "db:handouts"],
   essayBanks:    ["nv-essay-banks",   "db:essay-banks"],
+  classExams:    ["nv-class-exams",   "db:class-exams"],
 };
 const saveShared = (key, val) => { const [lk, bk] = SK[key]; dbSet(lk, bk, val); };
 const loadShared = async (key, fallback) => { const [lk, bk] = SK[key]; return dbLoad(lk, bk, fallback, true); };
@@ -146,16 +157,18 @@ const DEFAULT_ANNOUNCEMENTS = [
 // ─── INIT STORAGE ───────────────────────────────────────────────────
 // Seeds localStorage with defaults on first run, then backend hydrates over it
 const initData = () => {
-  if (!localStorage.getItem("nv-classes")) lsSet("nv-classes", DEFAULT_CLASSES);
-  if (!localStorage.getItem("nv-drugs")) lsSet("nv-drugs", DEFAULT_DRUGS);
-  if (!localStorage.getItem("nv-labs")) lsSet("nv-labs", DEFAULT_LABS);
-  if (!localStorage.getItem("nv-pq")) lsSet("nv-pq", DEFAULT_PQ);
-  if (!localStorage.getItem("nv-decks")) lsSet("nv-decks", DEFAULT_DECKS);
-  if (!localStorage.getItem("nv-dict")) lsSet("nv-dict", DEFAULT_DICT);
-  if (!localStorage.getItem("nv-skillsdb")) lsSet("nv-skillsdb", DEFAULT_SKILLS);
-  if (!localStorage.getItem("nv-announcements")) lsSet("nv-announcements", DEFAULT_ANNOUNCEMENTS);
-  if (!localStorage.getItem("nv-users")) lsSet("nv-users", [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]);
+  if (!ls("nv-classes", null)) lsSet("nv-classes", DEFAULT_CLASSES);
+  if (!ls("nv-drugs", null)) lsSet("nv-drugs", DEFAULT_DRUGS);
+  if (!ls("nv-labs", null)) lsSet("nv-labs", DEFAULT_LABS);
+  if (!ls("nv-pq", null)) lsSet("nv-pq", DEFAULT_PQ);
+  if (!ls("nv-decks", null)) lsSet("nv-decks", DEFAULT_DECKS);
+  if (!ls("nv-dict", null)) lsSet("nv-dict", DEFAULT_DICT);
+  if (!ls("nv-skillsdb", null)) lsSet("nv-skillsdb", DEFAULT_SKILLS);
+  if (!ls("nv-announcements", null)) lsSet("nv-announcements", DEFAULT_ANNOUNCEMENTS);
+  if (!ls("nv-users", null)) lsSet("nv-users", [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]);
 };
+// Run immediately at module load so _mem is populated before first render
+initData();
 
 // Hydrate all shared data from backend (called once on app mount)
 const hydrateFromBackend = async () => {
@@ -198,8 +211,10 @@ body.light{
 @keyframes spin{to{transform:rotate(360deg);}}
 
 /* AUTH */
-.auth-page{min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at 30% 20%,rgba(62,142,149,.2),transparent 50%),radial-gradient(ellipse at 80% 80%,rgba(90,173,160,.1),transparent 50%),var(--bg);padding:20px;}
-.auth-card{background:var(--bg3);border:1px solid var(--border2);border-radius:22px;padding:38px 34px;width:100%;max-width:420px;animation:fadeUp .5s ease;box-shadow:0 40px 80px rgba(0,0,0,.4);}
+.auth-page{min-height:100vh;display:flex;align-items:center;justify-content:center;background:url('https://images.unsplash.com/photo-1544717305-2782549b5136?w=1600&q=80') center/cover no-repeat;padding:20px;position:relative;}
+.auth-page::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(5,18,35,0.72) 0%,rgba(10,30,50,0.60) 50%,rgba(5,18,35,0.78) 100%);backdrop-filter:blur(1px);}
+.auth-page > *{position:relative;z-index:1;}
+.auth-card{background:rgba(10,22,40,0.78);border:1px solid rgba(62,142,149,0.35);border-radius:22px;padding:38px 34px;width:100%;max-width:420px;animation:fadeUp .5s ease;box-shadow:0 40px 80px rgba(0,0,0,.6),0 0 0 1px rgba(62,142,149,0.1) inset;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);}
 .auth-logo{display:flex;align-items:center;gap:10px;margin-bottom:5px;}
 .auth-logo-icon{width:40px;height:40px;border-radius:11px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:20px;}
 .auth-logo-name{font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:var(--accent);}
@@ -539,7 +554,7 @@ function AdminFirebaseConsole({ toast }) {
       const app = window.firebase.initializeApp(cfg, "nv-admin");
       setFb({ app, db: window.firebase.firestore(app), auth: window.firebase.auth(app), storage: window.firebase.storage(app) });
       setFbConfig(cfg);
-      localStorage.setItem("nv-firebase-config", JSON.stringify(cfg));
+      lsSet("nv-firebase-config", cfg);
       setStatus("connected"); setStatusMsg(`Connected to ${cfg.projectId}`);
       setShowSetup(false);
       toast(`Connected to Firebase project: ${cfg.projectId}`, "success");
@@ -1003,7 +1018,7 @@ function AdminOverview({ toast }) {
             ⬆️ Import Backup
             <input type="file" accept=".json" style={{display:"none"}} onChange={importAll} />
           </label>
-          <button className="btn btn-danger" onClick={()=>{if(confirm("Reset ALL data to defaults? This cannot be undone!")){["nv-classes","nv-drugs","nv-labs","nv-pq","nv-decks","nv-dict","nv-skillsdb","nv-announcements","nv-handouts"].forEach(k=>localStorage.removeItem(k));initData();toast("Data reset to defaults","warn");}}}>🔄 Reset to Defaults</button>
+          <button className="btn btn-danger" onClick={()=>{if(confirm("Reset ALL data to defaults? This cannot be undone!")){["nv-classes","nv-drugs","nv-labs","nv-pq","nv-decks","nv-dict","nv-skillsdb","nv-announcements","nv-handouts"].forEach(k=>{delete _mem[k];try{if(_lsAvail)localStorage.removeItem(k);}catch{}});initData();toast("Data reset to defaults","warn");}}}>🔄 Reset to Defaults</button>
         </div>
       </div>
       <div className="card">
@@ -3316,7 +3331,8 @@ function LecturerPage({ toast, currentUser }) {
   const [tab, setTab] = useState("handouts");
   const TABS = [
     { key:"handouts",  label:"📄 Handouts" },
-    { key:"mcq",       label:"📝 MCQ Exams" },
+    { key:"setexam",   label:"🏆 Set Class Exam" },
+    { key:"mcq",       label:"📝 MCQ Banks" },
     { key:"essay",     label:"✍️ Essay Exams" },
     { key:"announce",  label:"📢 Announcements" },
     { key:"students",  label:"👥 My Students" },
@@ -3335,10 +3351,508 @@ function LecturerPage({ toast, currentUser }) {
         {TABS.map(t=><div key={t.key} className={`admin-tab${tab===t.key?" active":""}`} style={tab===t.key?{background:"rgba(251,146,60,.18)",borderColor:"#f97316",color:"#f97316"}:{}} onClick={()=>setTab(t.key)}>{t.label}</div>)}
       </div>
       {tab==="handouts"  && <LecturerHandouts toast={toast} currentUser={currentUser} />}
+      {tab==="setexam"   && <LecturerSetExam toast={toast} currentUser={currentUser} />}
       {tab==="mcq"       && <LecturerMCQ toast={toast} currentUser={currentUser} />}
       {tab==="essay"     && <LecturerEssay toast={toast} currentUser={currentUser} />}
       {tab==="announce"  && <LecturerAnnouncements toast={toast} currentUser={currentUser} />}
       {tab==="students"  && <LecturerStudents toast={toast} />}
+    </div>
+  );
+}
+
+function LecturerSetExam({ toast, currentUser }) {
+  const classes = ls("nv-classes", DEFAULT_CLASSES);
+  const [exams, setExams] = useState(() => ls("nv-class-exams", []));
+  const [view, setView] = useState("list"); // list | create | manage
+  const [selExam, setSelExam] = useState(null);
+  const [inputMode, setInputMode] = useState("paste"); // paste | single
+  const [pasteText, setPasteText] = useState("");
+  const [answerText, setAnswerText] = useState("");
+  const [parsed, setParsed] = useState([]);
+  const [parseError, setParseError] = useState("");
+  const [singleQ, setSingleQ] = useState({ q: "", options: ["", "", "", ""], ans: 0 });
+  const [examForm, setExamForm] = useState({
+    title: "", classId: "", subject: "", date: "", duration: 60,
+    instructions: "", totalMarks: "", passMark: "", isPublished: false,
+  });
+  const [formError, setFormError] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null);
+
+  const myExams = exams.filter(e => e.createdBy === currentUser);
+
+  const saveExams = (updated) => {
+    setExams(updated);
+    saveShared("classExams", updated);
+  };
+
+  // ── Parse answer key helper ──
+  const parseAnswerKey = (text) => {
+    if (!text.trim()) return null;
+    const inline = [...text.matchAll(/(\d+)[.)]\s*([A-Da-d])/g)];
+    if (inline.length) return inline.map(m => ({ num: +m[1], ans: "ABCD".indexOf(m[2].toUpperCase()) }));
+    const lines = text.split("\n").map(l => l.trim()).filter(l => /^[A-Da-d]$/.test(l));
+    if (lines.length) return lines.map((l, i) => ({ num: i + 1, ans: "ABCD".indexOf(l.toUpperCase()) }));
+    return null;
+  };
+
+  // ── Parse & preview ──
+  const doParse = () => {
+    setParseError(""); setParsed([]);
+    if (!pasteText.trim()) { setParseError("Paste questions in the left column first."); return; }
+    const result = parseMCQText(pasteText);
+    if (result.type === "answerkey") { setParseError("Left column looks like an answer key — paste full questions with options here."); return; }
+    if (!result.questions.length) { setParseError("Could not parse questions. Check the format guide."); return; }
+    let qs = result.questions;
+    if (answerText.trim()) {
+      const key = parseAnswerKey(answerText);
+      if (key && key.length) { qs = applyAnswerKey(qs, key); }
+      else setParseError("Questions parsed OK but answer key format unrecognised — answers from question text used instead.");
+    }
+    setParsed(qs);
+  };
+
+  // ── Add single question to draft ──
+  const addSingleQ = () => {
+    if (!singleQ.q.trim()) { toast("Question text required", "error"); return; }
+    setParsed(prev => [...prev, { ...singleQ }]);
+    setSingleQ({ q: "", options: ["", "", "", ""], ans: 0 });
+    toast("Question added to draft!", "success");
+  };
+
+  const removeFromParsed = (idx) => setParsed(prev => prev.filter((_, i) => i !== idx));
+
+  // ── Create / update exam ──
+  const createExam = (publish) => {
+    setFormError("");
+    if (!examForm.title.trim()) { setFormError("Exam title is required."); return; }
+    if (!examForm.classId) { setFormError("Please select a target class."); return; }
+    if (parsed.length === 0) { setFormError("Add at least one question before saving."); return; }
+
+    const exam = {
+      id: Date.now(),
+      ...examForm,
+      duration: +examForm.duration || 60,
+      totalMarks: +examForm.totalMarks || parsed.length,
+      passMark: +examForm.passMark || Math.ceil(parsed.length * 0.5),
+      isPublished: publish,
+      questions: parsed,
+      createdBy: currentUser,
+      createdDate: new Date().toLocaleDateString(),
+      questionCount: parsed.length,
+    };
+    const updated = [...exams, exam];
+    saveExams(updated);
+    toast(publish ? `Exam published to ${classes.find(c=>c.id===examForm.classId)?.label}!` : "Exam saved as draft!", "success");
+    setView("list"); resetForm();
+  };
+
+  const updateExam = (examId, changes) => {
+    const updated = exams.map(e => e.id === examId ? { ...e, ...changes } : e);
+    saveExams(updated);
+  };
+
+  const deleteExam = (id) => {
+    const updated = exams.filter(e => e.id !== id);
+    saveExams(updated);
+    if (selExam?.id === id) { setSelExam(null); setView("list"); }
+    toast("Exam deleted", "success");
+  };
+
+  const publishToggle = (exam) => {
+    updateExam(exam.id, { isPublished: !exam.isPublished });
+    toast(exam.isPublished ? "Exam unpublished (hidden from students)" : "Exam published!", "success");
+    setSelExam(prev => prev?.id === exam.id ? { ...prev, isPublished: !prev.isPublished } : prev);
+  };
+
+  const resetForm = () => {
+    setExamForm({ title: "", classId: "", subject: "", date: "", duration: 60, instructions: "", totalMarks: "", passMark: "", isPublished: false });
+    setPasteText(""); setAnswerText(""); setParsed([]); setParseError(""); setFormError("");
+    setSingleQ({ q: "", options: ["", "", "", ""], ans: 0 });
+  };
+
+  const openManage = (exam) => { setSelExam(exam); setView("manage"); };
+
+  // ══════════════════════════════════════════════
+  //  LIST VIEW
+  // ══════════════════════════════════════════════
+  if (view === "list") return (
+    <div>
+      {/* Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <div className="sec-title">🏆 Set Class Exam</div>
+          <div className="sec-sub">Create, manage and publish exams to specific classes</div>
+        </div>
+        <button className="btn btn-accent" style={{ fontWeight: 700, padding: "10px 20px" }} onClick={() => { resetForm(); setView("create"); }}>
+          ＋ Create New Exam
+        </button>
+      </div>
+
+      {myExams.length === 0 ? (
+        <div className="card" style={{ textAlign: "center", padding: "60px 40px", color: "var(--text3)" }}>
+          <div style={{ fontSize: 52, marginBottom: 12 }}>🏆</div>
+          <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 700, fontSize: 18, marginBottom: 6, color: "var(--text2)" }}>No exams yet</div>
+          <div style={{ fontSize: 13, fontFamily: "'DM Mono',monospace", marginBottom: 20 }}>Create your first class exam and publish it to students</div>
+          <button className="btn btn-accent" onClick={() => { resetForm(); setView("create"); }}>＋ Create First Exam</button>
+        </div>
+      ) : (
+        <div style={{ display: "grid", gap: 14 }}>
+          {myExams.map(exam => {
+            const cls = classes.find(c => c.id === exam.classId);
+            return (
+              <div key={exam.id} className="card" style={{ border: `1px solid ${exam.isPublished ? "rgba(74,222,128,.35)" : "var(--border)"}`, background: exam.isPublished ? "rgba(74,222,128,.04)" : "var(--card)", animation: "fadeUp .3s ease" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
+                  <div style={{ flex: 1 }}>
+                    {/* Class badge + status */}
+                    <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap", alignItems: "center" }}>
+                      {cls && <span style={{ fontSize: 10, fontFamily: "'DM Mono',monospace", fontWeight: 700, background: `${cls.color}22`, color: cls.color, border: `1px solid ${cls.color}55`, borderRadius: 5, padding: "2px 8px" }}>{cls.label}</span>}
+                      <span style={{ fontSize: 10, fontFamily: "'DM Mono',monospace", fontWeight: 700, padding: "2px 8px", borderRadius: 5, background: exam.isPublished ? "rgba(74,222,128,.15)" : "rgba(251,146,60,.12)", color: exam.isPublished ? "var(--success)" : "var(--warn)", border: `1px solid ${exam.isPublished ? "rgba(74,222,128,.3)" : "rgba(251,146,60,.3)"}` }}>
+                        {exam.isPublished ? "● LIVE" : "○ DRAFT"}
+                      </span>
+                      {exam.subject && <span style={{ fontSize: 10, color: "var(--text3)", fontFamily: "'DM Mono',monospace" }}>{exam.subject}</span>}
+                    </div>
+                    <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 17, marginBottom: 4 }}>{exam.title}</div>
+                    <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 12, color: "var(--text3)", fontFamily: "'DM Mono',monospace" }}>
+                      <span>📝 {exam.questionCount} questions</span>
+                      <span>⏱ {exam.duration} min</span>
+                      {exam.date && <span>📅 {exam.date}</span>}
+                      <span>🎯 Pass: {exam.passMark}/{exam.totalMarks}</span>
+                      <span style={{ color: "var(--text3)" }}>Created {exam.createdDate}</span>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, flexShrink: 0, flexWrap: "wrap" }}>
+                    <button className="btn btn-sm" onClick={() => openManage(exam)} style={{ fontWeight: 700 }}>Manage ▶</button>
+                    <button className="btn btn-sm" style={{ background: exam.isPublished ? "rgba(239,68,68,.1)" : "rgba(74,222,128,.1)", color: exam.isPublished ? "var(--danger)" : "var(--success)", border: `1px solid ${exam.isPublished ? "rgba(239,68,68,.3)" : "rgba(74,222,128,.3)"}`, fontWeight: 700 }} onClick={() => publishToggle(exam)}>
+                      {exam.isPublished ? "Unpublish" : "Publish"}
+                    </button>
+                    <button className="btn btn-sm btn-danger" onClick={() => setConfirmDelete(exam.id)}>🗑️</button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Delete confirm */}
+      {confirmDelete && (
+        <div className="modal-overlay" onClick={() => setConfirmDelete(null)}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 380 }}>
+            <div className="modal-head"><div className="modal-title">⚠️ Delete Exam?</div><button className="modal-close" onClick={() => setConfirmDelete(null)}>✕</button></div>
+            <div style={{ fontSize: 13, color: "var(--text2)", marginBottom: 20 }}>This will permanently delete the exam and all its questions. Students who have attempted it will retain their scores.</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn btn-danger" style={{ flex: 1, fontWeight: 700 }} onClick={() => { deleteExam(confirmDelete); setConfirmDelete(null); }}>Yes, Delete</button>
+              <button className="btn" onClick={() => setConfirmDelete(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  // ══════════════════════════════════════════════
+  //  MANAGE VIEW — exam detail + question list
+  // ══════════════════════════════════════════════
+  if (view === "manage" && selExam) {
+    const liveExam = exams.find(e => e.id === selExam.id) || selExam;
+    const cls = classes.find(c => c.id === liveExam.classId);
+    return (
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 18, flexWrap: "wrap" }}>
+          <button className="btn btn-sm" onClick={() => setView("list")}>← Back</button>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 18 }}>{liveExam.title}</div>
+            <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "'DM Mono',monospace" }}>{cls?.label} · {liveExam.questionCount} questions · {liveExam.duration} min</div>
+          </div>
+          <button className="btn btn-sm" style={{ background: liveExam.isPublished ? "rgba(239,68,68,.1)" : "rgba(74,222,128,.1)", color: liveExam.isPublished ? "var(--danger)" : "var(--success)", border: `1px solid ${liveExam.isPublished ? "rgba(239,68,68,.3)" : "rgba(74,222,128,.3)"}`, fontWeight: 700 }} onClick={() => publishToggle(liveExam)}>
+            {liveExam.isPublished ? "● Unpublish" : "○ Publish"}
+          </button>
+        </div>
+
+        {/* Meta strip */}
+        <div className="card" style={{ marginBottom: 16, display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(120px,1fr))", gap: 12 }}>
+          {[
+            ["🏫 Class", cls?.label || liveExam.classId],
+            ["📝 Questions", liveExam.questionCount],
+            ["⏱ Duration", `${liveExam.duration} min`],
+            ["🎯 Pass Mark", `${liveExam.passMark} / ${liveExam.totalMarks}`],
+            ["📅 Date", liveExam.date || "—"],
+            ["Status", liveExam.isPublished ? "Published ●" : "Draft ○"],
+          ].map(([k, v]) => (
+            <div key={k} style={{ textAlign: "center" }}>
+              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: "var(--text3)", marginBottom: 2 }}>{k}</div>
+              <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 700, fontSize: 14, color: "var(--text)" }}>{v}</div>
+            </div>
+          ))}
+        </div>
+
+        {liveExam.instructions && (
+          <div style={{ background: "rgba(62,142,149,.08)", border: "1px solid rgba(62,142,149,.2)", borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 13, color: "var(--text2)", lineHeight: 1.6 }}>
+            <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: "var(--accent)", fontWeight: 700, display: "block", marginBottom: 4 }}>INSTRUCTIONS</span>
+            {liveExam.instructions}
+          </div>
+        )}
+
+        {/* Question list */}
+        <div style={{ background: "var(--bg3)", borderRadius: 14, border: "1px solid var(--border)", overflow: "hidden" }}>
+          <div style={{ padding: "12px 18px", borderBottom: "1px solid var(--border)", background: "var(--bg4)", fontFamily: "'Syne',sans-serif", fontWeight: 700, fontSize: 14 }}>
+            Questions ({liveExam.questions?.length || 0})
+          </div>
+          {(!liveExam.questions || liveExam.questions.length === 0) ? (
+            <div style={{ textAlign: "center", padding: 40, color: "var(--text3)", fontFamily: "'DM Mono',monospace", fontSize: 12 }}>No questions in this exam.</div>
+          ) : (
+            <div style={{ padding: 12, display: "grid", gap: 8, maxHeight: 520, overflowY: "auto" }}>
+              {liveExam.questions.map((q, qi) => (
+                <div key={qi} style={{ background: "var(--bg2)", borderRadius: 10, padding: "12px 14px", border: "1px solid var(--border)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginBottom: 8 }}>
+                    <div style={{ fontWeight: 600, fontSize: 13, flex: 1 }}>{qi + 1}. {q.q}</div>
+                    <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, fontWeight: 700, color: "var(--success)", background: "rgba(74,222,128,.12)", border: "1px solid rgba(74,222,128,.25)", borderRadius: 5, padding: "1px 8px", flexShrink: 0 }}>ANS: {"ABCD"[q.ans]}</span>
+                  </div>
+                  <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                    {q.options.map((o, oi) => (
+                      <span key={oi} style={{ fontSize: 11, padding: "3px 9px", borderRadius: 5, background: oi === q.ans ? "rgba(74,222,128,.15)" : "rgba(255,255,255,.04)", border: `1px solid ${oi === q.ans ? "var(--success)" : "var(--border)"}`, color: oi === q.ans ? "var(--success)" : "var(--text3)" }}>
+                        {"ABCD"[oi]}. {o}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ══════════════════════════════════════════════
+  //  CREATE VIEW
+  // ══════════════════════════════════════════════
+  return (
+    <div>
+      {/* Back + title */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+        <button className="btn btn-sm" onClick={() => { setView("list"); resetForm(); }}>← Back</button>
+        <div>
+          <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 18 }}>🏆 Create Class Exam</div>
+          <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "'DM Mono',monospace" }}>Set up exam details, add questions, then publish to your class</div>
+        </div>
+      </div>
+
+      {/* ─── Step 1: Exam Details ─── */}
+      <div style={{ background: "var(--bg3)", borderRadius: 14, border: "1px solid var(--border)", overflow: "hidden", marginBottom: 16 }}>
+        <div style={{ background: "linear-gradient(90deg,rgba(62,142,149,.14),transparent)", borderBottom: "1px solid var(--border)", padding: "12px 18px", display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ width: 26, height: 26, borderRadius: 8, background: "var(--accent)", color: "#fff", fontWeight: 800, fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>1</span>
+          <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 15, color: "var(--accent)" }}>Exam Details</div>
+        </div>
+        <div style={{ padding: 18, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div style={{ gridColumn: "1/-1" }}>
+            <label className="lbl">Exam Title *</label>
+            <input className="inp" placeholder="e.g. Mid-Semester MCQ — Pharmacology" value={examForm.title} onChange={e => setExamForm({ ...examForm, title: e.target.value })} />
+          </div>
+          <div>
+            <label className="lbl">Target Class *</label>
+            <select className="inp" value={examForm.classId} onChange={e => setExamForm({ ...examForm, classId: e.target.value })}>
+              <option value="">Select class...</option>
+              {classes.map(c => <option key={c.id} value={c.id}>{c.label} — {c.desc}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="lbl">Subject / Course</label>
+            <input className="inp" placeholder="e.g. Pharmacology" value={examForm.subject} onChange={e => setExamForm({ ...examForm, subject: e.target.value })} />
+          </div>
+          <div>
+            <label className="lbl">Exam Date</label>
+            <input className="inp" type="date" value={examForm.date} onChange={e => setExamForm({ ...examForm, date: e.target.value })} />
+          </div>
+          <div>
+            <label className="lbl">Duration (minutes)</label>
+            <input className="inp" type="number" min="10" max="300" value={examForm.duration} onChange={e => setExamForm({ ...examForm, duration: e.target.value })} />
+          </div>
+          <div>
+            <label className="lbl">Total Marks (leave blank = auto)</label>
+            <input className="inp" type="number" placeholder="Auto-set from question count" value={examForm.totalMarks} onChange={e => setExamForm({ ...examForm, totalMarks: e.target.value })} />
+          </div>
+          <div>
+            <label className="lbl">Pass Mark (leave blank = 50%)</label>
+            <input className="inp" type="number" placeholder="Auto = 50% of total" value={examForm.passMark} onChange={e => setExamForm({ ...examForm, passMark: e.target.value })} />
+          </div>
+          <div style={{ gridColumn: "1/-1" }}>
+            <label className="lbl">Instructions (optional)</label>
+            <textarea className="inp" rows={2} style={{ resize: "vertical" }} placeholder="e.g. Answer all questions. Time allowed: 60 minutes. No calculators permitted." value={examForm.instructions} onChange={e => setExamForm({ ...examForm, instructions: e.target.value })} />
+          </div>
+        </div>
+      </div>
+
+      {/* ─── Step 2: Add Questions ─── */}
+      <div style={{ background: "var(--bg3)", borderRadius: 14, border: "1px solid var(--border)", overflow: "hidden", marginBottom: 16 }}>
+        <div style={{ background: "linear-gradient(90deg,rgba(251,146,60,.14),transparent)", borderBottom: "1px solid var(--border)", padding: "12px 18px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ width: 26, height: 26, borderRadius: 8, background: "var(--warn)", color: "#000", fontWeight: 800, fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>2</span>
+            <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 15, color: "var(--warn)" }}>Add Questions</div>
+          </div>
+          {parsed.length > 0 && <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 12, color: "var(--success)", background: "rgba(74,222,128,.1)", border: "1px solid rgba(74,222,128,.3)", borderRadius: 6, padding: "3px 10px" }}>✓ {parsed.length} questions in draft</span>}
+        </div>
+
+        {/* Mode selector */}
+        <div style={{ padding: "14px 18px 0", display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {[
+            { k: "paste", icon: "📋", label: "Paste Questions & Answers", sub: "Bulk import with auto-parse" },
+            { k: "single", icon: "➕", label: "Add Single Question", sub: "Type one question manually" },
+          ].map(({ k, icon, label, sub }) => (
+            <button key={k} onClick={() => { setInputMode(k); setParseError(""); }}
+              style={{ flex: 1, minWidth: 180, padding: "11px 16px", borderRadius: 10, border: `2px solid ${inputMode === k ? "var(--warn)" : "var(--border)"}`, background: inputMode === k ? "rgba(251,146,60,.12)" : "transparent", cursor: "pointer", textAlign: "left", transition: "all .2s" }}>
+              <div style={{ fontSize: 16, marginBottom: 2 }}>{icon}</div>
+              <div style={{ fontWeight: 700, fontSize: 13, color: inputMode === k ? "var(--warn)" : "var(--text2)" }}>{label}</div>
+              <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "'DM Mono',monospace" }}>{sub}</div>
+            </button>
+          ))}
+        </div>
+
+        {/* ── PASTE MODE ── */}
+        {inputMode === "paste" && (
+          <div style={{ padding: 18 }}>
+            <div style={{ background: "var(--bg2)", borderRadius: 12, border: "1px solid var(--border)", overflow: "hidden" }}>
+              {/* Header */}
+              <div style={{ background: "linear-gradient(90deg,rgba(251,146,60,.1),rgba(74,222,128,.04))", borderBottom: "1px solid var(--border)", padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                <div style={{ fontSize: 12, color: "var(--text2)", fontFamily: "'DM Mono',monospace" }}>Paste questions left · paste answer key right (optional) · then Parse</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn btn-accent" style={{ fontWeight: 700 }} onClick={doParse}>🔍 Parse Questions</button>
+                  {parsed.length > 0 && <button className="btn" style={{ fontSize: 12 }} onClick={() => { setParsed([]); setPasteText(""); setAnswerText(""); setParseError(""); }}>🗑 Clear Draft</button>}
+                </div>
+              </div>
+
+              {/* Two columns */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr" }}>
+                {/* LEFT — Questions */}
+                <div style={{ borderRight: "1px solid var(--border)" }}>
+                  <div style={{ padding: "8px 14px", borderBottom: "1px solid var(--border)", background: "var(--bg3)" }}>
+                    <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, fontWeight: 700, color: "var(--warn)", textTransform: "uppercase", letterSpacing: ".08em" }}>Questions Column</span>
+                  </div>
+                  <div style={{ padding: "8px 12px", background: "rgba(251,146,60,.03)", borderBottom: "1px solid var(--border)", fontFamily: "'DM Mono',monospace", fontSize: 10, color: "var(--text3)", lineHeight: 2 }}>
+                    <b style={{ color: "var(--warn)" }}>Accepted formats:</b><br />
+                    <span style={{ color: "var(--accent)" }}>Q: Which organ produces insulin?</span><br />
+                    A: Liver{"  "}B: Kidney{"  "}C: Pancreas{"  "}D: Spleen<br />
+                    ANS: C{"  "}← optional (or use right column)<br /><br />
+                    <span style={{ color: "var(--accent)" }}>1. Normal adult SpO₂?</span><br />
+                    A) 85-90%{"  "}B) 95-100%{"  "}C) 80-85%{"  "}D: 90%<br /><br />
+                    <b>Separate questions with a blank line</b>
+                  </div>
+                  <textarea
+                    style={{ width: "100%", minHeight: 280, background: "var(--bg)", border: "none", padding: "12px 14px", color: "var(--text)", fontSize: 12, fontFamily: "'DM Mono',monospace", lineHeight: 1.8, outline: "none", resize: "vertical", boxSizing: "border-box" }}
+                    placeholder={"Q: What is normal adult temperature?\nA: 35.0°C\nB: 36.1-37.2°C\nC: 38.5°C\nD: 40.0°C\nANS: B\n\nQ: Which organ produces insulin?\nA: Liver\nB: Kidney\nC: Pancreas\nD: Spleen"}
+                    value={pasteText}
+                    onChange={e => { setPasteText(e.target.value); setParsed([]); setParseError(""); }}
+                  />
+                </div>
+
+                {/* RIGHT — Answer Key */}
+                <div>
+                  <div style={{ padding: "8px 14px", borderBottom: "1px solid var(--border)", background: "var(--bg3)" }}>
+                    <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, fontWeight: 700, color: "var(--success)", textTransform: "uppercase", letterSpacing: ".08em" }}>Answer Key Column</span>
+                    <span style={{ fontSize: 10, color: "var(--text3)", fontFamily: "'DM Mono',monospace", marginLeft: 8 }}>· optional if answers embedded</span>
+                  </div>
+                  <div style={{ padding: "8px 12px", background: "rgba(74,222,128,.03)", borderBottom: "1px solid var(--border)", fontFamily: "'DM Mono',monospace", fontSize: 10, color: "var(--text3)", lineHeight: 2 }}>
+                    <b style={{ color: "var(--success)" }}>Accepted formats:</b><br />
+                    <span style={{ color: "var(--accent)" }}>1.B 2.C 3.A 4.D</span>{"  "}← inline<br />
+                    <span style={{ color: "var(--accent)" }}>1) B</span><br />
+                    <span style={{ color: "var(--accent)" }}>2) C</span>{"  "}← numbered lines<br />
+                    <span style={{ color: "var(--accent)" }}>B</span><br />
+                    <span style={{ color: "var(--accent)" }}>C</span>{"  "}← one letter/line (maps to Q1, Q2...)<br /><br />
+                    <b>Leave blank if answers are in questions</b>
+                  </div>
+                  <textarea
+                    style={{ width: "100%", minHeight: 280, background: "var(--bg)", border: "none", padding: "12px 14px", color: "var(--text)", fontSize: 12, fontFamily: "'DM Mono',monospace", lineHeight: 1.8, outline: "none", resize: "vertical", boxSizing: "border-box" }}
+                    placeholder={"1.B 2.C 3.A\n\n— or —\n\n1) B\n2) C\n3) A\n\n— or —\n\nB\nC\nA"}
+                    value={answerText}
+                    onChange={e => { setAnswerText(e.target.value); setParseError(""); }}
+                  />
+                </div>
+              </div>
+
+              {parseError && (
+                <div style={{ padding: "10px 16px", background: "rgba(239,68,68,.08)", borderTop: "1px solid rgba(239,68,68,.2)", color: "var(--danger)", fontSize: 12, fontFamily: "'DM Mono',monospace" }}>⚠️ {parseError}</div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── SINGLE MODE ── */}
+        {inputMode === "single" && (
+          <div style={{ padding: 18 }}>
+            <div style={{ background: "var(--bg2)", borderRadius: 12, border: "1px solid var(--border)", padding: 18 }}>
+              <label className="lbl">Question *</label>
+              <textarea className="inp" rows={2} style={{ resize: "vertical" }} placeholder="Type your question..." value={singleQ.q} onChange={e => setSingleQ({ ...singleQ, q: e.target.value })} />
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+                {["A", "B", "C", "D"].map((l, i) => (
+                  <div key={l} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <button onClick={() => setSingleQ({ ...singleQ, ans: i })}
+                      style={{ width: 34, height: 34, borderRadius: 8, border: `2px solid ${singleQ.ans === i ? "var(--success)" : "var(--border)"}`, background: singleQ.ans === i ? "rgba(74,222,128,.15)" : "transparent", cursor: "pointer", fontSize: 13, fontWeight: 800, color: singleQ.ans === i ? "var(--success)" : "var(--text3)", fontFamily: "'DM Mono',monospace", flexShrink: 0 }}>{l}</button>
+                    <input className="inp" style={{ marginBottom: 0, flex: 1 }} placeholder={`Option ${l}`} value={singleQ.options[i]} onChange={e => { const o = [...singleQ.options]; o[i] = e.target.value; setSingleQ({ ...singleQ, options: o }); }} />
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "'DM Mono',monospace", marginBottom: 14 }}>
+                Click a letter button to mark as correct answer · Currently: <b style={{ color: "var(--success)" }}>Option {"ABCD"[singleQ.ans]}</b>
+              </div>
+              <button className="btn btn-accent" style={{ fontWeight: 700 }} onClick={addSingleQ}>➕ Add to Exam</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ─── Question Draft Preview ─── */}
+      {parsed.length > 0 && (
+        <div style={{ background: "var(--bg3)", borderRadius: 14, border: "1px solid rgba(74,222,128,.3)", overflow: "hidden", marginBottom: 16 }}>
+          <div style={{ padding: "12px 18px", borderBottom: "1px solid var(--border)", background: "rgba(74,222,128,.06)", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+            <div>
+              <span style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 15, color: "var(--success)" }}>✓ Draft Questions ({parsed.length})</span>
+              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: "var(--text3)", marginLeft: 10 }}>Review before saving the exam</span>
+            </div>
+          </div>
+          <div style={{ maxHeight: 340, overflowY: "auto", padding: "10px 12px", display: "grid", gap: 7 }}>
+            {parsed.map((p, i) => (
+              <div key={i} style={{ background: "var(--bg2)", borderRadius: 9, padding: "10px 12px", border: "1px solid var(--border)", display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>{i + 1}. {p.q}</div>
+                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                    {p.options.map((o, oi) => (
+                      <span key={oi} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: oi === p.ans ? "rgba(74,222,128,.15)" : "rgba(255,255,255,.04)", border: `1px solid ${oi === p.ans ? "var(--success)" : "var(--border)"}`, color: oi === p.ans ? "var(--success)" : "var(--text3)" }}>
+                        {"ABCD"[oi]}. {o}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, fontWeight: 700, color: "var(--success)", background: "rgba(74,222,128,.12)", border: "1px solid rgba(74,222,128,.25)", borderRadius: 5, padding: "1px 8px", flexShrink: 0 }}>ANS: {"ABCD"[p.ans]}</span>
+                <button className="btn btn-sm btn-danger" style={{ padding: "3px 8px", fontSize: 11, flexShrink: 0 }} onClick={() => removeFromParsed(i)}>✕</button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ─── Step 3: Save ─── */}
+      <div style={{ background: "var(--bg3)", borderRadius: 14, border: "1px solid var(--border)", overflow: "hidden" }}>
+        <div style={{ background: "linear-gradient(90deg,rgba(168,139,250,.12),transparent)", borderBottom: "1px solid var(--border)", padding: "12px 18px", display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ width: 26, height: 26, borderRadius: 8, background: "#a78bfa", color: "#fff", fontWeight: 800, fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>3</span>
+          <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 15, color: "#a78bfa" }}>Save & Publish</div>
+        </div>
+        <div style={{ padding: 18 }}>
+          {formError && (
+            <div style={{ background: "rgba(239,68,68,.08)", border: "1px solid rgba(239,68,68,.25)", borderRadius: 8, padding: "10px 14px", color: "var(--danger)", fontSize: 13, fontFamily: "'DM Mono',monospace", marginBottom: 14 }}>⚠️ {formError}</div>
+          )}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button className="btn" style={{ flex: 1, minWidth: 140, background: "rgba(251,146,60,.1)", color: "var(--warn)", border: "1px solid rgba(251,146,60,.3)", fontWeight: 700, padding: "12px" }} onClick={() => createExam(false)}>
+              💾 Save as Draft
+            </button>
+            <button className="btn btn-accent" style={{ flex: 2, minWidth: 200, fontWeight: 800, fontSize: 14, padding: "12px" }} onClick={() => createExam(true)}>
+              🚀 Publish Exam to Class
+            </button>
+          </div>
+          <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "'DM Mono',monospace", marginTop: 10 }}>
+            Draft = only you can see it · Published = visible to all students in the selected class
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -4236,13 +4750,16 @@ function LecturerStudents({ toast }) {
 // CLASS EXAMS VIEW (Student)
 // ════════════════════════════════════════════════════════════════════
 function ClassExamsView({ toast, currentUser, userClass }) {
-  const [tab, setTab] = useState("mcq");
+  const [tab, setTab] = useState("set");
   const allMCQ = ls("nv-pq", DEFAULT_PQ);
   const allEssay = ls("nv-essay-banks", []);
+  const allClassExams = ls("nv-class-exams", []);
 
-  // Filter by student's class — show exams for their class OR exams with no class set
+  // Filter by student's class
   const mcqBanks = allMCQ.filter(b=>!b.classId || b.classId===userClass);
   const essayBanks = allEssay.filter(b=>!b.classId || b.classId===userClass);
+  // Only published exams for this student's class
+  const classExams = allClassExams.filter(e => e.isPublished && e.classId === userClass);
 
   return (
     <div>
@@ -4253,25 +4770,180 @@ function ClassExamsView({ toast, currentUser, userClass }) {
         </div>
         <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
           {[
-            {key:"mcq",icon:"📝",label:"MCQ Exams",sub:`${mcqBanks.length} available`},
+            {key:"set",icon:"🏆",label:"Set Exams",sub:`${classExams.length} available`},
+            {key:"mcq",icon:"📝",label:"MCQ Banks",sub:`${mcqBanks.length} available`},
             {key:"essay",icon:"✍️",label:"Essay Exams",sub:`${essayBanks.length} available`}
           ].map(t=>(
             <div key={t.key} onClick={()=>setTab(t.key)} style={{
-              flex:1,minWidth:160,padding:"12px 16px",borderRadius:11,cursor:"pointer",transition:"all .2s",
+              flex:1,minWidth:140,padding:"12px 16px",borderRadius:11,cursor:"pointer",transition:"all .2s",
               border:`1px solid ${tab===t.key?"var(--warn)":"var(--border)"}`,
               background:tab===t.key?"rgba(251,146,60,.1)":"transparent",textAlign:"center"
             }}>
               <div style={{fontSize:22,marginBottom:4}}>{t.icon}</div>
-              <div style={{fontWeight:700,fontSize:14,color:tab===t.key?"var(--warn)":"var(--text2)"}}>{t.label}</div>
+              <div style={{fontWeight:700,fontSize:13,color:tab===t.key?"var(--warn)":"var(--text2)"}}>{t.label}</div>
               <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:2}}>{t.sub}</div>
             </div>
           ))}
         </div>
       </div>
-      {tab==="mcq"
-        ? <MCQExamView toast={toast} currentUser={currentUser} banks={mcqBanks} />
-        : <EssayExamView toast={toast} currentUser={currentUser} essayBanks={essayBanks} />
-      }
+      {tab==="set" && <SetExamStudentView toast={toast} currentUser={currentUser} classExams={classExams} />}
+      {tab==="mcq" && <MCQExamView toast={toast} currentUser={currentUser} banks={mcqBanks} />}
+      {tab==="essay" && <EssayExamView toast={toast} currentUser={currentUser} essayBanks={essayBanks} />}
+    </div>
+  );
+}
+
+// ─── Student view for lecturer-set exams ─────────────────────────────
+function SetExamStudentView({ toast, currentUser, classExams }) {
+  const [sel, setSel] = useState(null);
+  const [answers, setAnswers] = useState({});
+  const [submitted, setSubmitted] = useState(false);
+  const [score, setScore] = useState(null);
+  const [timeLeft, setTimeLeft] = useState(null);
+  const [started, setStarted] = useState(false);
+  const [attempts, setAttempts] = useState(() => ls(`nv-set-exam-att-${currentUser}`, {}));
+  const [qIdx, setQIdx] = useState(0);
+
+  const startExam = (exam) => {
+    const att = ls(`nv-set-exam-att-${currentUser}`, {});
+    if (att[String(exam.id)]) { toast("You have already used your 1 attempt for this exam.", "error"); return; }
+    setSel(exam); setAnswers({}); setSubmitted(false); setScore(null); setQIdx(0);
+    setTimeLeft(exam.duration * 60);
+    setStarted(true);
+  };
+
+  React.useEffect(() => {
+    if (!started || timeLeft === null || submitted) return;
+    if (timeLeft <= 0) { submitExam(); return; }
+    const t = setTimeout(() => setTimeLeft(p => p - 1), 1000);
+    return () => clearTimeout(t);
+  }, [started, timeLeft, submitted]);
+
+  const submitExam = () => {
+    if (!sel) return;
+    let correct = 0;
+    sel.questions.forEach((q, i) => { if (answers[i] === q.ans) correct++; });
+    const pct = Math.round((correct / sel.questions.length) * 100);
+    const pass = correct >= (sel.passMark || Math.ceil(sel.questions.length * 0.5));
+    setScore({ correct, total: sel.questions.length, pct, pass });
+    setSubmitted(true);
+    const att = { ...attempts, [String(sel.id)]: { date: new Date().toLocaleDateString(), score: correct, total: sel.questions.length, pct, pass } };
+    setAttempts(att);
+    saveMyData("set-exam-att", `nv-set-exam-att-${currentUser}`, att);
+    toast(pass ? `Passed! ${correct}/${sel.questions.length} (${pct}%)` : `Submitted: ${correct}/${sel.questions.length} (${pct}%)`, pass ? "success" : "warn");
+  };
+
+  const fmtTime = (s) => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+
+  if (started && sel && !submitted) {
+    const q = sel.questions[qIdx];
+    const urgent = timeLeft !== null && timeLeft < 120;
+    return (
+      <div>
+        {/* Top bar */}
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+          <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16}}>{sel.title}</div>
+          <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+            <span style={{fontFamily:"'DM Mono',monospace",fontSize:13,fontWeight:700,color:urgent?"var(--danger)":"var(--text2)",background:urgent?"rgba(239,68,68,.1)":"var(--bg3)",padding:"6px 14px",borderRadius:8,border:`1px solid ${urgent?"rgba(239,68,68,.3)":"var(--border)"}`}}>⏱ {fmtTime(timeLeft)}</span>
+            <span style={{fontFamily:"'DM Mono',monospace",fontSize:12,color:"var(--text3)"}}>{Object.keys(answers).length}/{sel.questions.length} answered</span>
+            <button className="btn btn-accent btn-sm" style={{fontWeight:700}} onClick={submitExam}>Submit ✓</button>
+          </div>
+        </div>
+        {/* Progress */}
+        <div className="progress-wrap" style={{marginBottom:18,height:6}}>
+          <div className="progress-fill" style={{width:`${((qIdx+1)/sel.questions.length)*100}%`,background:"var(--warn)"}} />
+        </div>
+        {/* Question */}
+        <div className="card" style={{marginBottom:14}}>
+          <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)",marginBottom:8}}>Q {qIdx+1} of {sel.questions.length}</div>
+          <div style={{fontWeight:600,fontSize:15,lineHeight:1.6,marginBottom:16}}>{q.q}</div>
+          <div style={{display:"grid",gap:8}}>
+            {q.options.map((o, oi) => (
+              <button key={oi} onClick={() => setAnswers(a => ({...a,[qIdx]:oi}))}
+                style={{padding:"12px 16px",borderRadius:10,border:`2px solid ${answers[qIdx]===oi?"var(--warn)":"var(--border)"}`,background:answers[qIdx]===oi?"rgba(251,146,60,.12)":"var(--bg3)",cursor:"pointer",textAlign:"left",fontSize:14,fontWeight:answers[qIdx]===oi?700:400,color:answers[qIdx]===oi?"var(--warn)":"var(--text2)",transition:"all .15s",display:"flex",alignItems:"center",gap:12}}>
+                <span style={{width:28,height:28,borderRadius:7,border:`1.5px solid ${answers[qIdx]===oi?"var(--warn)":"var(--border)"}`,background:answers[qIdx]===oi?"var(--warn)":"transparent",color:answers[qIdx]===oi?"#000":"var(--text3)",fontFamily:"'DM Mono',monospace",fontWeight:700,fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{"ABCD"[oi]}</span>
+                {o}
+              </button>
+            ))}
+          </div>
+        </div>
+        {/* Nav */}
+        <div style={{display:"flex",justifyContent:"space-between",gap:8}}>
+          <button className="btn btn-sm" disabled={qIdx===0} onClick={() => setQIdx(i=>i-1)}>← Prev</button>
+          <div style={{display:"flex",gap:5,flexWrap:"wrap",justifyContent:"center",flex:1}}>
+            {sel.questions.map((_,i) => (
+              <button key={i} onClick={() => setQIdx(i)}
+                style={{width:30,height:30,borderRadius:6,border:`1.5px solid ${qIdx===i?"var(--warn)":answers[i]!==undefined?"var(--success)":"var(--border)"}`,background:qIdx===i?"rgba(251,146,60,.15)":answers[i]!==undefined?"rgba(74,222,128,.1)":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:qIdx===i?"var(--warn)":answers[i]!==undefined?"var(--success)":"var(--text3)",fontFamily:"'DM Mono',monospace"}}>
+                {i+1}
+              </button>
+            ))}
+          </div>
+          {qIdx < sel.questions.length - 1
+            ? <button className="btn btn-sm btn-accent" onClick={() => setQIdx(i=>i+1)}>Next →</button>
+            : <button className="btn btn-sm btn-accent" style={{fontWeight:700}} onClick={submitExam}>Submit ✓</button>
+          }
+        </div>
+      </div>
+    );
+  }
+
+  if (submitted && score && sel) return (
+    <div>
+      <div className="card" style={{textAlign:"center",padding:"40px 30px",marginBottom:20,border:`1px solid ${score.pass?"rgba(74,222,128,.35)":"rgba(239,68,68,.25)"}`,background:score.pass?"rgba(74,222,128,.05)":"rgba(239,68,68,.03)"}}>
+        <div style={{fontSize:52,marginBottom:12}}>{score.pass?"🎉":"📋"}</div>
+        <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:24,marginBottom:4}}>{score.pass?"Passed!":"Submitted"}</div>
+        <div style={{fontSize:14,color:"var(--text2)",marginBottom:16}}>{sel.title}</div>
+        <div style={{fontFamily:"'DM Mono',monospace",fontSize:36,fontWeight:700,color:score.pass?"var(--success)":"var(--warn)"}}>{score.pct}%</div>
+        <div style={{fontSize:14,color:"var(--text3)",marginBottom:8}}>{score.correct} / {score.total} correct</div>
+        <div style={{fontSize:12,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginBottom:16}}>Pass mark: {sel.passMark || Math.ceil(sel.questions.length*0.5)} / {sel.totalMarks || sel.questions.length}</div>
+        <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:"var(--text3)"}}>🔒 1 attempt used — contact your lecturer to reset</span>
+      </div>
+      <button className="btn btn-sm" onClick={() => { setSel(null); setStarted(false); }}>← Back to Exams</button>
+    </div>
+  );
+
+  // Exam list
+  if (classExams.length === 0) return (
+    <div className="card" style={{textAlign:"center",padding:"50px 30px",color:"var(--text3)"}}>
+      <div style={{fontSize:44,marginBottom:10}}>🏆</div>
+      <div style={{fontFamily:"'DM Mono',monospace",fontSize:13}}>No class exams available yet.</div>
+      <div style={{fontSize:12,marginTop:6}}>Your lecturer will publish exams here when ready.</div>
+    </div>
+  );
+
+  return (
+    <div style={{display:"grid",gap:12}}>
+      {classExams.map(exam => {
+        const att = attempts[String(exam.id)];
+        return (
+          <div key={exam.id} className="card" style={{animation:"fadeUp .3s ease",border:att?"1px solid rgba(74,222,128,.2)":"1px solid var(--border)"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,flexWrap:"wrap"}}>
+              <div style={{flex:1}}>
+                {exam.subject && <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--accent)",marginBottom:4}}>{exam.subject}</div>}
+                <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16,marginBottom:6}}>{exam.title}</div>
+                <div style={{display:"flex",gap:12,flexWrap:"wrap",fontSize:12,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>
+                  <span>📝 {exam.questionCount} Qs</span>
+                  <span>⏱ {exam.duration} min</span>
+                  {exam.date && <span>📅 {exam.date}</span>}
+                  <span>🎯 Pass: {exam.passMark}/{exam.totalMarks}</span>
+                </div>
+                {exam.instructions && <div style={{fontSize:12,color:"var(--text2)",marginTop:8,lineHeight:1.5,fontStyle:"italic"}}>📋 {exam.instructions}</div>}
+                {att && (
+                  <div style={{marginTop:8,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:"var(--success)",background:"rgba(74,222,128,.1)",border:"1px solid rgba(74,222,128,.25)",borderRadius:5,padding:"2px 8px"}}>✓ Completed {att.date}</span>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:"var(--text2)",background:"var(--bg3)",borderRadius:5,padding:"2px 8px",border:"1px solid var(--border)"}}>{att.correct}/{att.total} · {att.pct}%</span>
+                    {att.pass && <span style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--success)"}}>PASSED</span>}
+                  </div>
+                )}
+              </div>
+              {!att
+                ? <button className="btn btn-accent btn-sm" style={{fontWeight:700}} onClick={() => startExam(exam)}>Start Exam ▶</button>
+                : <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:"var(--text3)"}}>🔒 Attempted</span>
+              }
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -4461,7 +5133,7 @@ function StudyProgress() {
 // MAIN APP
 // ════════════════════════════════════════════════════════════════════
 export default function App() {
-  useEffect(() => { initData(); hydrateFromBackend(); }, []);
+  useEffect(() => { hydrateFromBackend(); }, []);
 
   const [page, setPage] = useState("auth");
   const [authTab, setAuthTab] = useState("signin");
@@ -4590,7 +5262,7 @@ export default function App() {
     <>
       <style>{CSS}</style>
       <div className="auth-page">
-        <div className="auth-wrap" style={{width:"100%",maxWidth:440,padding:20,margin:"auto"}}>
+        <div className="auth-wrap" style={{width:"100%",maxWidth:440,padding:20,margin:"auto",position:"relative",zIndex:1}}>
           <div className="auth-card">
             <div className="auth-logo">
               <div className="auth-logo-icon">🏥</div>
