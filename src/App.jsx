@@ -3020,14 +3020,20 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
 
   const pushNotification = (item) => {
     const notifs = ls("nv-notifications", []);
-    saveMyData("notifications","nv-notifications",[{
+    const newNotif = {
       id:Date.now(), type:"handout",
       title:`New handout: ${item.title}`,
       body:`${currentUser.split("@")[0]} uploaded ${item.fileName?`a ${fileLabel(item.fileMime)} file`:"notes"}${item.course?` for ${item.course}`:""}`,
       from:currentUser, date:new Date().toLocaleDateString(),
       time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),
       read:false, handoutId:item.id
-    }, ...notifs]);
+    };
+    // Save to shared storage so ALL students receive this notification
+    saveShared("announcements", ls("nv-announcements", [])); // ensure announcements in sync
+    const updatedNotifs = [newNotif, ...notifs];
+    lsSet("nv-notifications", updatedNotifs);
+    bsSet("db:notifications", updatedNotifs, true);
+    notifyUserKey("nv-notifications");
   };
 
   const handleFile = (data, name, mime, err) => {
@@ -3636,6 +3642,264 @@ Tip: Be specific, use nursing terms, and cover all aspects of the question.`}
 }
 
 
+// ── Lecturer MCQ Bank Manager ─────────────────────────────────────────
+function LecturerMCQ({ toast, currentUser }) {
+  const classes = useShared("classes", DEFAULT_CLASSES);
+  const [banks, setBanks] = useHydratedShared("nv-pq", "pq", DEFAULT_PQ);
+  const [selBank, setSelBank] = useState(null);
+  const [showBankModal, setShowBankModal] = useState(false);
+  const [showQModal, setShowQModal] = useState(false);
+  const [editBank, setEditBank] = useState(null);
+  const [editQ, setEditQ] = useState(null);
+  const [inputMode, setInputMode] = useState("single");
+  const [pasteText, setPasteText] = useState("");
+  const [answerKeyText, setAnswerKeyText] = useState("");
+  const [parsed, setParsed] = useState([]);
+  const [parseError, setParseError] = useState("");
+  const [bankForm, setBankForm] = useState({subject:"",year:"",classId:""});
+  const [qForm, setQForm] = useState({q:"",options:["","","",""],ans:0});
+
+  const myBanks = banks; // lecturers see all banks (can be filtered by createdBy if desired)
+
+  const doParse = () => {
+    setParseError(""); setParsed([]);
+    const result = parseMCQText(pasteText);
+    if (result.type === "answerkey") { setParseError("Looks like an answer key — use the Apply Answers tab."); return; }
+    if (!result.questions.length) { setParseError("Could not parse questions. Check the format guide."); return; }
+    setParsed(result.questions);
+  };
+
+  const doImport = () => {
+    if (!selBank) return toast("Select a bank first","error");
+    const updated = banks.map(b=>b.id===selBank?{...b,questions:[...b.questions,...parsed]}:b);
+    setBanks(updated); saveShared("pq",updated);
+    toast(`${parsed.length} questions imported!`,"success");
+    setPasteText(""); setParsed([]); setInputMode("single");
+  };
+
+  const doApplyAnswerKey = () => {
+    if (!selBank) return toast("Select a bank first","error");
+    setParseError("");
+    const text = answerKeyText.trim();
+    const inlineMatches = [...text.matchAll(/(\d+)[.)]\s*([A-Da-d])/g)];
+    if (inlineMatches.length) {
+      const key = inlineMatches.map(m=>({num:+m[1], ans:"ABCD".indexOf(m[2].toUpperCase())}));
+      const updated = banks.map(b=>b.id===selBank?{...b,questions:applyAnswerKey(b.questions,key)}:b);
+      setBanks(updated); saveShared("pq",updated);
+      toast(`Applied ${key.length} answers!`,"success"); setAnswerKeyText(""); return;
+    }
+    const letterLines = text.split("\n").map(l=>l.trim()).filter(l=>/^[A-Da-d]$/.test(l));
+    if (letterLines.length) {
+      const key = letterLines.map((l,i)=>({num:i+1, ans:"ABCD".indexOf(l.toUpperCase())}));
+      const updated = banks.map(b=>b.id===selBank?{...b,questions:applyAnswerKey(b.questions,key)}:b);
+      setBanks(updated); saveShared("pq",updated);
+      toast(`Applied ${key.length} answers!`,"success"); setAnswerKeyText(""); return;
+    }
+    setParseError("Could not parse. Use: 1.B 2.C 3.A  or one letter per line.");
+  };
+
+  const saveBank = () => {
+    if (!bankForm.subject) return toast("Subject required","error");
+    let u;
+    if (editBank!==null) { u=banks.map((b,i)=>i===editBank?{...b,...bankForm,createdBy:b.createdBy||currentUser}:b); toast("Updated","success"); }
+    else { u=[...banks,{...bankForm,id:Date.now(),questions:[],createdBy:currentUser}]; toast("Bank created","success"); }
+    setBanks(u); saveShared("pq",u); setShowBankModal(false); setEditBank(null); setBankForm({subject:"",year:"",classId:""});
+  };
+
+  const delBank = (id) => {
+    if(!confirm("Delete this question bank?"))return;
+    const u=banks.filter(b=>b.id!==id); setBanks(u); saveShared("pq",u);
+    if(selBank===id)setSelBank(null); toast("Deleted","success");
+  };
+
+  const saveQ = () => {
+    if (!qForm.q) return toast("Question required","error");
+    const updated = banks.map(b=>{
+      if (b.id!==selBank) return b;
+      let qs;
+      if (editQ!==null) { qs=b.questions.map((q,i)=>i===editQ?{...qForm}:q); toast("Updated","success"); }
+      else { qs=[...b.questions,{...qForm}]; toast("Question added","success"); }
+      return {...b,questions:qs};
+    });
+    setBanks(updated); saveShared("pq",updated);
+    setShowQModal(false); setEditQ(null); setQForm({q:"",options:["","","",""],ans:0});
+  };
+
+  const delQ = (bankId, qIdx) => {
+    const u=banks.map(b=>b.id===bankId?{...b,questions:b.questions.filter((_,i)=>i!==qIdx)}:b);
+    setBanks(u); saveShared("pq",u); toast("Deleted","success");
+  };
+
+  const currentBank = banks.find(b=>b.id===selBank);
+
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <div className="sec-title">📝 MCQ Question Banks ({myBanks.length} banks)</div>
+        <button className="btn btn-accent" onClick={()=>{setShowBankModal(true);setEditBank(null);setBankForm({subject:"",year:"",classId:""});}}>+ New Bank</button>
+      </div>
+
+      <div className="grid2" style={{marginBottom:20}}>
+        {myBanks.map((b,i)=>{
+          const cls = classes.find(c=>c.id===b.classId);
+          return (
+            <div key={b.id} className="card" style={{cursor:"pointer",border:selBank===b.id?"1px solid var(--accent)":"1px solid var(--border)",transition:"border .2s"}} onClick={()=>{setSelBank(b.id);setInputMode("single");setParsed([]);setPasteText("");setAnswerKeyText("");}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                <div>
+                  {cls&&<span style={{fontSize:10,fontFamily:"'DM Mono',monospace",color:cls.color,background:`${cls.color}20`,padding:"1px 7px",borderRadius:4,marginBottom:5,display:"inline-block"}}>{cls.label}</span>}
+                  <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15}}>{b.subject}</div>
+                  <div style={{fontSize:12,color:"var(--text3)",marginTop:3}}>{b.year}{b.year?" · ":""}{b.questions.length} questions</div>
+                </div>
+                <div style={{display:"flex",gap:5,flexShrink:0}}>
+                  <button className="btn btn-sm" onClick={e=>{e.stopPropagation();setEditBank(i);setBankForm({subject:b.subject,year:b.year||"",classId:b.classId||""});setShowBankModal(true);}}>✏️</button>
+                  <button className="btn btn-sm btn-danger" onClick={e=>{e.stopPropagation();delBank(b.id);}}>🗑️</button>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {myBanks.length===0&&<div style={{gridColumn:"1/-1",textAlign:"center",padding:40,color:"var(--text3)",fontFamily:"'DM Mono',monospace",fontSize:13}}>No MCQ banks yet. Create one above.</div>}
+      </div>
+
+      {currentBank&&(
+        <div className="card">
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:8}}>
+            <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700}}>{currentBank.subject} — {currentBank.questions.length} Questions</div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {[{k:"single",icon:"➕",label:"Add One"},{k:"paste",icon:"📋",label:"Paste & Parse"},{k:"answerkey",icon:"🔑",label:"Apply Answers"}].map(({k,icon,label})=>(
+                <button key={k} className={`btn btn-sm${inputMode===k?" btn-accent":""}`} onClick={()=>{setInputMode(inputMode===k?"none":k);setParsed([]);setParseError("");}}>{icon} {label}</button>
+              ))}
+            </div>
+          </div>
+
+          {inputMode==="single"&&(
+            <div style={{background:"var(--bg4)",borderRadius:10,padding:16,marginBottom:16}}>
+              <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:14,marginBottom:12}}>➕ Add Single Question</div>
+              <label className="lbl">Question</label>
+              <textarea className="inp" rows={2} style={{resize:"vertical"}} placeholder="Type question..." value={qForm.q} onChange={e=>setQForm({...qForm,q:e.target.value})} />
+              {["A","B","C","D"].map((l,i)=>(
+                <div key={l} style={{display:"flex",gap:8,alignItems:"center",marginBottom:8}}>
+                  <span style={{width:22,fontFamily:"'DM Mono',monospace",fontSize:12,color:"var(--text3)",flexShrink:0}}>{l}.</span>
+                  <input className="inp" style={{marginBottom:0,flex:1}} placeholder={`Option ${l}`} value={qForm.options[i]} onChange={e=>{const o=[...qForm.options];o[i]=e.target.value;setQForm({...qForm,options:o});}} />
+                  <button onClick={()=>setQForm({...qForm,ans:i})} style={{width:28,height:28,borderRadius:6,border:`2px solid ${qForm.ans===i?"var(--success)":"var(--border)"}`,background:qForm.ans===i?"rgba(74,222,128,.15)":"transparent",cursor:"pointer",fontSize:13,flexShrink:0,color:qForm.ans===i?"var(--success)":"var(--text3)"}}>{qForm.ans===i?"✓":"○"}</button>
+                </div>
+              ))}
+              <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginBottom:10}}>Click ○ to mark correct · Selected: <b style={{color:"var(--success)"}}>{" ABCD"[qForm.ans]}</b></div>
+              <button className="btn btn-accent" onClick={saveQ}>➕ Add Question</button>
+            </div>
+          )}
+
+          {inputMode==="paste"&&(
+            <div style={{background:"var(--bg4)",borderRadius:10,padding:16,marginBottom:16}}>
+              <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:14,marginBottom:8}}>📋 Paste & Auto-Parse</div>
+              <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginBottom:10,lineHeight:1.9,background:"rgba(62,142,149,.08)",borderRadius:7,padding:"8px 12px"}}>
+                <b style={{color:"var(--accent)"}}>Any of these formats work:</b><br/>
+                Q: Question{"  "}A: Opt1{"  "}B: Opt2{"  "}C: Opt3{"  "}D: Opt4{"  "}ANS: B<br/>
+                (Separate multiple questions with a blank line)
+              </div>
+              <textarea className="paste-box" rows={10} placeholder={"Q: What is the normal adult temperature?\nA: 35.0 C\nB: 36.1-37.2 C\nC: 38.5 C\nD: 40.0 C\nANS: B"} value={pasteText} onChange={e=>{setPasteText(e.target.value);setParsed([]);setParseError("");}} />
+              {parseError&&<div style={{color:"var(--danger)",fontSize:12,fontFamily:"'DM Mono',monospace",marginBottom:8}}>⚠️ {parseError}</div>}
+              <div style={{display:"flex",gap:8,marginBottom:parsed.length?12:0}}>
+                <button className="btn btn-accent" onClick={doParse}>🔍 Parse</button>
+                {parsed.length>0&&<button className="btn btn-success" onClick={doImport}>✅ Import {parsed.length} Questions</button>}
+                <button className="btn" onClick={()=>{setInputMode("single");setParsed([]);setPasteText("");setParseError("");}}>Cancel</button>
+              </div>
+              {parsed.length>0&&(
+                <div className="parse-preview">
+                  {parsed.map((p,i)=>(
+                    <div key={i} className="parse-item">
+                      <span className="parse-check">✓</span>
+                      <span style={{flex:1,fontSize:12}}>{p.q.slice(0,80)}{p.q.length>80?"...":""}</span>
+                      <span style={{color:"var(--success)",fontFamily:"'DM Mono',monospace",fontSize:11,flexShrink:0}}>ANS: {"ABCD"[p.ans]}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {inputMode==="answerkey"&&(
+            <div style={{background:"var(--bg4)",borderRadius:10,padding:16,marginBottom:16}}>
+              <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:14,marginBottom:8}}>🔑 Apply Answer Key</div>
+              <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginBottom:10,lineHeight:1.9,background:"rgba(167,139,250,.08)",borderRadius:7,padding:"8px 12px"}}>
+                <b style={{color:"var(--purple)"}}>Paste just the answers:</b><br/>
+                1.B 2.C 3.A 4.D 5.B  or  B / C / A (one per line)<br/>
+                <b>Bank has {currentBank.questions.length} questions.</b>
+              </div>
+              <textarea className="paste-box" rows={5} placeholder={"1.B 2.C 3.A 4.D\n\n— or —\n\nB\nC\nA\nD"} value={answerKeyText} onChange={e=>{setAnswerKeyText(e.target.value);setParseError("");}} />
+              {parseError&&<div style={{color:"var(--danger)",fontSize:12,fontFamily:"'DM Mono',monospace",marginBottom:8}}>⚠️ {parseError}</div>}
+              <div style={{display:"flex",gap:8}}>
+                <button className="btn btn-purple" onClick={doApplyAnswerKey}>🔑 Apply Answers</button>
+                <button className="btn" onClick={()=>{setInputMode("single");setAnswerKeyText("");setParseError("");}}>Cancel</button>
+              </div>
+            </div>
+          )}
+
+          {currentBank.questions.length===0 ? (
+            <div style={{textAlign:"center",color:"var(--text3)",padding:30,fontFamily:"'DM Mono',monospace",fontSize:13}}>No questions yet. Use Add One or Paste & Parse above.</div>
+          ) : (
+            <div style={{display:"grid",gap:8,marginTop:8}}>
+              {currentBank.questions.map((q,qi)=>(
+                <div key={qi} style={{background:"var(--bg3)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--border)"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",gap:10}}>
+                    <div style={{flex:1}}>
+                      <div style={{fontWeight:600,fontSize:13,marginBottom:8}}>{qi+1}. {q.q}</div>
+                      <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+                        {q.options.map((opt,oi)=>(
+                          <span key={oi} style={{fontSize:11,padding:"3px 9px",borderRadius:5,background:oi===q.ans?"rgba(74,222,128,.15)":"rgba(255,255,255,.04)",border:`1px solid ${oi===q.ans?"var(--success)":"var(--border)"}`,color:oi===q.ans?"var(--success)":"var(--text3)"}}>
+                            {"ABCD"[oi]}. {opt}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <div style={{display:"flex",gap:5,flexShrink:0}}>
+                      <button className="btn btn-sm" onClick={()=>{setEditQ(qi);setQForm({...q});setShowQModal(true);}}>✏️</button>
+                      <button className="btn btn-sm btn-danger" onClick={()=>delQ(currentBank.id,qi)}>🗑️</button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {showBankModal&&(
+        <div className="modal-overlay" onClick={()=>setShowBankModal(false)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head"><div className="modal-title">{editBank!==null?"Edit Bank":"New Question Bank"}</div><button className="modal-close" onClick={()=>setShowBankModal(false)}>✕</button></div>
+            <label className="lbl">Subject</label><input className="inp" placeholder="e.g. Anatomy & Physiology" value={bankForm.subject} onChange={e=>setBankForm({...bankForm,subject:e.target.value})} />
+            <label className="lbl">Year / Exam Label (optional)</label><input className="inp" placeholder="e.g. 2023" value={bankForm.year} onChange={e=>setBankForm({...bankForm,year:e.target.value})} />
+            <label className="lbl">Target Class (optional)</label>
+            <select className="inp" value={bankForm.classId||""} onChange={e=>setBankForm({...bankForm,classId:e.target.value})}>
+              <option value="">All Classes (Past Questions)</option>
+              {classes.map(c=><option key={c.id} value={c.id}>{c.label} — {c.desc}</option>)}
+            </select>
+            <div style={{display:"flex",gap:8}}><button className="btn btn-accent" style={{flex:1}} onClick={saveBank}>Save</button><button className="btn" onClick={()=>setShowBankModal(false)}>Cancel</button></div>
+          </div>
+        </div>
+      )}
+
+      {showQModal&&(
+        <div className="modal-overlay" onClick={()=>setShowQModal(false)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head"><div className="modal-title">{editQ!==null?"Edit":"Add"} Question</div><button className="modal-close" onClick={()=>setShowQModal(false)}>✕</button></div>
+            <label className="lbl">Question</label><textarea className="inp" rows={3} style={{resize:"vertical"}} value={qForm.q} onChange={e=>setQForm({...qForm,q:e.target.value})} />
+            {["A","B","C","D"].map((l,i)=>(
+              <div key={l}><label className="lbl">Option {l}</label><input className="inp" value={qForm.options[i]} onChange={e=>{const o=[...qForm.options];o[i]=e.target.value;setQForm({...qForm,options:o});}} /></div>
+            ))}
+            <label className="lbl">Correct Answer</label>
+            <select className="inp" value={qForm.ans} onChange={e=>setQForm({...qForm,ans:+e.target.value})}>
+              {["A","B","C","D"].map((l,i)=><option key={l} value={i}>Option {l}: {qForm.options[i]}</option>)}
+            </select>
+            <div style={{display:"flex",gap:8}}><button className="btn btn-accent" style={{flex:1}} onClick={saveQ}>Save</button><button className="btn" onClick={()=>setShowQModal(false)}>Cancel</button></div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ════════════════════════════════════════════════════════════════════
 // LECTURER PORTAL
 // ════════════════════════════════════════════════════════════════════
@@ -4198,14 +4462,19 @@ function LecturerHandouts({ toast, currentUser }) {
 
   const pushNotification = (h) => {
     const notifs = ls("nv-notifications", []);
-    saveMyData("notifications","nv-notifications",[{
+    const newNotif = {
       id:Date.now(), type:"handout",
       title:`New handout: ${h.title}`,
       body:`${currentUser.split("@")[0]} uploaded ${h.fileName ? `a ${fileLabel(h.fileMime)} file` : "notes"}${h.course?` for ${h.course}`:""}`,
       from:currentUser, date:new Date().toLocaleDateString(),
       time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),
       read:false, handoutId:h.id
-    }, ...notifs]);
+    };
+    // Save to shared storage so ALL students receive this notification
+    const updatedNotifs = [newNotif, ...notifs];
+    lsSet("nv-notifications", updatedNotifs);
+    bsSet("db:notifications", updatedNotifs, true);
+    notifyUserKey("nv-notifications");
   };
 
   const save = () => {
@@ -5099,17 +5368,50 @@ function Messages({ user, toast }) {
 }
 
 function Notifications({ currentUser, onRead }) {
-  const [notifs, setNotifs] = useHydratedUser("nv-notifications", "notifications", []);
+  // Notifications are stored in shared storage so all students receive them
+  const [notifs, setNotifs] = useState(() => ls("nv-notifications", []));
+  
+  useEffect(() => {
+    // Hydrate from shared backend on mount
+    bsGet("db:notifications", true).then(remote => {
+      if (remote && Array.isArray(remote)) {
+        lsSet("nv-notifications", remote);
+        setNotifs(remote);
+      }
+    }).catch(() => {});
+    // Also listen for local pushes
+    const refresh = () => setNotifs(ls("nv-notifications", []));
+    if (!_userSubs["nv-notifications"]) _userSubs["nv-notifications"] = new Set();
+    _userSubs["nv-notifications"].add(refresh);
+    window.addEventListener("nv:user-hydrated", refresh);
+    window.addEventListener("nv:shared-hydrated", refresh);
+    return () => {
+      _userSubs["nv-notifications"]?.delete(refresh);
+      window.removeEventListener("nv:user-hydrated", refresh);
+      window.removeEventListener("nv:shared-hydrated", refresh);
+    };
+  }, []);
 
   useEffect(() => {
-    // Mark all as read
+    // Mark all as read - save back to shared storage
     const updated = notifs.map(n=>({...n,read:true}));
+    lsSet("nv-notifications", updated);
+    bsSet("db:notifications", updated, true);
     setNotifs(updated);
     if (onRead) onRead();
   }, []);
 
-  const del = (id) => { const u=notifs.filter(n=>n.id!==id); setNotifs(u); };
-  const clearAll = () => { setNotifs([]); };
+  const del = (id) => {
+    const u=notifs.filter(n=>n.id!==id);
+    lsSet("nv-notifications", u);
+    bsSet("db:notifications", u, true);
+    setNotifs(u);
+  };
+  const clearAll = () => {
+    lsSet("nv-notifications", []);
+    bsSet("db:notifications", [], true);
+    setNotifs([]);
+  };
 
   const typeIcon = (type) => { if(type==="handout")return"📄"; if(type==="announcement")return"📢"; return"🔔"; };
   const typeColor = (type) => { if(type==="handout")return"var(--accent)"; if(type==="announcement")return"var(--warn)"; return"var(--text3)"; };
@@ -5237,8 +5539,15 @@ export default function App() {
     setIsLecturer(user.role === "lecturer");
     setCurrentUserClass(user.class || "");
     setPage("app");
-    const notifs = ls("nv-notifications", []);
-    setUnreadNotifs(notifs.filter(n => !n.read).length);
+    // Read unread count from shared notifications
+    bsGet("db:notifications", true).then(sharedNotifs => {
+      const list = Array.isArray(sharedNotifs) ? sharedNotifs : ls("nv-notifications", []);
+      lsSet("nv-notifications", list);
+      setUnreadNotifs(list.filter(n => !n.read).length);
+    }).catch(() => {
+      const notifs = ls("nv-notifications", []);
+      setUnreadNotifs(notifs.filter(n => !n.read).length);
+    });
     toast("Welcome back! 👋", "success");
     setLoginLoading(false);
   };
