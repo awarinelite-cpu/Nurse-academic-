@@ -61,6 +61,7 @@ const SK = {
   handouts:      ["nv-handouts",      "db:handouts"],
   essayBanks:    ["nv-essay-banks",   "db:essay-banks"],
   classExams:    ["nv-class-exams",   "db:class-exams"],
+  messages:      ["nv-messages",      "db:messages"],
 };
 // saveShared: write to cache+localStorage immediately, fire backend async, notify React subscribers
 const _sharedSubs = {}; // key → Set of () => void
@@ -3018,6 +3019,13 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
   const [fileMime, setFileMime] = useState("");
   const [uploading] = useState(false);
 
+  // Hydrate from backend on mount for cross-device sync
+  useEffect(() => {
+    loadShared("handouts", []).then(data => {
+      if (data) { lsSet("nv-handouts", data); notifyKey("handouts"); }
+    }).catch(() => {});
+  }, []);
+
   const pushNotification = (item) => {
     const notifs = ls("nv-notifications", []);
     const newNotif = {
@@ -3953,6 +3961,13 @@ function LecturerSetExam({ toast, currentUser }) {
   });
   const [formError, setFormError] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
+
+  // Hydrate from backend on mount so lecturer sees latest state across devices
+  useEffect(() => {
+    loadShared("classExams", []).then(data => {
+      if (data) { lsSet("nv-class-exams", data); notifyKey("classExams"); }
+    }).catch(() => {});
+  }, []);
 
   const myExams = exams.filter(e => e.createdBy === currentUser);
 
@@ -5051,6 +5066,18 @@ function ClassExamsView({ toast, currentUser, userClass }) {
   const allEssay = useShared("essayBanks", []);
   const allClassExams = useShared("classExams", []);
 
+  // Explicitly hydrate from backend on mount so exams sync across devices
+  useEffect(() => {
+    loadShared("classExams", []).then(() => notifyKey("classExams")).catch(() => {});
+    loadShared("pq", DEFAULT_PQ).then(() => notifyKey("pq")).catch(() => {});
+    loadShared("essayBanks", []).then(() => notifyKey("essayBanks")).catch(() => {});
+    // Poll every 30s for new exams published by lecturer
+    const interval = setInterval(() => {
+      loadShared("classExams", []).then(() => notifyKey("classExams")).catch(() => {});
+    }, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
   // Filter by student's class
   const mcqBanks = allMCQ.filter(b=>!b.classId || b.classId===userClass);
   const essayBanks = allEssay.filter(b=>!b.classId || b.classId===userClass);
@@ -5248,6 +5275,11 @@ function PastQuestionsView({ toast, currentUser }) {
   const mcqBanks = useShared("pq", DEFAULT_PQ);
   const essayBanks = useShared("essayBanks", []);
 
+  useEffect(() => {
+    loadShared("pq", DEFAULT_PQ).then(() => notifyKey("pq")).catch(() => {});
+    loadShared("essayBanks", []).then(() => notifyKey("essayBanks")).catch(() => {});
+  }, []);
+
   return (
     <div>
       <div style={{marginBottom:20}}>
@@ -5359,12 +5391,122 @@ function StudyPlanner({ toast }) {
   return<div><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}><div><div className="sec-title">📅 Study Planner</div><div className="sec-sub">{pending} task{pending!==1?"s":""} pending</div></div><button className="btn btn-accent" onClick={()=>setShowAdd(true)}>+ Add Task</button></div>{tasks.length===0&&<div style={{textAlign:"center",padding:"60px",color:"var(--text3)"}}><div style={{fontSize:48}}>✅</div><div style={{fontFamily:"'DM Mono',monospace",fontSize:13,marginTop:12}}>No tasks!</div></div>}{tasks.map(t=><div key={t.id} className="card2" style={{marginBottom:8,display:"flex",alignItems:"center",gap:12,opacity:t.done?.5:1}}><div style={{width:22,height:22,borderRadius:6,border:`2px solid ${t.done?"var(--success)":"var(--border2)"}`,background:t.done?"var(--success)":"transparent",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all .2s"}} onClick={()=>toggle(t.id)}>{t.done&&<span style={{fontSize:12,color:"white"}}>✓</span>}</div><div style={{flex:1}}><div style={{fontWeight:600,fontSize:14,textDecoration:t.done?"line-through":"none"}}>{t.task}</div>{(t.subject||t.due)&&<div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{t.subject}{t.subject&&t.due?" · ":""}{t.due}</div>}</div><span className="tag" style={{borderColor:pColor[t.priority],color:pColor[t.priority]}}>{t.priority}</span><button className="btn btn-sm btn-danger" onClick={()=>del(t.id)}>✕</button></div>)}{showAdd&&<div className="modal-overlay" onClick={()=>setShowAdd(false)}><div className="modal" onClick={e=>e.stopPropagation()}><div className="modal-head"><div className="modal-title">Add Task</div><button className="modal-close" onClick={()=>setShowAdd(false)}>✕</button></div><label className="lbl">Task</label><input className="inp" value={form.task} onChange={e=>setForm({...form,task:e.target.value})} /><label className="lbl">Subject</label><input className="inp" value={form.subject} onChange={e=>setForm({...form,subject:e.target.value})} /><label className="lbl">Due Date</label><input className="inp" type="date" value={form.due} onChange={e=>setForm({...form,due:e.target.value})} /><label className="lbl">Priority</label><select className="inp" value={form.priority} onChange={e=>setForm({...form,priority:e.target.value})}>{["High","Medium","Low"].map(p=><option key={p}>{p}</option>)}</select><div style={{display:"flex",gap:8}}><button className="btn btn-accent" style={{flex:1}} onClick={save}>Add</button><button className="btn" onClick={()=>setShowAdd(false)}>Cancel</button></div></div></div>}</div>;
 }
 
-function Messages({ user, toast }) {
-  const [msgs, setMsgs] = useState(()=>ls("nv-messages",[{id:1,from:"System",text:"Welcome to Nursing Academic Hub! 🎉",time:"Now",read:true}]));
+function Messages({ user, toast, userClass }) {
+  // Messages are stored in shared storage keyed by class room so all class members can chat.
+  // Room key: "db:messages-{classId}" or "db:messages-general" for no class.
+  const roomKey = userClass ? `db:messages-${userClass}` : "db:messages-general";
+  const lsKey = userClass ? `nv-messages-${userClass}` : "nv-messages-general";
+  const [msgs, setMsgs] = useState(() => ls(lsKey, [{id:1,from:"System",text:"Welcome to Nursing Academic Hub! 🎉",time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),read:true}]));
   const [input, setInput] = useState("");
-  const announcements = ls("nv-announcements",[]);
-  const send=()=>{if(!input.trim())return;const msg={id:Date.now(),from:user,text:input,time:"Just now",read:true,mine:true};const u=[...msgs,msg];setMsgs(u);saveMyData("messages","nv-messages",u);setInput("");};
-  return<div><div className="sec-title">💬 Messages</div><div className="sec-sub">Notifications and chat</div>{announcements.filter(a=>a.pinned).map(a=><div key={a.id} style={{background:"rgba(251,146,60,.08)",border:"1px solid rgba(251,146,60,.2)",borderRadius:10,padding:"10px 14px",marginBottom:10,fontSize:13}}><b>📌 {a.title}:</b> {a.body}</div>)}<div className="card" style={{marginBottom:14,minHeight:250,display:"flex",flexDirection:"column",gap:8,padding:14}}>{msgs.map(m=><div key={m.id} style={{display:"flex",gap:8,alignItems:"flex-start",justifyContent:m.mine?"flex-end":"flex-start"}}>{!m.mine&&<div style={{width:30,height:30,borderRadius:50,background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,flexShrink:0}}>📢</div>}<div style={{maxWidth:"75%"}}>{!m.mine&&<div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginBottom:3}}>{m.from} · {m.time}</div>}<div style={{background:m.mine?"linear-gradient(135deg,var(--accent),var(--accent2))":"var(--card2)",borderRadius:m.mine?"14px 14px 4px 14px":"14px 14px 14px 4px",padding:"9px 13px",fontSize:14,color:m.mine?"white":"var(--text)"}}>{m.text}</div></div></div>)}</div><div style={{display:"flex",gap:8}}><input className="inp" style={{flex:1,marginBottom:0}} placeholder="Type a message..." value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&send()} /><button className="btn btn-accent" onClick={send}>Send</button></div></div>;
+  const [sending, setSending] = useState(false);
+  const announcements = useShared("announcements", []);
+  const msgsEndRef = React.useRef(null);
+
+  // Hydrate from shared backend and poll every 5 seconds for new messages
+  useEffect(() => {
+    const fetchMsgs = () => {
+      bsGet(roomKey, true).then(remote => {
+        if (remote && Array.isArray(remote) && remote.length > 0) {
+          lsSet(lsKey, remote);
+          setMsgs(remote);
+        }
+      }).catch(() => {});
+    };
+    fetchMsgs();
+    const interval = setInterval(fetchMsgs, 5000);
+    return () => clearInterval(interval);
+  }, [roomKey, lsKey]);
+
+  // Scroll to bottom on new messages
+  useEffect(() => {
+    msgsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [msgs]);
+
+  const send = async () => {
+    if (!input.trim() || sending) return;
+    setSending(true);
+    const now = new Date();
+    const msg = {
+      id: Date.now(),
+      from: user,
+      text: input.trim(),
+      time: now.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}),
+      date: now.toLocaleDateString(),
+      read: true,
+      mine: true
+    };
+    const current = ls(lsKey, []);
+    const updated = [...current, msg];
+    // Save locally immediately
+    lsSet(lsKey, updated);
+    setMsgs(updated);
+    setInput("");
+    // Save to shared backend so all class members receive it
+    try {
+      await bsSet(roomKey, updated, true);
+    } catch(e) {
+      toast("Message saved locally — will sync when online", "warn");
+    }
+    setSending(false);
+  };
+
+  const pinnedAnnouncements = announcements.filter(a=>a.pinned);
+
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12,flexWrap:"wrap",gap:8}}>
+        <div>
+          <div className="sec-title">💬 Class Messages</div>
+          <div className="sec-sub">{userClass ? `Class: ${userClass}` : "General"} · messages sync live</div>
+        </div>
+      </div>
+      {pinnedAnnouncements.map(a=>(
+        <div key={a.id} style={{background:"rgba(251,146,60,.08)",border:"1px solid rgba(251,146,60,.2)",borderRadius:10,padding:"10px 14px",marginBottom:10,fontSize:13}}>
+          <b>📌 {a.title}:</b> {a.body}
+        </div>
+      ))}
+      <div className="card" style={{marginBottom:14,minHeight:280,maxHeight:420,display:"flex",flexDirection:"column",gap:8,padding:14,overflowY:"auto"}}>
+        {msgs.map(m => {
+          const isMe = m.from === user;
+          return (
+            <div key={m.id} style={{display:"flex",gap:8,alignItems:"flex-start",justifyContent:isMe?"flex-end":"flex-start"}}>
+              {!isMe && (
+                <div style={{width:30,height:30,borderRadius:50,background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,flexShrink:0}}>
+                  {m.from==="System" ? "📢" : m.from.charAt(0).toUpperCase()}
+                </div>
+              )}
+              <div style={{maxWidth:"75%"}}>
+                {!isMe && (
+                  <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginBottom:3}}>
+                    {m.from} · {m.time}
+                  </div>
+                )}
+                <div style={{background:isMe?"linear-gradient(135deg,var(--accent),var(--accent2))":"var(--card2)",borderRadius:isMe?"14px 14px 4px 14px":"14px 14px 14px 4px",padding:"9px 13px",fontSize:14,color:isMe?"white":"var(--text)"}}>
+                  {m.text}
+                </div>
+                {isMe && <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:3,textAlign:"right"}}>{m.time}</div>}
+              </div>
+            </div>
+          );
+        })}
+        <div ref={msgsEndRef} />
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <input
+          className="inp"
+          style={{flex:1,marginBottom:0}}
+          placeholder="Type a message..."
+          value={input}
+          onChange={e=>setInput(e.target.value)}
+          onKeyDown={e=>e.key==="Enter"&&send()}
+          disabled={sending}
+        />
+        <button className="btn btn-accent" onClick={send} disabled={sending}>
+          {sending ? "..." : "Send"}
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function Notifications({ currentUser, onRead }) {
@@ -5526,7 +5668,6 @@ export default function App() {
       safeLoad(() => loadUser(u, "timetable",     "nv-timetable",         [])).then(() => notifyUserKey("nv-timetable")),
       safeLoad(() => loadUser(u, "gpa-courses",   "nv-gpa-courses",       [])).then(() => notifyUserKey("nv-gpa-courses")),
       safeLoad(() => loadUser(u, "skills-done",   "nv-skills-done",       {})).then(() => notifyUserKey("nv-skills-done")),
-      safeLoad(() => loadUser(u, "messages",      "nv-messages",          [])).then(() => notifyUserKey("nv-messages")),
     ]);
 
     // 3. All done — enter the app regardless of any storage errors above
@@ -5600,7 +5741,7 @@ export default function App() {
       case "questions": return <PastQuestionsView toast={toast} currentUser={currentUser} />;
       case "classexams": return <ClassExamsView toast={toast} currentUser={currentUser} userClass={currentUserClass} />;
       case "lecturer": return <LecturerPage toast={toast} currentUser={currentUser} />;
-      case "messages": return <Messages user={currentUser} toast={toast} />;
+      case "messages": return <Messages user={currentUser} toast={toast} userClass={currentUserClass} />;
       case "notifications": return <Notifications currentUser={currentUser} onRead={()=>setUnreadNotifs(0)} />;
       default: return <Dashboard user={currentUser} onNavigate={navigate} />;
     }
