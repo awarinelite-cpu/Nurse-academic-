@@ -5151,6 +5151,10 @@ function SetExamStudentView({ toast, currentUser, classExams }) {
     setSubmitted(true);
     const newAtt = { ...attempts, [String(sel.id)]: { date: new Date().toLocaleDateString(), score: correct, total: sel.questions.length, pct, pass } };
     setAttempts(newAtt); // useHydratedUser auto-saves to backend
+    // Save to results list so it shows on the Results page
+    const prevResults = ls("nv-results", []);
+    saveMyData("results", "nv-results", [...prevResults, { id: Date.now(), subject: sel.title || sel.subject || "Set Exam", type: "Set Exam", score: correct, total: sel.questions.length, pct, date: new Date().toLocaleDateString() }]);
+    notifyUserKey("nv-results");
     toast(pass ? `Passed! ${correct}/${sel.questions.length} (${pct}%)` : `Submitted: ${correct}/${sel.questions.length} (${pct}%)`, pass ? "success" : "warn");
   };
 
@@ -5367,6 +5371,181 @@ function MedCalc() {
   const bmiVal=bmi.h&&bmi.w?(+bmi.w/(+bmi.h/100)**2).toFixed(1):null;
   const bmiCls=bmiVal?+bmiVal<18.5?"Underweight":+bmiVal<25?"Normal":+bmiVal<30?"Overweight":"Obese":null;
   return<div><div className="sec-title">🧮 Med Calculator</div><div className="sec-sub">Drug dosage & BMI</div><div className="grid2"><div className="card"><div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,marginBottom:12}}>💊 Dose Calculator</div><label className="lbl">Dose (mg/kg)</label><input className="inp" type="number" placeholder="10" value={dose} onChange={e=>setDose(e.target.value)} /><label className="lbl">Weight (kg)</label><input className="inp" type="number" placeholder="70" value={weight} onChange={e=>setWeight(e.target.value)} />{result&&<div className="card2" style={{textAlign:"center",marginBottom:12}}><div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>REQUIRED DOSE</div><div style={{fontFamily:"'Syne',sans-serif",fontSize:26,fontWeight:800,color:"var(--accent)"}}>{result} mg</div></div>}<label className="lbl">Drug Available (mg)</label><input className="inp" type="number" value={avail} onChange={e=>setAvail(e.target.value)} /><label className="lbl">Available Volume (mL)</label><input className="inp" type="number" value={vol} onChange={e=>setVol(e.target.value)} />{volume&&<div className="card2" style={{textAlign:"center"}}><div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>GIVE</div><div style={{fontFamily:"'Syne',sans-serif",fontSize:26,fontWeight:800,color:"var(--accent2)"}}>{volume} mL</div></div>}</div><div className="card"><div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,marginBottom:12}}>⚖️ BMI</div><label className="lbl">Height (cm)</label><input className="inp" type="number" value={bmi.h} onChange={e=>setBmi({...bmi,h:e.target.value})} /><label className="lbl">Weight (kg)</label><input className="inp" type="number" value={bmi.w} onChange={e=>setBmi({...bmi,w:e.target.value})} />{bmiVal&&<div className="card2" style={{textAlign:"center"}}><div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>BMI</div><div style={{fontFamily:"'Syne',sans-serif",fontSize:48,fontWeight:800,color:"var(--accent)"}}>{bmiVal}</div><div style={{color:+bmiVal<18.5?"var(--warn)":+bmiVal<25?"var(--success)":+bmiVal<30?"var(--warn)":"var(--danger)",fontWeight:600}}>{bmiCls}</div></div>}</div></div></div>;
+}
+
+// ─── Results ─────────────────────────────────────────────────────────
+function Results({ toast }) {
+  const [results, setResults] = useHydratedUser("nv-results", "results", []);
+  const [filter, setFilter] = useState("all"); // all | MCQ Exam | Essay (AI) | Set Exam
+  const [sortBy, setSortBy] = useState("date"); // date | score | subject
+  const [showClear, setShowClear] = useState(false);
+
+  // Hydrate from backend on mount
+  useEffect(() => {
+    loadUser(_currentUser, "results", "nv-results", []).then(() => notifyUserKey("nv-results")).catch(() => {});
+  }, []);
+
+  const types = ["all", ...Array.from(new Set(results.map(r => r.type)))];
+
+  const filtered = results
+    .filter(r => filter === "all" || r.type === filter)
+    .sort((a, b) => {
+      if (sortBy === "score") return b.pct - a.pct;
+      if (sortBy === "subject") return (a.subject || "").localeCompare(b.subject || "");
+      return b.id - a.id; // date desc
+    });
+
+  const avg = results.length > 0 ? Math.round(results.reduce((s, r) => s + (r.pct || 0), 0) / results.length) : 0;
+  const best = results.length > 0 ? Math.max(...results.map(r => r.pct || 0)) : 0;
+  const passed = results.filter(r => (r.pct || 0) >= 50).length;
+
+  const scoreColor = (pct) => pct >= 70 ? "var(--success)" : pct >= 50 ? "var(--warn)" : "var(--danger)";
+  const scoreBg = (pct) => pct >= 70 ? "rgba(74,222,128,.12)" : pct >= 50 ? "rgba(251,146,60,.12)" : "rgba(248,113,113,.12)";
+  const scoreBorder = (pct) => pct >= 70 ? "rgba(74,222,128,.3)" : pct >= 50 ? "rgba(251,146,60,.3)" : "rgba(248,113,113,.3)";
+  const gradeLabel = (pct) => pct >= 90 ? "A+" : pct >= 80 ? "A" : pct >= 70 ? "B" : pct >= 60 ? "C" : pct >= 50 ? "D" : "F";
+
+  const clearAll = () => {
+    setResults([]);
+    toast("All results cleared", "success");
+    setShowClear(false);
+  };
+
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6,flexWrap:"wrap",gap:10}}>
+        <div>
+          <div className="sec-title">📊 My Results</div>
+          <div className="sec-sub">{results.length} exam{results.length !== 1 ? "s" : ""} taken</div>
+        </div>
+        {results.length > 0 && (
+          <button className="btn btn-sm btn-danger" onClick={() => setShowClear(true)}>🗑️ Clear All</button>
+        )}
+      </div>
+
+      {/* Stats row */}
+      {results.length > 0 && (
+        <div className="grid3" style={{marginBottom:18,gap:10}}>
+          {[
+            {lbl:"Average", val:`${avg}%`, sub:"overall score", color:"var(--accent)"},
+            {lbl:"Best Score", val:`${best}%`, sub:"highest result", color:"var(--success)"},
+            {lbl:"Pass Rate", val:`${results.length > 0 ? Math.round((passed/results.length)*100) : 0}%`, sub:`${passed}/${results.length} passed`, color:"var(--warn)"},
+          ].map(s => (
+            <div key={s.lbl} className="stat-card">
+              <div className="stat-lbl">{s.lbl}</div>
+              <div className="stat-val" style={{color:s.color,fontSize:26,fontFamily:"'Syne',sans-serif",fontWeight:800}}>{s.val}</div>
+              <div className="stat-sub">{s.sub}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Filters */}
+      {results.length > 0 && (
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:14,alignItems:"center"}}>
+          <div style={{display:"flex",gap:6,flex:1,flexWrap:"wrap"}}>
+            {types.map(t => (
+              <button key={t} onClick={() => setFilter(t)} style={{
+                padding:"5px 12px",borderRadius:8,border:`1px solid ${filter===t?"var(--accent)":"var(--border)"}`,
+                background:filter===t?"rgba(62,142,149,.15)":"transparent",
+                color:filter===t?"var(--accent)":"var(--text3)",
+                fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace",transition:"all .2s"
+              }}>{t === "all" ? "All" : t}</button>
+            ))}
+          </div>
+          <select
+            className="inp"
+            style={{marginBottom:0,width:"auto",fontSize:12,padding:"5px 10px",fontFamily:"'DM Mono',monospace"}}
+            value={sortBy}
+            onChange={e => setSortBy(e.target.value)}
+          >
+            <option value="date">Sort: Latest</option>
+            <option value="score">Sort: Score ↓</option>
+            <option value="subject">Sort: Subject</option>
+          </select>
+        </div>
+      )}
+
+      {/* Results list */}
+      {filtered.length === 0 ? (
+        <div style={{textAlign:"center",padding:"60px 20px",color:"var(--text3)"}}>
+          <div style={{fontSize:52,marginBottom:12}}>📊</div>
+          <div style={{fontFamily:"'DM Mono',monospace",fontSize:13}}>
+            {results.length === 0 ? "No results yet." : "No results for this filter."}
+          </div>
+          <div style={{fontSize:12,color:"var(--text3)",marginTop:6}}>
+            Complete an MCQ exam, essay, or class exam to see your results here.
+          </div>
+        </div>
+      ) : (
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {filtered.map((r, i) => (
+            <div key={r.id} className="card" style={{
+              borderLeft:`3px solid ${scoreColor(r.pct)}`,
+              animation:`fadeUp .3s ease ${i * 0.04}s both`
+            }}>
+              <div style={{display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
+                {/* Grade badge */}
+                <div style={{
+                  width:50,height:50,borderRadius:12,flexShrink:0,
+                  background:scoreBg(r.pct),border:`1px solid ${scoreBorder(r.pct)}`,
+                  display:"flex",alignItems:"center",justifyContent:"center",
+                  fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20,color:scoreColor(r.pct)
+                }}>
+                  {gradeLabel(r.pct)}
+                </div>
+                {/* Info */}
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:700,fontSize:14,marginBottom:2,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+                    {r.subject || "Untitled Exam"}
+                  </div>
+                  <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginBottom:4}}>
+                    {r.type} · {r.date}
+                  </div>
+                  {/* Progress bar */}
+                  <div style={{background:"var(--bg4)",borderRadius:20,height:5,overflow:"hidden",maxWidth:220}}>
+                    <div style={{height:"100%",borderRadius:20,width:`${r.pct}%`,background:scoreColor(r.pct),transition:"width .6s ease"}} />
+                  </div>
+                </div>
+                {/* Score */}
+                <div style={{textAlign:"right",flexShrink:0}}>
+                  <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:22,color:scoreColor(r.pct)}}>
+                    {r.pct}%
+                  </div>
+                  {r.score != null && r.total != null && (
+                    <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>
+                      {r.score}/{r.total}
+                    </div>
+                  )}
+                  <div style={{fontSize:10,color:r.pct>=50?"var(--success)":"var(--danger)",fontFamily:"'DM Mono',monospace",marginTop:2,fontWeight:600}}>
+                    {r.pct >= 50 ? "✓ PASS" : "✗ FAIL"}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Clear confirm modal */}
+      {showClear && (
+        <div className="modal-overlay" onClick={() => setShowClear(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">Clear All Results?</div>
+              <button className="modal-close" onClick={() => setShowClear(false)}>✕</button>
+            </div>
+            <div style={{fontSize:13,color:"var(--text2)",marginBottom:20}}>
+              This will permanently delete all {results.length} result{results.length !== 1 ? "s" : ""}. This cannot be undone.
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <button className="btn btn-danger" style={{flex:1}} onClick={clearAll}>🗑️ Yes, Clear All</button>
+              <button className="btn" onClick={() => setShowClear(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function Timetable({ toast }) {
