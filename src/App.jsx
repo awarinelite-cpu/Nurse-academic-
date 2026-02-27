@@ -1,13 +1,16 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 
-// ─── LOCAL STORAGE HELPERS (with in-memory fallback for artifact env) ─
+// ─── IN-MEMORY CACHE + LOCAL STORAGE (L1 + L2) ──────────────────────
+// _mem is the primary in-process cache. Reads hit _mem first (zero-cost),
+// then fall through to localStorage, then to the supplied default.
 const _mem = {};
 const _lsAvail = (() => { try { localStorage.setItem("__t","1"); localStorage.removeItem("__t"); return true; } catch { return false; } })();
 const ls = (k, d) => {
+  if (_mem[k] !== undefined) return _mem[k];           // L1 hit
   try {
-    if (_lsAvail) { const v = localStorage.getItem(k); if (v) { const p = JSON.parse(v); _mem[k] = p; return p; } }
-    return _mem[k] !== undefined ? _mem[k] : d;
-  } catch { return _mem[k] !== undefined ? _mem[k] : d; }
+    if (_lsAvail) { const v = localStorage.getItem(k); if (v !== null) { const p = JSON.parse(v); _mem[k] = p; return p; } }
+  } catch {}
+  return d;
 };
 const lsSet = (k, v) => {
   _mem[k] = v;
@@ -51,18 +54,117 @@ const SK = {
   essayBanks:    ["nv-essay-banks",   "db:essay-banks"],
   classExams:    ["nv-class-exams",   "db:class-exams"],
 };
-const saveShared = (key, val) => { const [lk, bk] = SK[key]; dbSet(lk, bk, val); };
+// saveShared: write to cache+localStorage immediately, fire backend async, notify React subscribers
+const _sharedSubs = {}; // key → Set of () => void
+const notifyKey = (key) => { (_sharedSubs[key] || new Set()).forEach(fn => fn()); };
+const saveShared = (key, val) => {
+  const [lk, bk] = SK[key]; dbSet(lk, bk, val); notifyKey(key);
+};
 const loadShared = async (key, fallback) => { const [lk, bk] = SK[key]; return dbLoad(lk, bk, fallback, true); };
 
-// Per-user private storage helpers
-const uKey = (user, suffix) => `u:${user}:${suffix}`;
+// ─── useShared(key, fallback) ─────────────────────────────────────────
+// Reactive hook: returns current value from cache and auto-rerenders when
+// saveShared() is called or hydrateFromBackend() completes for this key.
+const useShared = (key, fallback) => {
+  const [lk] = SK[key] || ["__unknown__"];
+  const [val, setVal] = useState(() => ls(lk, fallback));
+  useEffect(() => {
+    const refresh = () => setVal(ls(lk, fallback));
+    if (!_sharedSubs[key]) _sharedSubs[key] = new Set();
+    _sharedSubs[key].add(refresh);
+    // Also listen for the global hydration event
+    window.addEventListener("nv:shared-hydrated", refresh);
+    return () => {
+      _sharedSubs[key].delete(refresh);
+      window.removeEventListener("nv:shared-hydrated", refresh);
+    };
+  }, [key]);
+  return val;
+};
+
+// ─── useMyData(suffix, lsKey, fallback) ──────────────────────────────
+// Reactive hook for per-user private data. Re-renders when backend hydration
+// pushes fresh data to cache after login.
+const _userSubs = {}; // lsKey → Set of () => void
+const notifyUserKey = (lsKey) => { (_userSubs[lsKey] || new Set()).forEach(fn => fn()); };
+const saveMyDataNotify = (suffix, lsKey, val) => {
+  lsSet(lsKey, val);
+  if (_currentUser) bsSet(uKey(_currentUser, suffix), val, false);
+  notifyUserKey(lsKey);
+};
+const useMyData = (lsKey, fallback) => {
+  const [val, setVal] = useState(() => ls(lsKey, fallback));
+  useEffect(() => {
+    const refresh = () => setVal(ls(lsKey, fallback));
+    if (!_userSubs[lsKey]) _userSubs[lsKey] = new Set();
+    _userSubs[lsKey].add(refresh);
+    window.addEventListener("nv:user-hydrated", refresh);
+    return () => {
+      _userSubs[lsKey].delete(refresh);
+      window.removeEventListener("nv:user-hydrated", refresh);
+    };
+  }, [lsKey]);
+  return val;
+};
+
+
+// ─── useHydratedShared(lsKey, skKey, fallback) ───────────────────────
+// Drop-in upgrade for components using useState(()=>ls(lsKey, fallback)).
+// Returns [val, setVal] where setVal also persists to backend via saveShared.
+const useHydratedShared = (lsKey, skKey, fallback) => {
+  const [val, setValInner] = useState(() => ls(lsKey, fallback));
+  useEffect(() => {
+    const refresh = () => setValInner(ls(lsKey, fallback));
+    if (skKey && _sharedSubs[skKey]) {
+      _sharedSubs[skKey].add(refresh);
+    }
+    window.addEventListener("nv:shared-hydrated", refresh);
+    return () => {
+      if (skKey && _sharedSubs[skKey]) _sharedSubs[skKey].delete(refresh);
+      window.removeEventListener("nv:shared-hydrated", refresh);
+    };
+  }, [lsKey, skKey]);
+  const setVal = useCallback((v) => {
+    setValInner(v);
+    if (skKey) saveShared(skKey, v);
+    else lsSet(lsKey, v);
+  }, [lsKey, skKey]);
+  return [val, setVal];
+};
+
+// ─── useHydratedUser(lsKey, suffix, fallback) ────────────────────────
+// Drop-in upgrade for per-user data components.
+const useHydratedUser = (lsKey, suffix, fallback) => {
+  const [val, setValInner] = useState(() => ls(lsKey, fallback));
+  useEffect(() => {
+    const refresh = () => setValInner(ls(lsKey, fallback));
+    if (!_userSubs[lsKey]) _userSubs[lsKey] = new Set();
+    _userSubs[lsKey].add(refresh);
+    window.addEventListener("nv:user-hydrated", refresh);
+    return () => {
+      _userSubs[lsKey].delete(refresh);
+      window.removeEventListener("nv:user-hydrated", refresh);
+    };
+  }, [lsKey]);
+  const setVal = useCallback((v) => {
+    setValInner(v);
+    saveMyData(suffix, lsKey, v);
+  }, [lsKey, suffix]);
+  return [val, setVal];
+};
+
+
 const saveUser = (user, suffix, lsKey, val) => { lsSet(lsKey, val); bsSet(uKey(user, suffix), val, false); };
 const loadUser = async (user, suffix, lsKey, fallback) => dbLoad(lsKey, uKey(user, suffix), fallback, false);
 
 // Module-level current user ref (set on login, used by components for backend saves)
 let _currentUser = "";
 const setCurrentUserRef = (u) => { _currentUser = u; };
-const saveMyData = (suffix, lsKey, val) => { lsSet(lsKey, val); if (_currentUser) bsSet(uKey(_currentUser, suffix), val, false); };
+const saveMyData = (suffix, lsKey, val) => {
+  lsSet(lsKey, val);
+  if (_currentUser) bsSet(uKey(_currentUser, suffix), val, false);
+  notifyUserKey(lsKey);
+};
 
 // ─── ESSAY SUBMISSION BACKEND ────────────────────────────────────────
 const saveEssaySubmissionToBackend = async (studentEmail, bankId, data) => {
@@ -170,16 +272,24 @@ const initData = () => {
 // Run immediately at module load so _mem is populated before first render
 initData();
 
-// Hydrate all shared data from backend (called once on app mount)
+// Hydrate all shared data from backend in parallel.
+// After each key resolves, notify its React subscribers immediately so the
+// UI updates key-by-key rather than waiting for the full batch.
 const hydrateFromBackend = async () => {
   const defaults = {
     users: [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}],
     classes: DEFAULT_CLASSES, drugs: DEFAULT_DRUGS, labs: DEFAULT_LABS,
     pq: DEFAULT_PQ, decks: DEFAULT_DECKS, dict: DEFAULT_DICT,
     skills: DEFAULT_SKILLS, announcements: DEFAULT_ANNOUNCEMENTS,
-    handouts: [], essayBanks: [],
+    handouts: [], essayBanks: [], classExams: [],
   };
-  await Promise.all(Object.keys(SK).map(key => loadShared(key, defaults[key] || [])));
+  await Promise.all(
+    Object.keys(SK).map(async key => {
+      await loadShared(key, defaults[key] || []);
+      notifyKey(key); // notify per-key subscribers as soon as this key is ready
+    })
+  );
+  window.dispatchEvent(new CustomEvent("nv:shared-hydrated")); // catch-all for older ls()-based components
 };
 
 // ─── STYLES ─────────────────────────────────────────────────────────
@@ -230,7 +340,8 @@ body.light{
 .inp-wrap .inp{margin-bottom:0;}
 .inp-eye{position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text3);cursor:pointer;font-size:15px;}
 .btn-primary{width:100%;padding:13px;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:10px;font-family:'Syne',sans-serif;font-size:15px;font-weight:700;color:white;cursor:pointer;transition:all .2s;margin-top:4px;}
-.btn-primary:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(62,142,149,.3);}
+.btn-primary:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 8px 24px rgba(62,142,149,.3);}
+.btn-primary.loading,.btn-primary:disabled{opacity:.7;cursor:not-allowed;transform:none;}
 .btn-admin{background:linear-gradient(135deg,var(--admin),var(--admin2));}
 .btn-admin:hover{box-shadow:0 8px 24px rgba(124,58,237,.3);}
 .auth-switch{text-align:center;margin-top:12px;font-size:12px;color:var(--text3);font-family:'DM Mono',monospace;}
@@ -1040,7 +1151,7 @@ function AdminOverview({ toast }) {
 
 // ── Admin Users ──────────────────────────────────────────────────────
 function AdminUsers({ toast }) {
-  const [users, setUsers] = useState(()=>ls("nv-users",[]));
+  const [users, setUsers] = useHydratedShared("nv-users", "users", []);
   const [edit, setEdit] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({username:"",password:"",role:"student",class:""});
@@ -1116,7 +1227,8 @@ function AdminUsers({ toast }) {
 
 // ── Admin Classes ────────────────────────────────────────────────────
 function AdminClasses({ toast }) {
-  const [classes, setClasses] = useState(()=>ls("nv-classes",DEFAULT_CLASSES));
+  const classes = useShared("classes", DEFAULT_CLASSES);
+  const setClasses = (val) => saveShared("classes", val);
   const [edit, setEdit] = useState(null);
   const [showModal, setShowModal] = useState(false);
   const [pasteMode, setPasteMode] = useState(false);
@@ -1496,8 +1608,8 @@ const parseEssayText = (text) => {
 };
 
 function AdminPQ({ toast }) {
-  const classes = ls("nv-classes", DEFAULT_CLASSES);
-  const [banks, setBanks] = useState(()=>ls("nv-pq",DEFAULT_PQ));
+  const classes = useShared("classes", DEFAULT_CLASSES);
+  const [banks, setBanks] = useHydratedShared("nv-pq", "pq", DEFAULT_PQ);
   const [selBank, setSelBank] = useState(null);
   const [showBankModal, setShowBankModal] = useState(false);
   const [showQModal, setShowQModal] = useState(false);
@@ -2069,7 +2181,7 @@ function AdminSkills({ toast }) {
 
 // ── Admin Announcements ──────────────────────────────────────────────
 function AdminAnnouncements({ toast }) {
-  const [items, setItems] = useState(()=>ls("nv-announcements",DEFAULT_ANNOUNCEMENTS));
+  const [items, setItems] = useHydratedShared("nv-announcements", "announcements", DEFAULT_ANNOUNCEMENTS);
   const [showModal, setShowModal] = useState(false);
   const [edit, setEdit] = useState(null);
   const [form, setForm] = useState({title:"",body:"",pinned:false});
@@ -2132,8 +2244,8 @@ function AdminAnnouncements({ toast }) {
 
 // ── Admin Exam Retakes ───────────────────────────────────────────────
 function AdminExamRetakes({ toast }) {
-  const [banks] = useState(()=>ls("nv-pq",DEFAULT_PQ));
-  const [users, setUsers] = useState(()=>ls("nv-users",[]));
+  const banks = useShared("pq", DEFAULT_PQ);
+  const [users] = useHydratedShared("nv-users", "users", []);
   const [attempts, setAttempts] = useState(()=>ls("nv-exam-attempts",{}));
   const [search, setSearch] = useState("");
 
@@ -2218,7 +2330,7 @@ function AdminExamRetakes({ toast }) {
 
 // ── Admin Essay Exams ────────────────────────────────────────────────
 function AdminEssayExams({ toast }) {
-  const [banks, setBanks] = useState(()=>ls("nv-essay-banks",[]));
+  const [banks, setBanks] = useHydratedShared("nv-essay-banks", "essayBanks", []);
   const [selBank, setSelBank] = useState(null);
   const [showBankModal, setShowBankModal] = useState(false);
   const [showQModal, setShowQModal] = useState(false);
@@ -2568,8 +2680,8 @@ function AdminEssayExams({ toast }) {
 
 // ── Admin Handouts ───────────────────────────────────────────────────
 function AdminHandouts({ toast }) {
-  const [handouts, setHandouts] = useState(()=>ls("nv-handouts",[]));
-  const classes = ls("nv-classes", DEFAULT_CLASSES);
+  const [handouts, setHandouts] = useHydratedShared("nv-handouts", "handouts", []);
+  const classes = useShared("classes", DEFAULT_CLASSES);
 
   const del = (id) => { const u=handouts.filter(h=>h.id!==id); setHandouts(u); saveShared("handouts",u); toast("Deleted","success"); };
   const clearAll = () => { if(!confirm("Delete ALL handouts?"))return; setHandouts([]); saveShared("handouts",[]); toast("All handouts cleared","warn"); };
@@ -2609,9 +2721,11 @@ function AdminHandouts({ toast }) {
 // STUDENT VIEWS
 // ════════════════════════════════════════════════════════════════════
 function Dashboard({ user, onNavigate }) {
-  const handouts = ls("nv-handouts",[]);
-  const classes = ls("nv-classes", DEFAULT_CLASSES);
-  const announcements = ls("nv-announcements",[]).filter(a=>a.pinned);
+  const handouts = useShared("handouts", []);
+  const classes = useShared("classes", DEFAULT_CLASSES);
+  const announcements = useShared("announcements", []).filter(a=>a.pinned);
+  const results = useMyData("nv-results", []);
+  const users = useShared("users", []);
   return (
     <div>
       {announcements.length>0&&announcements.map(a=>(
@@ -2626,8 +2740,8 @@ function Dashboard({ user, onNavigate }) {
           {lbl:"CLASSES",val:classes.length,sub:"Active programs"},
           {lbl:"COURSES",val:classes.reduce((s,c)=>s+c.courses.length,0),sub:"Across all classes"},
           {lbl:"HANDOUTS",val:handouts.length,sub:"Total uploaded"},
-          {lbl:"RESULTS",val:ls("nv-results",[]).length,sub:"Test & exam scores"},
-          {lbl:"USERS",val:ls("nv-users",[]).length,sub:"Registered accounts"},
+          {lbl:"RESULTS",val:results.length,sub:"Test & exam scores"},
+          {lbl:"USERS",val:users.length,sub:"Registered accounts"},
         ].map((s,i)=>(
           <div key={s.lbl} className="stat-card" style={{animationDelay:`${i*.06}s`}}>
             <div className="stat-lbl">{s.lbl}</div>
@@ -2657,8 +2771,8 @@ function Dashboard({ user, onNavigate }) {
 }
 
 function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
-  const classes = ls("nv-classes", DEFAULT_CLASSES);
-  const [handouts, setHandouts] = useState(()=>ls("nv-handouts",[]));
+  const classes = useShared("classes", DEFAULT_CLASSES);
+  const [handouts, setHandouts] = useHydratedShared("nv-handouts", "handouts", []);
   const [showAdd, setShowAdd] = useState(false);
   const [title, setTitle] = useState(""); const [note, setNote] = useState("");
   const [selClass, setSelClass] = useState(selectedClass?.id||""); const [selCourse, setSelCourse] = useState("");
@@ -2840,7 +2954,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
 }
 
 function Results({ toast }) {
-  const [results, setResults] = useState(()=>ls("nv-results",[]));
+  const [results, setResults] = useHydratedUser("nv-results", "results", []);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({subject:"",score:"",total:"",type:"",date:""});
   const save=()=>{if(!form.subject||!form.score)return toast("Fill required fields","error");const item={...form,id:Date.now(),pct:Math.round((+form.score/+(form.total||100))*100)};const u=[...results,item];setResults(u);saveMyData("results","nv-results",u);setForm({subject:"",score:"",total:"",type:"",date:""});setShowAdd(false);toast("Result saved!","success");};
@@ -2865,6 +2979,7 @@ function Results({ toast }) {
 // ─── MCQ Exam View ────────────────────────────────────────────────────
 function MCQExamView({ toast, currentUser, banks }) {
   const attKey = `nv-mcq-att-${currentUser}`;
+  const [att, setAtt] = useHydratedUser(attKey, "mcq-att", {});
   const [sel, setSel] = useState(null);
   const [active, setActive] = useState(false);
   const [answers, setAnswers] = useState([]);
@@ -2873,7 +2988,6 @@ function MCQExamView({ toast, currentUser, banks }) {
   const [finalAnswers, setFinalAnswers] = useState([]);
 
   const startExam = (bank) => {
-    const att = ls(attKey, {});
     if (att[String(bank.id)]) { toast("You have already used your 1 attempt for this exam.", "error"); return; }
     setSel(bank);
     setAnswers(new Array(bank.questions.length).fill(null));
@@ -2890,11 +3004,11 @@ function MCQExamView({ toast, currentUser, banks }) {
     const snap = [...answers];
     const score = sel.questions.reduce((s,q,i) => snap[i]===q.ans ? s+1 : s, 0);
     const pct = Math.round((score / sel.questions.length) * 100);
-    const att = ls(attKey, {});
-    att[String(sel.id)] = { score, total: sel.questions.length, pct, answers: snap, date: new Date().toLocaleDateString() };
-    saveMyData("mcq-att",attKey,att);
+    const newAtt = { ...att, [String(sel.id)]: { score, total: sel.questions.length, pct, answers: snap, date: new Date().toLocaleDateString() } };
+    setAtt(newAtt); // useHydratedUser auto-saves to backend
     const results = ls("nv-results", []);
     saveMyData("results","nv-results",[...results, { id:Date.now(), subject:sel.subject, type:"MCQ Exam", score, total:sel.questions.length, pct, date:new Date().toLocaleDateString() }]);
+    notifyUserKey("nv-results");
     setFinalAnswers(snap);
     setActive(false); setDone(true);
   };
@@ -3004,15 +3118,15 @@ function MCQExamView({ toast, currentUser, banks }) {
   return (
     <div className="grid2">
       {banks.map((b,i)=>{
-        const att = ls(attKey,{})[String(b.id)];
+        const bankAtt = att[String(b.id)];
         return (
           <div key={b.id} className="card" style={{animation:`fadeUp .4s ease ${i*.08}s both`}}>
             <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15,marginBottom:4}}>{b.subject}</div>
             <div style={{fontSize:12,color:"var(--text3)",marginBottom:10}}>{b.year} · {b.questions.length} questions</div>
-            {att ? (
+            {bankAtt ? (
               <div>
-                <div style={{fontSize:13,marginBottom:4}}>Score: <span style={{fontWeight:700,color:att.pct>=70?"var(--success)":att.pct>=50?"var(--warn)":"var(--danger)"}}>{att.score}/{att.total} ({att.pct}%)</span></div>
-                <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>🔒 Attempted {att.date}</div>
+                <div style={{fontSize:13,marginBottom:4}}>Score: <span style={{fontWeight:700,color:bankAtt.pct>=70?"var(--success)":bankAtt.pct>=50?"var(--warn)":"var(--danger)"}}>{bankAtt.score}/{bankAtt.total} ({bankAtt.pct}%)</span></div>
+                <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>🔒 Attempted {bankAtt.date}</div>
               </div>
             ) : (
               <button className="btn btn-accent btn-sm" onClick={()=>startExam(b)}>Start Exam ▶</button>
@@ -3027,6 +3141,7 @@ function MCQExamView({ toast, currentUser, banks }) {
 // ─── Essay Exam View ───────────────────────────────────────────────────
 function EssayExamView({ toast, currentUser, essayBanks }) {
   const attKey = `nv-essay-att-${currentUser}`;
+  const [essayAtt, setEssayAtt] = useHydratedUser(attKey, "essay-att", {});
   const [sel, setSel] = useState(null);
   const [active, setActive] = useState(false);
   const [answers, setAnswers] = useState({});
@@ -3036,8 +3151,7 @@ function EssayExamView({ toast, currentUser, essayBanks }) {
   const [savedAnswers, setSavedAnswers] = useState({});
 
   const startExam = (bank) => {
-    const att = ls(attKey, {});
-    if (att[String(bank.id)]) { toast("You have already used your 1 attempt for this essay.", "error"); return; }
+    if (essayAtt[String(bank.id)]) { toast("You have already used your 1 attempt for this essay.", "error"); return; }
     setSel(bank); setAnswers({}); setActive(true); setDone(false); setFeedback(null);
   };
 
@@ -3077,23 +3191,22 @@ Return ONLY valid JSON with no markdown or backticks:
       const parsed = JSON.parse(raw);
 
       const attData = { date:new Date().toLocaleDateString(), score:parsed.overallScore, total:totalMarks, pct:parsed.overallPct, grade:parsed.grade, answers:snap, feedback:parsed, gradedByAI:true };
-      const att = ls(attKey, {});
-      att[String(sel.id)] = attData;
-      saveMyData("essay-att",attKey,att);
+      const newEssayAtt = { ...essayAtt, [String(sel.id)]: attData };
+      setEssayAtt(newEssayAtt);
 
       // Save to backend for lecturer visibility
       saveEssaySubmissionToBackend(currentUser, sel.id, { ...submissionBase, feedback:parsed, gradedByAI:true, grade:parsed.grade, pct:parsed.overallPct });
 
       const results = ls("nv-results",[]);
       saveMyData("results","nv-results",[...results,{id:Date.now(),subject:sel.subject,type:"Essay (AI)",score:parsed.overallScore,total:totalMarks,pct:parsed.overallPct,date:new Date().toLocaleDateString()}]);
+      notifyUserKey("nv-results");
 
       setFeedback(parsed);
     } catch(e) {
       // AI unavailable — save submission for MANUAL LECTURER GRADING
       const attData = { date:new Date().toLocaleDateString(), score:null, total:totalMarks, pct:null, grade:null, answers:snap, feedback:null, pendingManualGrade:true };
-      const att = ls(attKey, {});
-      att[String(sel.id)] = attData;
-      saveMyData("essay-att",attKey,att);
+      const newEssayAtt = { ...essayAtt, [String(sel.id)]: attData };
+      setEssayAtt(newEssayAtt);
 
       // Save to backend so lecturer can see and grade manually
       saveEssaySubmissionToBackend(currentUser, sel.id, { ...submissionBase, pendingManualGrade:true });
@@ -3288,28 +3401,28 @@ Tip: Be specific, use nursing terms, and cover all aspects of the question.`}
       ) : (
         <div className="grid2">
           {essayBanks.map((b,i)=>{
-            const att = ls(attKey,{})[String(b.id)];
+            const bankAtt = essayAtt[String(b.id)];
             return (
               <div key={b.id} className="card" style={{animation:`fadeUp .4s ease ${i*.08}s both`}}>
                 <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15,marginBottom:4}}>{b.subject}</div>
                 <div style={{fontSize:12,color:"var(--text3)",marginBottom:8}}>{b.questions.length} questions · {b.questions.reduce((s,q)=>s+(+q.marks||10),0)} total marks</div>
                 {b.description&&<div style={{fontSize:11,color:"var(--text3)",marginBottom:8,fontStyle:"italic"}}>{b.description}</div>}
-                {att ? (
+                {bankAtt ? (
                   <div>
-                    {att.pendingManualGrade && !att.manualGrade && (
+                    {bankAtt.pendingManualGrade && !bankAtt.manualGrade && (
                       <div style={{background:"rgba(251,146,60,.08)",border:"1px solid rgba(251,146,60,.25)",borderRadius:8,padding:"8px 12px",fontSize:12,color:"var(--warn)",marginBottom:6}}>
                         ⏳ Submitted · Awaiting manual grading from your lecturer
                       </div>
                     )}
-                    {att.manualGrade && (
+                    {bankAtt.manualGrade && (
                       <div style={{marginBottom:6}}>
-                        <div style={{fontSize:14,fontWeight:700,marginBottom:2}}>Grade: <span style={{color:"var(--accent)"}}>{att.manualGrade.grade}</span> · {att.manualGrade.pct}%</div>
-                        {att.manualGrade.overallComment && <div style={{fontSize:12,color:"var(--text2)"}}>{att.manualGrade.overallComment}</div>}
-                        <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:4}}>✏️ Manually graded on {att.gradedDate}</div>
+                        <div style={{fontSize:14,fontWeight:700,marginBottom:2}}>Grade: <span style={{color:"var(--accent)"}}>{bankAtt.manualGrade.grade}</span> · {bankAtt.manualGrade.pct}%</div>
+                        {bankAtt.manualGrade.overallComment && <div style={{fontSize:12,color:"var(--text2)"}}>{bankAtt.manualGrade.overallComment}</div>}
+                        <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:4}}>✏️ Manually graded on {bankAtt.gradedDate}</div>
                       </div>
                     )}
-                    {att.grade && !att.manualGrade && <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Grade: <span style={{color:"var(--accent)"}}>{att.grade}</span> · {att.pct}%</div>}
-                    <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>🔒 Submitted {att.date} — contact lecturer to reset</div>
+                    {bankAtt.grade && !bankAtt.manualGrade && <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Grade: <span style={{color:"var(--accent)"}}>{bankAtt.grade}</span> · {bankAtt.pct}%</div>}
+                    <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>🔒 Submitted {bankAtt.date} — contact lecturer to reset</div>
                   </div>
                 ) : (
                   <button className="btn btn-accent btn-sm" onClick={()=>startExam(b)}>Start Essay ▶</button>
@@ -3361,8 +3474,8 @@ function LecturerPage({ toast, currentUser }) {
 }
 
 function LecturerSetExam({ toast, currentUser }) {
-  const classes = ls("nv-classes", DEFAULT_CLASSES);
-  const [exams, setExams] = useState(() => ls("nv-class-exams", []));
+  const classes = useShared("classes", DEFAULT_CLASSES);
+  const [exams, setExams] = useHydratedShared("nv-class-exams", "classExams", []);
   const [view, setView] = useState("list"); // list | create | manage
   const [selExam, setSelExam] = useState(null);
   const [inputMode, setInputMode] = useState("paste"); // paste | single
@@ -3381,8 +3494,7 @@ function LecturerSetExam({ toast, currentUser }) {
   const myExams = exams.filter(e => e.createdBy === currentUser);
 
   const saveExams = (updated) => {
-    setExams(updated);
-    saveShared("classExams", updated);
+    setExams(updated); // useHydratedShared handles saveShared("classExams", ...) automatically
   };
 
   // ── Parse answer key helper ──
@@ -3858,8 +3970,8 @@ function LecturerSetExam({ toast, currentUser }) {
 }
 
 function LecturerHandouts({ toast, currentUser }) {
-  const [handouts, setHandouts] = useState(()=>ls("nv-handouts",[]));
-  const classes = ls("nv-classes", DEFAULT_CLASSES);
+  const [handouts, setHandouts] = useHydratedShared("nv-handouts", "handouts", []);
+  const classes = useShared("classes", DEFAULT_CLASSES);
   const [form, setForm] = useState({title:"",description:"",classId:"",fileUrl:"",fileType:"pdf"});
   const [showModal, setShowModal] = useState(false);
   const [edit, setEdit] = useState(null);
@@ -3948,8 +4060,8 @@ function LecturerHandouts({ toast, currentUser }) {
 }
 
 function LecturerMCQ({ toast, currentUser }) {
-  const classes = ls("nv-classes", DEFAULT_CLASSES);
-  const [banks, setBanks] = useState(()=>ls("nv-pq",DEFAULT_PQ));
+  const classes = useShared("classes", DEFAULT_CLASSES);
+  const [banks, setBanks] = useHydratedShared("nv-pq", "pq", DEFAULT_PQ);
   const [selBank, setSelBank] = useState(null);
   const [showBankModal, setShowBankModal] = useState(false);
   const [editBank, setEditBank] = useState(null);
@@ -4316,7 +4428,7 @@ function LecturerMCQ({ toast, currentUser }) {
 }
 
 function LecturerEssay({ toast, currentUser }) {
-  const [banks, setBanks] = useState(()=>ls("nv-essay-banks",[]));
+  const [banks, setBanks] = useHydratedShared("nv-essay-banks", "essayBanks", []);
   const [selBank, setSelBank] = useState(null);
   const [showBankModal, setShowBankModal] = useState(false);
   const [showQModal, setShowQModal] = useState(false);
@@ -4640,7 +4752,7 @@ function LecturerEssay({ toast, currentUser }) {
 }
 
 function LecturerAnnouncements({ toast, currentUser }) {
-  const [announcements, setAnnouncements] = useState(()=>ls("nv-announcements",DEFAULT_ANNOUNCEMENTS));
+  const [announcements, setAnnouncements] = useHydratedShared("nv-announcements", "announcements", DEFAULT_ANNOUNCEMENTS);
   const [form, setForm] = useState({title:"",body:"",pinned:false});
   const [showModal, setShowModal] = useState(false);
   const [edit, setEdit] = useState(null);
@@ -4751,9 +4863,9 @@ function LecturerStudents({ toast }) {
 // ════════════════════════════════════════════════════════════════════
 function ClassExamsView({ toast, currentUser, userClass }) {
   const [tab, setTab] = useState("set");
-  const allMCQ = ls("nv-pq", DEFAULT_PQ);
-  const allEssay = ls("nv-essay-banks", []);
-  const allClassExams = ls("nv-class-exams", []);
+  const allMCQ = useShared("pq", DEFAULT_PQ);
+  const allEssay = useShared("essayBanks", []);
+  const allClassExams = useShared("classExams", []);
 
   // Filter by student's class
   const mcqBanks = allMCQ.filter(b=>!b.classId || b.classId===userClass);
@@ -4801,12 +4913,11 @@ function SetExamStudentView({ toast, currentUser, classExams }) {
   const [score, setScore] = useState(null);
   const [timeLeft, setTimeLeft] = useState(null);
   const [started, setStarted] = useState(false);
-  const [attempts, setAttempts] = useState(() => ls(`nv-set-exam-att-${currentUser}`, {}));
+  const [attempts, setAttempts] = useHydratedUser(`nv-set-exam-att-${currentUser}`, "set-exam-att", {});
   const [qIdx, setQIdx] = useState(0);
 
   const startExam = (exam) => {
-    const att = ls(`nv-set-exam-att-${currentUser}`, {});
-    if (att[String(exam.id)]) { toast("You have already used your 1 attempt for this exam.", "error"); return; }
+    if (attempts[String(exam.id)]) { toast("You have already used your 1 attempt for this exam.", "error"); return; }
     setSel(exam); setAnswers({}); setSubmitted(false); setScore(null); setQIdx(0);
     setTimeLeft(exam.duration * 60);
     setStarted(true);
@@ -4827,9 +4938,8 @@ function SetExamStudentView({ toast, currentUser, classExams }) {
     const pass = correct >= (sel.passMark || Math.ceil(sel.questions.length * 0.5));
     setScore({ correct, total: sel.questions.length, pct, pass });
     setSubmitted(true);
-    const att = { ...attempts, [String(sel.id)]: { date: new Date().toLocaleDateString(), score: correct, total: sel.questions.length, pct, pass } };
-    setAttempts(att);
-    saveMyData("set-exam-att", `nv-set-exam-att-${currentUser}`, att);
+    const newAtt = { ...attempts, [String(sel.id)]: { date: new Date().toLocaleDateString(), score: correct, total: sel.questions.length, pct, pass } };
+    setAttempts(newAtt); // useHydratedUser auto-saves to backend
     toast(pass ? `Passed! ${correct}/${sel.questions.length} (${pct}%)` : `Submitted: ${correct}/${sel.questions.length} (${pct}%)`, pass ? "success" : "warn");
   };
 
@@ -4951,8 +5061,8 @@ function SetExamStudentView({ toast, currentUser, classExams }) {
 // ─── Main Exams & Questions wrapper ────────────────────────────────────
 function PastQuestionsView({ toast, currentUser }) {
   const [tab, setTab] = useState("mcq");
-  const mcqBanks = ls("nv-pq", DEFAULT_PQ);
-  const essayBanks = ls("nv-essay-banks", []);
+  const mcqBanks = useShared("pq", DEFAULT_PQ);
+  const essayBanks = useShared("essayBanks", []);
 
   return (
     <div>
@@ -5015,18 +5125,18 @@ function DictionaryView() {
 }
 
 function SkillsView() {
-  const [skillsDb] = useState(()=>ls("nv-skillsdb",DEFAULT_SKILLS));
-  const [done, setDone] = useState(()=>ls("nv-skills-done",{}));
-  const toggle=(id)=>{const u={...done,[id]:!done[id]};setDone(u);saveMyData("skills-done","nv-skills-done",u);};
+  const skillsDb = useShared("skills", DEFAULT_SKILLS);
+  const [done, setDone] = useHydratedUser("nv-skills-done", "skills-done", {});
+  const toggle=(id)=>{const u={...done,[id]:!done[id]};setDone(u);};
   const count = skillsDb.filter(s=>done[s.id]).length;
   return<div><div className="sec-title">✅ Skills Checklist</div><div className="sec-sub">Track clinical competencies</div><div className="card" style={{marginBottom:16}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}><span style={{fontFamily:"'DM Mono',monospace",fontSize:12,color:"var(--text3)"}}>Progress</span><span style={{fontFamily:"'DM Mono',monospace",fontSize:12,color:"var(--accent)"}}>{count}/{skillsDb.length}</span></div><div className="progress-wrap"><div className="progress-fill" style={{width:`${skillsDb.length>0?(count/skillsDb.length)*100:0}%`,background:"linear-gradient(90deg,var(--accent),var(--accent2))"}} /></div></div>{skillsDb.map(s=><div key={s.id} className="card2" style={{marginBottom:8,display:"flex",alignItems:"center",gap:12,cursor:"pointer",opacity:done[s.id]?.6:1}} onClick={()=>toggle(s.id)}><div style={{width:22,height:22,borderRadius:6,border:`2px solid ${done[s.id]?"var(--success)":"var(--border2)"}`,background:done[s.id]?"var(--success)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all .2s"}}>{done[s.id]&&<span style={{fontSize:12,color:"white"}}>✓</span>}</div><div style={{fontSize:14,fontWeight:500,textDecoration:done[s.id]?"line-through":"none",flex:1}}>{s.name}</div>{done[s.id]&&<span className="tag tag-success">Done</span>}</div>)}</div>;
 }
 
 function GPACalc({ toast }) {
-  const [courses, setCourses] = useState(()=>ls("nv-gpa-courses",[]));
+  const [courses, setCourses] = useHydratedUser("nv-gpa-courses", "gpa-courses", []);
   const [form, setForm] = useState({name:"",units:"",grade:""});
   const GRADES=[{l:"A",p:"5.0"},{l:"B",p:"4.0"},{l:"C",p:"3.0"},{l:"D",p:"2.0"},{l:"E",p:"1.0"},{l:"F",p:"0.0"}];
-  const add=()=>{if(!form.name||!form.units||!form.grade)return toast("Fill all fields","error");const u=[...courses,{...form,id:Date.now(),units:+form.units,grade:+form.grade}];setCourses(u);saveMyData("gpa-courses","nv-gpa-courses",u);setForm({name:"",units:"",grade:""});};
+  const add=()=>{if(!form.name||!form.units||!form.grade)return toast("Fill all fields","error");const u=[...courses,{...form,id:Date.now(),units:+form.units,grade:+form.grade}];setCourses(u);setForm({name:"",units:"",grade:""});};
   const tp=courses.reduce((s,c)=>s+c.units*c.grade,0),tu=courses.reduce((s,c)=>s+c.units,0),gpa=tu>0?tp/tu:0;
   const cls=gpa>=4.5?"First Class":gpa>=3.5?"Second Class Upper":gpa>=2.5?"Second Class Lower":gpa>=1.5?"Third Class":"Fail";
   const clsColor=gpa>=4.5?"var(--accent)":gpa>=3.5?"var(--accent2)":gpa>=2.5?"var(--warn)":"var(--danger)";
@@ -5044,22 +5154,22 @@ function MedCalc() {
 }
 
 function Timetable({ toast }) {
-  const [tt, setTt] = useState(()=>ls("nv-timetable",[]));
+  const [tt, setTt] = useHydratedUser("nv-timetable", "timetable", []);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({day:"Monday",time:"",subject:"",venue:"",type:"Lecture"});
   const DAYS=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
   const COLORS={Lecture:"var(--accent)",Practical:"var(--warn)",Tutorial:"var(--accent2)",Clinical:"var(--danger)"};
-  const save=()=>{if(!form.time||!form.subject)return toast("Fill required fields","error");const u=[...tt,{...form,id:Date.now()}];setTt(u);saveMyData("timetable","nv-timetable",u);setShowAdd(false);toast("Added!","success");};
+  const save=()=>{if(!form.time||!form.subject)return toast("Fill required fields","error");const u=[...tt,{...form,id:Date.now()}];setTt(u);setShowAdd(false);toast("Added!","success");};
   return<div><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}><div><div className="sec-title">📅 Timetable</div><div className="sec-sub">Weekly schedule</div></div><button className="btn btn-accent" onClick={()=>setShowAdd(true)}>+ Add Class</button></div>{DAYS.map(day=>{const dc=tt.filter(t=>t.day===day);if(!dc.length)return null;return<div key={day} style={{marginBottom:18}}><div style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:"var(--text3)",marginBottom:8,textTransform:"uppercase",letterSpacing:"1px"}}>{day}</div>{dc.sort((a,b)=>a.time.localeCompare(b.time)).map(c=><div key={c.id} className="card2" style={{marginBottom:7,display:"flex",alignItems:"center",gap:12,borderLeft:`3px solid ${COLORS[c.type]||"var(--accent)"}`}}><div style={{fontFamily:"'DM Mono',monospace",fontSize:13,fontWeight:600,color:"var(--accent)",minWidth:48}}>{c.time}</div><div style={{flex:1}}><div style={{fontWeight:600,fontSize:14}}>{c.subject}</div>{c.venue&&<div style={{fontSize:11,color:"var(--text3)"}}>{c.venue}</div>}</div><span className="tt-badge" style={{background:`${COLORS[c.type]||"var(--accent)"}20`,color:COLORS[c.type]||"var(--accent)"}}>{c.type}</span><button className="btn btn-sm btn-danger" onClick={()=>{const u=tt.filter(x=>x.id!==c.id);setTt(u);saveMyData("timetable","nv-timetable",u);}}>✕</button></div>)}</div>;})} {tt.length===0&&<div style={{textAlign:"center",padding:"50px",color:"var(--text3)"}}><div style={{fontSize:48}}>📅</div><div style={{fontFamily:"'DM Mono',monospace",fontSize:13,marginTop:12}}>No classes added.</div></div>}{showAdd&&<div className="modal-overlay" onClick={()=>setShowAdd(false)}><div className="modal" onClick={e=>e.stopPropagation()}><div className="modal-head"><div className="modal-title">Add Class</div><button className="modal-close" onClick={()=>setShowAdd(false)}>✕</button></div>{[["Day","day","select"],["Time","time","time"],["Subject","subject","text"],["Venue","venue","text"],["Type","type","select"]].map(([l,k,t])=><div key={k}><label className="lbl">{l}</label>{t==="select"?<select className="inp" value={form[k]} onChange={e=>setForm({...form,[k]:e.target.value})}>{k==="day"?DAYS.map(d=><option key={d}>{d}</option>):["Lecture","Practical","Tutorial","Clinical"].map(d=><option key={d}>{d}</option>)}</select>:<input className="inp" type={t} value={form[k]} onChange={e=>setForm({...form,[k]:e.target.value})} />}</div>)}<div style={{display:"flex",gap:8}}><button className="btn btn-accent" style={{flex:1}} onClick={save}>Save</button><button className="btn" onClick={()=>setShowAdd(false)}>Cancel</button></div></div></div>}</div>;
 }
 
 function StudyPlanner({ toast }) {
-  const [tasks, setTasks] = useState(()=>ls("nv-tasks",[]));
+  const [tasks, setTasks] = useHydratedUser("nv-tasks", "tasks", []);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({task:"",subject:"",due:"",priority:"Medium"});
-  const save=()=>{if(!form.task)return toast("Enter task","error");const u=[...tasks,{...form,id:Date.now(),done:false}];setTasks(u);saveMyData("tasks","nv-tasks",u);setForm({task:"",subject:"",due:"",priority:"Medium"});setShowAdd(false);toast("Task added!","success");};
-  const toggle=(id)=>{const u=tasks.map(t=>t.id===id?{...t,done:!t.done}:t);setTasks(u);saveMyData("tasks","nv-tasks",u);};
-  const del=(id)=>{const u=tasks.filter(t=>t.id!==id);setTasks(u);saveMyData("tasks","nv-tasks",u);};
+  const save=()=>{if(!form.task)return toast("Enter task","error");const u=[...tasks,{...form,id:Date.now(),done:false}];setTasks(u);setForm({task:"",subject:"",due:"",priority:"Medium"});setShowAdd(false);toast("Task added!","success");};
+  const toggle=(id)=>{const u=tasks.map(t=>t.id===id?{...t,done:!t.done}:t);setTasks(u);};
+  const del=(id)=>{const u=tasks.filter(t=>t.id!==id);setTasks(u);};
   const pColor={High:"var(--danger)",Medium:"var(--warn)",Low:"var(--accent)"};
   const pending=tasks.filter(t=>!t.done).length;
   return<div><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}><div><div className="sec-title">📅 Study Planner</div><div className="sec-sub">{pending} task{pending!==1?"s":""} pending</div></div><button className="btn btn-accent" onClick={()=>setShowAdd(true)}>+ Add Task</button></div>{tasks.length===0&&<div style={{textAlign:"center",padding:"60px",color:"var(--text3)"}}><div style={{fontSize:48}}>✅</div><div style={{fontFamily:"'DM Mono',monospace",fontSize:13,marginTop:12}}>No tasks!</div></div>}{tasks.map(t=><div key={t.id} className="card2" style={{marginBottom:8,display:"flex",alignItems:"center",gap:12,opacity:t.done?.5:1}}><div style={{width:22,height:22,borderRadius:6,border:`2px solid ${t.done?"var(--success)":"var(--border2)"}`,background:t.done?"var(--success)":"transparent",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all .2s"}} onClick={()=>toggle(t.id)}>{t.done&&<span style={{fontSize:12,color:"white"}}>✓</span>}</div><div style={{flex:1}}><div style={{fontWeight:600,fontSize:14,textDecoration:t.done?"line-through":"none"}}>{t.task}</div>{(t.subject||t.due)&&<div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{t.subject}{t.subject&&t.due?" · ":""}{t.due}</div>}</div><span className="tag" style={{borderColor:pColor[t.priority],color:pColor[t.priority]}}>{t.priority}</span><button className="btn btn-sm btn-danger" onClick={()=>del(t.id)}>✕</button></div>)}{showAdd&&<div className="modal-overlay" onClick={()=>setShowAdd(false)}><div className="modal" onClick={e=>e.stopPropagation()}><div className="modal-head"><div className="modal-title">Add Task</div><button className="modal-close" onClick={()=>setShowAdd(false)}>✕</button></div><label className="lbl">Task</label><input className="inp" value={form.task} onChange={e=>setForm({...form,task:e.target.value})} /><label className="lbl">Subject</label><input className="inp" value={form.subject} onChange={e=>setForm({...form,subject:e.target.value})} /><label className="lbl">Due Date</label><input className="inp" type="date" value={form.due} onChange={e=>setForm({...form,due:e.target.value})} /><label className="lbl">Priority</label><select className="inp" value={form.priority} onChange={e=>setForm({...form,priority:e.target.value})}>{["High","Medium","Low"].map(p=><option key={p}>{p}</option>)}</select><div style={{display:"flex",gap:8}}><button className="btn btn-accent" style={{flex:1}} onClick={save}>Add</button><button className="btn" onClick={()=>setShowAdd(false)}>Cancel</button></div></div></div>}</div>;
@@ -5074,17 +5184,17 @@ function Messages({ user, toast }) {
 }
 
 function Notifications({ currentUser, onRead }) {
-  const [notifs, setNotifs] = useState(()=>ls("nv-notifications",[]));
+  const [notifs, setNotifs] = useHydratedUser("nv-notifications", "notifications", []);
 
   useEffect(() => {
     // Mark all as read
     const updated = notifs.map(n=>({...n,read:true}));
-    setNotifs(updated); saveMyData("notifications","nv-notifications",updated);
+    setNotifs(updated);
     if (onRead) onRead();
   }, []);
 
-  const del = (id) => { const u=notifs.filter(n=>n.id!==id); setNotifs(u); saveMyData("notifications","nv-notifications",u); };
-  const clearAll = () => { setNotifs([]); saveMyData("notifications","nv-notifications",[]); };
+  const del = (id) => { const u=notifs.filter(n=>n.id!==id); setNotifs(u); };
+  const clearAll = () => { setNotifs([]); };
 
   const typeIcon = (type) => { if(type==="handout")return"📄"; if(type==="announcement")return"📢"; return"🔔"; };
   const typeColor = (type) => { if(type==="handout")return"var(--accent)"; if(type==="announcement")return"var(--warn)"; return"var(--text3)"; };
@@ -5123,7 +5233,10 @@ function Notifications({ currentUser, onRead }) {
 }
 
 function StudyProgress() {
-  const results=ls("nv-results",[]);const tasks=ls("nv-tasks",[]);const skillsDb=ls("nv-skillsdb",DEFAULT_SKILLS);const done=ls("nv-skills-done",{});
+  const results = useMyData("nv-results", []);
+  const tasks = useMyData("nv-tasks", []);
+  const skillsDb = useShared("skills", DEFAULT_SKILLS);
+  const done = useMyData("nv-skills-done", {});
   const doneTasks=tasks.filter(t=>t.done).length;const doneSkills=skillsDb.filter(s=>done[s.id]).length;
   const avg=results.length>0?Math.round(results.reduce((s,r)=>s+r.pct,0)/results.length):0;
   return<div><div className="sec-title">📈 Study Progress</div><div className="sec-sub">Your academic overview</div><div className="grid3" style={{marginBottom:20}}>{[{lbl:"Avg Score",val:`${avg}%`,sub:`${results.length} results`,color:"var(--accent)"},{lbl:"Tasks Done",val:`${doneTasks}/${tasks.length}`,sub:"Completed",color:"var(--success)"},{lbl:"Skills",val:`${doneSkills}/${skillsDb.length}`,sub:"Competencies",color:"var(--accent2)"}].map(s=><div key={s.lbl} className="stat-card"><div className="stat-lbl">{s.lbl}</div><div className="stat-val" style={{color:s.color,fontSize:24}}>{s.val}</div><div className="stat-sub">{s.sub}</div></div>)}</div>{results.length>0&&<div className="card"><div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,marginBottom:12}}>Recent Results</div>{results.slice(-5).reverse().map(r=><div key={r.id} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 0",borderBottom:"1px solid var(--border)"}}><div style={{flex:1}}><div style={{fontWeight:600,fontSize:13}}>{r.subject}</div><div style={{fontSize:11,color:"var(--text3)"}}>{r.type} · {r.date}</div></div><div style={{flex:1,background:"var(--bg4)",borderRadius:20,height:6,overflow:"hidden"}}><div style={{height:"100%",borderRadius:20,width:`${r.pct}%`,background:r.pct>=70?"var(--success)":r.pct>=50?"var(--warn)":"var(--danger)"}} /></div><span style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:14,color:r.pct>=70?"var(--success)":r.pct>=50?"var(--warn)":"var(--danger)",minWidth:40,textAlign:"right"}}>{r.pct}%</span></div>)}</div>}</div>;
@@ -5160,26 +5273,57 @@ export default function App() {
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3200);
   };
 
+  const [loginLoading, setLoginLoading] = useState(false);
+
   const login = async () => {
     if (!username || !password) return toast("Fill in all fields", "error");
-    // Pull latest user list from backend first (in case admin added account from another device)
-    await loadShared("users", [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]);
-    const users = ls("nv-users", []);
-    const user = users.find(u => u.username === username && u.password === password);
-    if (!user) return toast("Invalid credentials", "error");
-    if (loginType === "admin" && user.role !== "admin") return toast("Not an admin account", "error");
-    // Hydrate this user's private data from backend
-    await loadUser(username, "results", "nv-results", []);
-    await loadUser(username, "notifications", "nv-notifications", []);
-    await loadUser(username, "essay-att", `nv-essay-att-${username}`, {});
-    await loadUser(username, "tasks", "nv-tasks", []);
-    await loadUser(username, "timetable", "nv-timetable", []);
-    await loadUser(username, "gpa-courses", "nv-gpa-courses", []);
-    await loadUser(username, "skills-done", "nv-skills-done", {});
-    setCurrentUserRef(username); setCurrentUser(username); setIsAdmin(user.role === "admin"); setIsLecturer(user.role === "lecturer"); setCurrentUserClass(user.class||""); setPage("app");
-    const notifs = ls("nv-notifications", []);
-    setUnreadNotifs(notifs.filter(n => !n.read).length);
-    toast(`Welcome back! 👋`, "success");
+    setLoginLoading(true);
+    try {
+      // 1. Fetch user list + all shared data in parallel so everything is fresh immediately
+      await Promise.all([
+        loadShared("users", [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]),
+        // Pre-warm shared content so first page render is instant
+        ...Object.keys(SK).filter(k => k !== "users").map(k => loadShared(k, [])),
+      ]);
+      notifyKey("users"); // update any subscribed components
+
+      const users = ls("nv-users", []);
+      const user = users.find(u => u.username === username && u.password === password);
+      if (!user) { toast("Invalid credentials", "error"); setLoginLoading(false); return; }
+      if (loginType === "admin" && user.role !== "admin") { toast("Not an admin account", "error"); setLoginLoading(false); return; }
+
+      // 2. Hydrate ALL per-user private data in parallel (no waterfall)
+      const u = username;
+      await Promise.all([
+        loadUser(u, "results",      "nv-results",          []).then(() => notifyUserKey("nv-results")),
+        loadUser(u, "notifications","nv-notifications",    []).then(() => notifyUserKey("nv-notifications")),
+        loadUser(u, "essay-att",    `nv-essay-att-${u}`,   {}).then(() => notifyUserKey(`nv-essay-att-${u}`)),
+        loadUser(u, "mcq-att",      `nv-mcq-att-${u}`,     {}).then(() => notifyUserKey(`nv-mcq-att-${u}`)),
+        loadUser(u, "set-exam-att", `nv-set-exam-att-${u}`,{}).then(() => notifyUserKey(`nv-set-exam-att-${u}`)),
+        loadUser(u, "tasks",        "nv-tasks",             []).then(() => notifyUserKey("nv-tasks")),
+        loadUser(u, "timetable",    "nv-timetable",         []).then(() => notifyUserKey("nv-timetable")),
+        loadUser(u, "gpa-courses",  "nv-gpa-courses",       []).then(() => notifyUserKey("nv-gpa-courses")),
+        loadUser(u, "skills-done",  "nv-skills-done",       {}).then(() => notifyUserKey("nv-skills-done")),
+        loadUser(u, "messages",     "nv-messages",          []).then(() => notifyUserKey("nv-messages")),
+      ]);
+
+      // 3. Broadcast that user data is freshly hydrated so all hooks re-render
+      window.dispatchEvent(new CustomEvent("nv:user-hydrated"));
+      window.dispatchEvent(new CustomEvent("nv:shared-hydrated"));
+
+      setCurrentUserRef(u);
+      setCurrentUser(u);
+      setIsAdmin(user.role === "admin");
+      setIsLecturer(user.role === "lecturer");
+      setCurrentUserClass(user.class || "");
+      setPage("app");
+      const notifs = ls("nv-notifications", []);
+      setUnreadNotifs(notifs.filter(n => !n.read).length);
+      toast("Welcome back! 👋", "success");
+    } catch (e) {
+      toast("Login error — check connection", "error");
+    }
+    setLoginLoading(false);
   };
 
   const register = () => {
@@ -5290,8 +5434,8 @@ export default function App() {
                   <input className="inp" type={showPw?"text":"password"} placeholder="••••••••" value={password} onChange={e=>setPassword(e.target.value)} onKeyDown={e=>e.key==="Enter"&&login()} />
                   <button className="inp-eye" onClick={()=>setShowPw(p=>!p)}>{showPw?"🙈":"👁"}</button>
                 </div>
-                <button className={`btn-primary${loginType==="admin"?" btn-admin":""}`} onClick={login}>
-                  {loginType==="admin"?"🛡️ Admin Sign In →":"Sign In →"}
+                <button className={`btn-primary${loginType==="admin"?" btn-admin":""}${loginLoading?" loading":""}`} onClick={login} disabled={loginLoading}>
+                  {loginLoading ? "⏳ Signing in..." : loginType==="admin" ? "🛡️ Admin Sign In →" : "Sign In →"}
                 </button>
                 <div className="auth-switch">No account? <span onClick={()=>setAuthTab("register")}>Register here</span></div>
               </>
