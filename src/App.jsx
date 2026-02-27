@@ -21,10 +21,18 @@ const lsSet = (k, v) => {
 // shared:true  = all users see this data (admin-managed content)
 // shared:false = private per-user data
 const bsGet = async (key, shared = true) => {
-  try { const r = await window.storage.get(key, shared); return r ? JSON.parse(r.value) : null; } catch { return null; }
+  try {
+    if (typeof window === "undefined" || !window.storage) return null;
+    const r = await window.storage.get(key, shared);
+    if (!r || r.value === undefined || r.value === null) return null;
+    return JSON.parse(r.value);
+  } catch { return null; }
 };
 const bsSet = async (key, val, shared = true) => {
-  try { await window.storage.set(key, JSON.stringify(val), shared); } catch {}
+  try {
+    if (typeof window === "undefined" || !window.storage) return;
+    await window.storage.set(key, JSON.stringify(val), shared);
+  } catch {}
 };
 
 // Dual-write: localStorage first (instant UI) + backend async (persistence)
@@ -283,13 +291,13 @@ const hydrateFromBackend = async () => {
     skills: DEFAULT_SKILLS, announcements: DEFAULT_ANNOUNCEMENTS,
     handouts: [], essayBanks: [], classExams: [],
   };
-  await Promise.all(
+  // Use allSettled so one failing key never blocks the rest
+  await Promise.allSettled(
     Object.keys(SK).map(async key => {
-      await loadShared(key, defaults[key] || []);
-      notifyKey(key); // notify per-key subscribers as soon as this key is ready
+      try { await loadShared(key, defaults[key] || []); notifyKey(key); } catch {}
     })
   );
-  window.dispatchEvent(new CustomEvent("nv:shared-hydrated")); // catch-all for older ls()-based components
+  window.dispatchEvent(new CustomEvent("nv:shared-hydrated"));
 };
 
 // ─── STYLES ─────────────────────────────────────────────────────────
@@ -5278,51 +5286,53 @@ export default function App() {
   const login = async () => {
     if (!username || !password) return toast("Fill in all fields", "error");
     setLoginLoading(true);
-    try {
-      // 1. Fetch user list + all shared data in parallel so everything is fresh immediately
-      await Promise.all([
-        loadShared("users", [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]),
-        // Pre-warm shared content so first page render is instant
-        ...Object.keys(SK).filter(k => k !== "users").map(k => loadShared(k, [])),
-      ]);
-      notifyKey("users"); // update any subscribed components
 
-      const users = ls("nv-users", []);
-      const user = users.find(u => u.username === username && u.password === password);
-      if (!user) { toast("Invalid credentials", "error"); setLoginLoading(false); return; }
-      if (loginType === "admin" && user.role !== "admin") { toast("Not an admin account", "error"); setLoginLoading(false); return; }
+    // Helper: attempt a backend load but NEVER throw — always fall back gracefully
+    const safeLoad = async (fn) => { try { await fn(); } catch(e) { console.warn("safeLoad:", e); } };
 
-      // 2. Hydrate ALL per-user private data in parallel (no waterfall)
-      const u = username;
-      await Promise.all([
-        loadUser(u, "results",      "nv-results",          []).then(() => notifyUserKey("nv-results")),
-        loadUser(u, "notifications","nv-notifications",    []).then(() => notifyUserKey("nv-notifications")),
-        loadUser(u, "essay-att",    `nv-essay-att-${u}`,   {}).then(() => notifyUserKey(`nv-essay-att-${u}`)),
-        loadUser(u, "mcq-att",      `nv-mcq-att-${u}`,     {}).then(() => notifyUserKey(`nv-mcq-att-${u}`)),
-        loadUser(u, "set-exam-att", `nv-set-exam-att-${u}`,{}).then(() => notifyUserKey(`nv-set-exam-att-${u}`)),
-        loadUser(u, "tasks",        "nv-tasks",             []).then(() => notifyUserKey("nv-tasks")),
-        loadUser(u, "timetable",    "nv-timetable",         []).then(() => notifyUserKey("nv-timetable")),
-        loadUser(u, "gpa-courses",  "nv-gpa-courses",       []).then(() => notifyUserKey("nv-gpa-courses")),
-        loadUser(u, "skills-done",  "nv-skills-done",       {}).then(() => notifyUserKey("nv-skills-done")),
-        loadUser(u, "messages",     "nv-messages",          []).then(() => notifyUserKey("nv-messages")),
-      ]);
+    // 1. Fetch user list from backend (required for cross-device login)
+    //    Falls back to localStorage if backend is unreachable
+    await safeLoad(() => loadShared("users", [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]));
+    notifyKey("users");
 
-      // 3. Broadcast that user data is freshly hydrated so all hooks re-render
-      window.dispatchEvent(new CustomEvent("nv:user-hydrated"));
-      window.dispatchEvent(new CustomEvent("nv:shared-hydrated"));
+    const users = ls("nv-users", [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]);
+    console.log("Users found:", users.length, "Looking for:", username);
+    const user = users.find(u => u.username === username && u.password === password);
+    if (!user) { toast("Invalid credentials — check email & password", "error"); setLoginLoading(false); return; }
+    if (loginType === "admin" && user.role !== "admin") { toast("Not an admin account", "error"); setLoginLoading(false); return; }
 
-      setCurrentUserRef(u);
-      setCurrentUser(u);
-      setIsAdmin(user.role === "admin");
-      setIsLecturer(user.role === "lecturer");
-      setCurrentUserClass(user.class || "");
-      setPage("app");
-      const notifs = ls("nv-notifications", []);
-      setUnreadNotifs(notifs.filter(n => !n.read).length);
-      toast("Welcome back! 👋", "success");
-    } catch (e) {
-      toast("Login error — check connection", "error");
-    }
+    // 2. Hydrate all other shared content + this user's private data in parallel.
+    //    Promise.allSettled means NO single failure can block login.
+    const u = username;
+    await Promise.allSettled([
+      ...Object.keys(SK).filter(k => k !== "users").map(k =>
+        safeLoad(() => loadShared(k, [])).then(() => notifyKey(k))
+      ),
+      safeLoad(() => loadUser(u, "results",       "nv-results",           [])).then(() => notifyUserKey("nv-results")),
+      safeLoad(() => loadUser(u, "notifications", "nv-notifications",     [])).then(() => notifyUserKey("nv-notifications")),
+      safeLoad(() => loadUser(u, "essay-att",     `nv-essay-att-${u}`,    {})).then(() => notifyUserKey(`nv-essay-att-${u}`)),
+      safeLoad(() => loadUser(u, "mcq-att",       `nv-mcq-att-${u}`,      {})).then(() => notifyUserKey(`nv-mcq-att-${u}`)),
+      safeLoad(() => loadUser(u, "set-exam-att",  `nv-set-exam-att-${u}`, {})).then(() => notifyUserKey(`nv-set-exam-att-${u}`)),
+      safeLoad(() => loadUser(u, "tasks",         "nv-tasks",             [])).then(() => notifyUserKey("nv-tasks")),
+      safeLoad(() => loadUser(u, "timetable",     "nv-timetable",         [])).then(() => notifyUserKey("nv-timetable")),
+      safeLoad(() => loadUser(u, "gpa-courses",   "nv-gpa-courses",       [])).then(() => notifyUserKey("nv-gpa-courses")),
+      safeLoad(() => loadUser(u, "skills-done",   "nv-skills-done",       {})).then(() => notifyUserKey("nv-skills-done")),
+      safeLoad(() => loadUser(u, "messages",      "nv-messages",          [])).then(() => notifyUserKey("nv-messages")),
+    ]);
+
+    // 3. All done — enter the app regardless of any storage errors above
+    window.dispatchEvent(new CustomEvent("nv:user-hydrated"));
+    window.dispatchEvent(new CustomEvent("nv:shared-hydrated"));
+
+    setCurrentUserRef(u);
+    setCurrentUser(u);
+    setIsAdmin(user.role === "admin");
+    setIsLecturer(user.role === "lecturer");
+    setCurrentUserClass(user.class || "");
+    setPage("app");
+    const notifs = ls("nv-notifications", []);
+    setUnreadNotifs(notifs.filter(n => !n.read).length);
+    toast("Welcome back! 👋", "success");
     setLoginLoading(false);
   };
 
