@@ -5126,7 +5126,7 @@ function NcPaywall({ currentUser, onUnlocked, toast, preview, isMock }) {
                       ref:       `NC-${Date.now()}`,
                       metadata:  { name: _name, custom_fields:[{display_name:"Student Name",variable_name:"name",value:_name}] },
                       onClose:   ()=>{},
-                      callback:  async (response)=>{
+                      callback:  (response)=>{
                         // Payment successful — generate & save code
                         const newCode = generateAccessCode();
                         // Save to Firebase
