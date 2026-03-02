@@ -5089,27 +5089,7 @@ function NcPaywall({ currentUser, onUnlocked, toast, preview, isMock }) {
           {/* Payment options */}
           <div style={{marginTop:20,borderTop:"1px solid var(--border)",paddingTop:16}}>
             <div style={{fontWeight:800,fontSize:12,color:"var(--text3)",marginBottom:12,textTransform:"uppercase",letterSpacing:.5,textAlign:"center"}}>💳 Purchase a Code — Pay Via</div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:14}}>
-              {/* Opay */}
-              <a href="tel:9026985870"
-                style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6,padding:"12px 8px",borderRadius:12,
-                  background:"linear-gradient(135deg,#00b140,#007a2c)",textDecoration:"none",cursor:"pointer",
-                  boxShadow:"0 2px 8px rgba(0,177,64,.2)",transition:"transform .15s,box-shadow .15s"}}
-                onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 4px 16px rgba(0,177,64,.35)";}}
-                onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 2px 8px rgba(0,177,64,.2)";}}>
-                <div style={{width:36,height:36,borderRadius:"50%",background:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:14,color:"#00b140",letterSpacing:-1}}>OPay</div>
-                <div style={{color:"white",fontWeight:800,fontSize:11}}>OPay</div>
-              </a>
-              {/* Remita */}
-              <a href="https://remita.net" target="_blank" rel="noopener noreferrer"
-                style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6,padding:"12px 8px",borderRadius:12,
-                  background:"linear-gradient(135deg,#e63946,#9b1d24)",textDecoration:"none",cursor:"pointer",
-                  boxShadow:"0 2px 8px rgba(230,57,70,.2)",transition:"transform .15s,box-shadow .15s"}}
-                onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 4px 16px rgba(230,57,70,.35)";}}
-                onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 2px 8px rgba(230,57,70,.2)";}}>
-                <div style={{width:36,height:36,borderRadius:"50%",background:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:11,color:"#e63946",letterSpacing:-1}}>REM</div>
-                <div style={{color:"white",fontWeight:800,fontSize:11}}>Remita</div>
-              </a>
+            <div style={{display:"grid",gridTemplateColumns:"1fr",gap:10,marginBottom:14}}>
               {/* Paystack */}
               <div
                 onClick={async ()=>{
