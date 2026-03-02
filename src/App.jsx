@@ -43,7 +43,7 @@ const sendResetEmail = async (toEmail, code) => {
 
 // ─── PAYSTACK CONFIG ─────────────────────────────────────────────────
 // Paste your Paystack Public Key below (starts with pk_test_ or pk_live_)
-const PAYSTACK_PUBLIC_KEY = "sk_live_df3daa050188088c9052656f0eeafc9cad3fb7d2";
+const PAYSTACK_PUBLIC_KEY = "pk_live_25be9012b1233d358dfbab621aac09469f128cd4";
 const PAYSTACK_AMOUNT     = 200000; // Amount in kobo (500000 = ₦5,000) — change to your price
 
 // Generates a unique NC access code like NC-XXXX-XXXX-XXXX
