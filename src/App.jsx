@@ -5144,7 +5144,7 @@ function NcPaywall({ currentUser, onUnlocked, toast, preview, isMock }) {
                     });
                     handler.openIframe();
                   } catch(e) {
-                    alert("❌ Could not load Paystack. Please check your internet connection and try again.");
+                    alert("❌ Error: " + (e?.message || e?.toString() || "Unknown error"));
                   }
                 }}
                 style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6,padding:"12px 8px",borderRadius:12,
