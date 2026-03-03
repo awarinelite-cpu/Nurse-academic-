@@ -412,7 +412,11 @@ const callSignal = async (caller, callee, data) => {
   if (!_db) return false;
   try {
     const cid = _callId(caller, callee);
-    await _db.collection("voice_calls").doc(cid).set({ caller, callee, ...data, updatedAt: Date.now() });
+    // Always preserve original caller/callee — only update the data fields
+    await _db.collection("voice_calls").doc(cid).set(
+      { ...data, updatedAt: Date.now() },
+      { merge: true }
+    );
     return true;
   } catch(e) { console.error("[Call] signal failed:", e.message); return false; }
 };
@@ -440,7 +444,10 @@ const callEnd = async (caller, callee) => {
   if (!_db) return;
   try {
     const cid = _callId(caller, callee);
-    await _db.collection("voice_calls").doc(cid).set({ caller, callee, status: "ended", updatedAt: Date.now() });
+    await _db.collection("voice_calls").doc(cid).set(
+      { status: "ended", updatedAt: Date.now() },
+      { merge: true }
+    );
   } catch(e) {}
 };
 
@@ -7489,6 +7496,8 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
   const remoteAudio  = useRef(null);
   const timerRef     = useRef(null);
   const unsubRef     = useRef(null);
+  const appliedCallerIce = useRef(0); // track how many callerCandidates already applied
+  const appliedCalleeIce = useRef(0); // track how many calleeCandidates already applied
 
   const allUsers = ls("nv-users", []);
   const peerName = allUsers.find(u => u.username === peer)?.displayName || peer.split("@")[0];
@@ -7546,7 +7555,7 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
       const pc = await setupPC();
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      await callSignal(user, peer, { status: "ringing", offer: { type: offer.type, sdp: offer.sdp } });
+      await callSignal(user, peer, { caller: user, callee: peer, status: "ringing", offer: { type: offer.type, sdp: offer.sdp } });
 
       // Listen for answer
       unsubRef.current = callSubscribe(user, peer, async (doc) => {
@@ -7559,9 +7568,11 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
           timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
         }
         if (doc.calleeCandidates) {
-          for (const c of doc.calleeCandidates) {
+          const newCandidates = doc.calleeCandidates.slice(appliedCalleeIce.current);
+          for (const c of newCandidates) {
             try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
           }
+          appliedCalleeIce.current = doc.calleeCandidates.length;
         }
       });
     } catch(e) { toast("Microphone access denied", "error"); hangUp(); }
@@ -7582,9 +7593,11 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
       unsubRef.current = callSubscribe(user, peer, async (doc) => {
         if (doc.status === "ended") { cleanup(); setStatus("ended"); setTimeout(() => onEnd(), 1200); return; }
         if (doc.callerCandidates) {
-          for (const c of doc.callerCandidates) {
+          const newCandidates = doc.callerCandidates.slice(appliedCallerIce.current);
+          for (const c of newCandidates) {
             try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
           }
+          appliedCallerIce.current = doc.callerCandidates.length;
         }
       });
     } catch(e) { toast("Microphone access denied", "error"); hangUp(); }
@@ -7599,18 +7612,8 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
   useEffect(() => {
     if (role === "caller") {
       startCall();
-    } else {
-      // Fetch offer from Firestore immediately
-      if (_db) {
-        const cid = _callId(user, peer);
-        _db.collection("voice_calls").doc(cid).get().then(snap => {
-          if (snap.exists && snap.data().offer) {
-            // Store offer for answerCall
-            pcRef._offer = snap.data().offer;
-          }
-        });
-      }
     }
+    // callee: no action on mount — wait for user to tap Answer (offer fetched then)
     return () => cleanup();
   }, []);
 
@@ -7814,17 +7817,19 @@ function Messages({ user, toast, onUnreadChange }) {
   useEffect(() => { if (activeUser) setTimeout(() => inputRef.current?.focus(), 100); }, [activeUser]);
 
   // ── Listen for incoming calls ─────────────────────────────────────
+  const callModalRef = useRef(callModal);
+  useEffect(() => { callModalRef.current = callModal; }, [callModal]);
+
   useEffect(() => {
     if (!user || !_db) return;
-    // Subscribe to any voice_call doc where user is callee
+    // Single-field query (no composite index needed), filter status in JS
     const unsub = _db.collection("voice_calls")
       .where("callee", "==", user)
-      .where("status", "==", "ringing")
       .onSnapshot(snap => {
         snap.docChanges().forEach(change => {
           if (change.type === "added" || change.type === "modified") {
             const d = change.doc.data();
-            if (d.status === "ringing" && !callModal) {
+            if (d.status === "ringing" && !callModalRef.current) {
               setCallModal({ peer: d.caller, role: "callee" });
             }
           }
@@ -7832,7 +7837,7 @@ function Messages({ user, toast, onUnreadChange }) {
       }, () => {});
     callUnsubRef.current = unsub;
     return () => { unsub(); };
-  }, [user, callModal]);
+  }, [user]);
 
   const startVoiceCall = () => {
     if (!activeUser) return;
