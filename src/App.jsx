@@ -7559,10 +7559,16 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
         { urls: "stun:stun2.l.google.com:19302" },
-        // Free TURN fallback so calls work behind symmetric NATs
-        { urls: "turn:openrelay.metered.ca:80",  username: "openrelayproject", credential: "openrelayproject" },
-        { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+        { urls: "stun:stun3.l.google.com:19302" },
+        { urls: "stun:stun4.l.google.com:19302" },
+        { urls: "stun:global.stun.twilio.com:3478" },
+        // Reliable free TURN relay fallback for users behind strict/symmetric NATs
+        { urls: "turn:a.relay.metered.ca:80",               username: "free", credential: "free" },
+        { urls: "turn:a.relay.metered.ca:80?transport=tcp",  username: "free", credential: "free" },
+        { urls: "turn:a.relay.metered.ca:443",              username: "free", credential: "free" },
+        { urls: "turns:a.relay.metered.ca:443",             username: "free", credential: "free" },
       ],
+      iceCandidatePoolSize: 10,
     });
     pcRef.current = pc;
 
@@ -7706,7 +7712,7 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
   // ── Mute toggle ───────────────────────────────────────────────────
   const toggleMute = () => {
     if (localStreamRef.current) {
-      const nowMuted = !muted; // toggle muted state
+      const nowMuted = !muted;
       localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = !nowMuted; });
       setMuted(nowMuted);
     }
