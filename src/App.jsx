@@ -337,16 +337,29 @@ const examBsSet = async (key, val) => _setDocField(_DOC_EXAMS, key, val);
 const _safeKey = (email) => email.replace(/[^a-zA-Z0-9]/g, "_");
 const _convId  = (a, b) => [a, b].sort().join("||");
 
-const dmSend = async (fromUser, toUser, text) => {
+const dmSend = async (fromUser, toUser, payload) => {
+  // payload: { text?, type?, fileData?, fileName?, fileType?, fileSize?, duration? }
   const ready = await _loadFirebase(); if (!ready) return false;
   try {
     const cid   = _convId(fromUser, toUser);
     const msgId = "m_" + Date.now() + "_" + Math.random().toString(36).slice(2,7);
-    const msg   = { id:msgId, from:fromUser, to:toUser, text:text.trim(), sentAt:Date.now(), read:false };
+    const msg   = {
+      id: msgId, from: fromUser, to: toUser, sentAt: Date.now(), read: false,
+      type: payload.type || "text",
+      text: payload.text || "",
+      ...(payload.fileData  && { fileData:  payload.fileData }),
+      ...(payload.fileName  && { fileName:  payload.fileName }),
+      ...(payload.fileType  && { fileType:  payload.fileType }),
+      ...(payload.fileSize  && { fileSize:  payload.fileSize }),
+      ...(payload.duration  && { duration:  payload.duration }),
+    };
     await _db.collection("dm_convs").doc(cid).collection("msgs").doc(msgId).set(msg);
+    const preview = payload.type === "file" ? ("📎 " + (payload.fileName||"File"))
+                  : payload.type === "voice" ? "🎤 Voice note"
+                  : (payload.text||"").slice(0,100);
     await _db.collection("dm_convs").doc(cid).set({
       participants: [fromUser, toUser],
-      lastMsg:  text.trim().slice(0,100),
+      lastMsg:  preview,
       lastFrom: fromUser,
       lastAt:   Date.now(),
       ["unread_" + _safeKey(toUser)]: true,
@@ -783,6 +796,7 @@ body{
 
 ::-webkit-scrollbar{width:5px;height:5px;}
 ::-webkit-scrollbar-thumb{background:var(--accent2);border-radius:10px;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 @keyframes fadeUp{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:translateY(0);}}
 @keyframes fadeIn{from{opacity:0;}to{opacity:1;}}
 @keyframes slideIn{from{transform:translateX(110%);opacity:0;}to{transform:translateX(0);opacity:1;}}
@@ -7422,38 +7436,66 @@ function MedCalc() {
 }
 
 function Messages({ user, toast, onUnreadChange }) {
-  const allUsers = ls("nv-users", []);
-  // Classmates = all students except self
-  const classmates = allUsers.filter(u => u.username !== user && u.role !== "admin");
+  const allUsers  = ls("nv-users", []);
+  const allClasses = ls("nv-classes", []);
+  const me = allUsers.find(u => u.username === user);
+  const myClassId = me?.class || "";
 
-  const [convs, setConvs]       = useState([]);           // inbox list from Firestore
-  const [activeUser, setActiveUser] = useState(null);     // who we're chatting with
-  const [msgs, setMsgs]         = useState([]);           // messages in active conv
-  const [input, setInput]       = useState("");
-  const [sending, setSending]   = useState(false);
-  const [search, setSearch]     = useState("");
-  const [notifPerm, setNotifPerm] = useState(() =>
+  // Class-restricted: only show students in the same class
+  const classmates = allUsers.filter(u =>
+    u.username !== user &&
+    u.role !== "admin" &&
+    u.role !== "lecturer" &&
+    u.class === myClassId &&
+    myClassId !== ""
+  );
+
+  // State
+  const [convs,       setConvs]       = useState([]);
+  const [activeUser,  setActiveUser]  = useState(null);
+  const [msgs,        setMsgs]        = useState([]);
+  const [input,       setInput]       = useState("");
+  const [sending,     setSending]     = useState(false);
+  const [search,      setSearch]      = useState("");
+  const [dropOpen,    setDropOpen]    = useState(false);
+  const [notifPerm,   setNotifPerm]   = useState(() =>
     typeof Notification !== "undefined" ? Notification.permission : "default"
   );
-  const bottomRef = useRef(null);
-  const inputRef  = useRef(null);
+  // Voice note recording
+  const [recording,   setRecording]   = useState(false);
+  const [recSeconds,  setRecSeconds]  = useState(0);
+  const mediaRecRef  = useRef(null);
+  const recTimerRef  = useRef(null);
+  const recChunksRef = useRef([]);
+  // File input
+  const fileInputRef = useRef(null);
+  const bottomRef    = useRef(null);
+  const inputRef     = useRef(null);
+  const dropRef      = useRef(null);
 
-  // ── Request browser notification permission once ──────────────────
+  // ── Notification permission ───────────────────────────────────────
   useEffect(() => {
     if (typeof Notification !== "undefined" && Notification.permission === "default") {
       Notification.requestPermission().then(p => setNotifPerm(p));
     }
   }, []);
 
-  // ── Subscribe to inbox (all convs for this user) ──────────────────
+  // ── Close dropdown on outside click ──────────────────────────────
+  useEffect(() => {
+    const handler = (e) => {
+      if (dropRef.current && !dropRef.current.contains(e.target)) setDropOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  // ── Subscribe to inbox ────────────────────────────────────────────
   useEffect(() => {
     if (!user) return;
-    // Delay slightly to let Firebase load
     let unsub = () => {};
     const t = setTimeout(() => {
       unsub = dmSubscribeInbox(user, incoming => {
         setConvs(incoming);
-        // Count total unread convs
         const unread = incoming.filter(c => c["unread_" + _safeKey(user)]).length;
         if (onUnreadChange) onUnreadChange(unread);
       });
@@ -7466,360 +7508,426 @@ function Messages({ user, toast, onUnreadChange }) {
     if (!activeUser) return;
     let prevCount = 0;
     const unsub = dmSubscribeConv(user, activeUser, incoming => {
-      // Fire browser notification for new incoming messages
       if (incoming.length > prevCount) {
         const newMsgs = incoming.slice(prevCount);
         newMsgs.forEach(m => {
           if (m.from !== user && notifPerm === "granted") {
-            const name = allUsers.find(u2 => u2.username === m.from)?.displayName
-              || m.from.split("@")[0];
-            try {
-              new Notification(`💬 ${name}`, { body: m.text, icon: "/favicon.ico", tag: m.id });
-            } catch(e) {}
+            const name = allUsers.find(u2 => u2.username === m.from)?.displayName || m.from.split("@")[0];
+            try { new Notification("💬 " + name, { body: m.type === "voice" ? "🎤 Voice note" : m.type === "file" ? "📎 " + m.fileName : m.text, icon: "/favicon.ico", tag: m.id }); } catch(e) {}
           }
         });
       }
       prevCount = incoming.length;
       setMsgs(incoming);
-      // Mark as read since window is open
       dmMarkRead(user, activeUser);
-      // Update unread in convs list
-      setConvs(cs => cs.map(c =>
-        c.id === _convId(user, activeUser)
-          ? { ...c, ["unread_" + _safeKey(user)]: false }
-          : c
-      ));
+      setConvs(cs => cs.map(c => c.id === _convId(user, activeUser) ? { ...c, ["unread_" + _safeKey(user)]: false } : c));
     });
     return () => unsub();
   }, [activeUser, user]);
 
-  // ── Scroll to bottom when messages update ─────────────────────────
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [msgs]);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
+  useEffect(() => { if (activeUser) setTimeout(() => inputRef.current?.focus(), 100); }, [activeUser]);
 
-  // ── Focus input when switching conv ──────────────────────────────
-  useEffect(() => {
-    if (activeUser) setTimeout(() => inputRef.current?.focus(), 100);
-  }, [activeUser]);
-
-  const send = async () => {
+  // ── Send text ─────────────────────────────────────────────────────
+  const sendText = async () => {
     const text = input.trim();
     if (!text || !activeUser || sending) return;
     setSending(true);
     setInput("");
-    // Optimistic: add message locally immediately
-    const tempMsg = { id:"tmp_"+Date.now(), from:user, to:activeUser, text, sentAt:Date.now(), read:false };
-    setMsgs(m => [...m, tempMsg]);
-    const ok = await dmSend(user, activeUser, text);
-    if (!ok) {
-      toast("⚠️ Failed to send — check your connection", "error");
-      setMsgs(m => m.filter(x => x.id !== tempMsg.id));
-      setInput(text);
-    }
+    const tempId = "tmp_" + Date.now();
+    setMsgs(m => [...m, { id: tempId, from: user, to: activeUser, text, type: "text", sentAt: Date.now(), read: false }]);
+    const ok = await dmSend(user, activeUser, { type: "text", text });
+    if (!ok) { toast("⚠️ Send failed", "error"); setMsgs(m => m.filter(x => x.id !== tempId)); setInput(text); }
     setSending(false);
   };
 
-  const openConv = (username) => {
-    setActiveUser(username);
-    setMsgs([]);
+  // ── Send file ─────────────────────────────────────────────────────
+  const sendFile = async (file) => {
+    if (!file || !activeUser) return;
+    const MAX = 2 * 1024 * 1024; // 2 MB limit (Firestore doc limit)
+    if (file.size > MAX) { toast("File too large — max 2 MB", "error"); return; }
+    setSending(true);
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const fileData = e.target.result; // base64 data URL
+      const tempId = "tmp_" + Date.now();
+      setMsgs(m => [...m, { id: tempId, from: user, to: activeUser, type: "file", fileName: file.name, fileType: file.type, fileSize: file.size, fileData, sentAt: Date.now(), read: false }]);
+      const ok = await dmSend(user, activeUser, { type: "file", text: "", fileName: file.name, fileType: file.type, fileSize: file.size, fileData });
+      if (!ok) { toast("⚠️ File send failed", "error"); setMsgs(m => m.filter(x => x.id !== tempId)); }
+      setSending(false);
+    };
+    reader.readAsDataURL(file);
   };
 
+  // ── Voice recording ───────────────────────────────────────────────
+  const startRecording = async () => {
+    if (!activeUser) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recChunksRef.current = [];
+      const mr = new MediaRecorder(stream, { mimeType: MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/ogg" });
+      mr.ondataavailable = e => { if (e.data.size > 0) recChunksRef.current.push(e.data); };
+      mr.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        const blob = new Blob(recChunksRef.current, { type: mr.mimeType });
+        if (blob.size > 2 * 1024 * 1024) { toast("Voice note too long — max ~2 minutes", "error"); return; }
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+          const dur = recSeconds;
+          const tempId = "tmp_" + Date.now();
+          setMsgs(m => [...m, { id: tempId, from: user, to: activeUser, type: "voice", fileData: e.target.result, fileType: mr.mimeType, duration: dur, sentAt: Date.now(), read: false }]);
+          const ok = await dmSend(user, activeUser, { type: "voice", text: "", fileData: e.target.result, fileType: mr.mimeType, duration: dur });
+          if (!ok) { toast("⚠️ Voice note send failed", "error"); setMsgs(m => m.filter(x => x.id !== tempId)); }
+        };
+        reader.readAsDataURL(blob);
+      };
+      mr.start();
+      mediaRecRef.current = mr;
+      setRecording(true);
+      setRecSeconds(0);
+      recTimerRef.current = setInterval(() => setRecSeconds(s => s + 1), 1000);
+    } catch(e) { toast("Microphone access denied", "error"); }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecRef.current && mediaRecRef.current.state !== "inactive") {
+      mediaRecRef.current.stop();
+    }
+    clearInterval(recTimerRef.current);
+    setRecording(false);
+    setRecSeconds(0);
+  };
+
+  const cancelRecording = () => {
+    if (mediaRecRef.current && mediaRecRef.current.state !== "inactive") {
+      mediaRecRef.current.stream?.getTracks().forEach(t => t.stop());
+      mediaRecRef.current.ondataavailable = null;
+      mediaRecRef.current.onstop = null;
+      mediaRecRef.current.stop();
+    }
+    clearInterval(recTimerRef.current);
+    recChunksRef.current = [];
+    setRecording(false);
+    setRecSeconds(0);
+  };
+
+  const formatDur = (s) => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+
+  // ── Helpers ────────────────────────────────────────────────────────
   const formatTime = (ts) => {
     if (!ts) return "";
-    const d = new Date(ts);
-    const now = new Date();
-    const isToday = d.toDateString() === now.toDateString();
-    return isToday
+    const d = new Date(ts), now = new Date();
+    return d.toDateString() === now.toDateString()
       ? d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" })
       : d.toLocaleDateString([], { month:"short", day:"numeric" });
   };
+  const displayName = (email) => { const u = allUsers.find(x => x.username === email); return u?.displayName || email.split("@")[0]; };
+  const avatarChar  = (email) => { const u = allUsers.find(x => x.username === email); return u?.avatar || displayName(email)[0]?.toUpperCase() || "?"; };
+  const hasUnread   = (username) => { const c = convs.find(x => x.id === _convId(user, username)); return c && c["unread_" + _safeKey(user)]; };
 
-  const displayName = (email) => {
-    const u = allUsers.find(x => x.username === email);
-    return u?.displayName || email.split("@")[0];
+  const openConv = (username) => { setActiveUser(username); setMsgs([]); setDropOpen(false); };
+
+  const filteredPeople = classmates.filter(u => {
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return u.username.toLowerCase().includes(q) || (u.displayName||"").toLowerCase().includes(q);
+  }).sort((a, b) => {
+    const ca = convs.find(c => c.participants?.includes(a.username));
+    const cb = convs.find(c => c.participants?.includes(b.username));
+    return (cb?.lastAt||0) - (ca?.lastAt||0);
+  });
+
+  const formatFileSize = (bytes) => {
+    if (!bytes) return "";
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + " KB";
+    return (bytes/(1024*1024)).toFixed(1) + " MB";
   };
 
-  const avatar = (email) => {
-    const u = allUsers.find(x => x.username === email);
-    return u?.avatar || displayName(email)[0]?.toUpperCase() || "?";
+  const isImage = (type) => type && type.startsWith("image/");
+  const isPdf   = (type) => type === "application/pdf";
+
+  // ── Message bubble renderer ────────────────────────────────────────
+  const renderMsgContent = (m) => {
+    const mine = m.from === user;
+    const bubbleColor = mine ? "linear-gradient(135deg,var(--accent),var(--accent2))" : "var(--card2)";
+    const textColor   = mine ? "white" : "var(--text)";
+
+    if (m.type === "voice") {
+      return (
+        <div style={{ background: bubbleColor, borderRadius: mine ? "18px 18px 4px 18px" : "18px 18px 18px 4px", padding:"10px 14px", minWidth:200, display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{ width:36, height:36, borderRadius:"50%", background: mine ? "rgba(255,255,255,.2)" : "rgba(0,119,182,.12)", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+            <span style={{ fontSize:18 }}>🎤</span>
+          </div>
+          <div style={{ flex:1 }}>
+            <audio controls src={m.fileData} style={{ width:"100%", height:32, minWidth:140 }} />
+            <div style={{ fontSize:10, color: mine ? "rgba(255,255,255,.75)" : "var(--text3)", marginTop:3 }}>
+              {m.duration ? formatDur(m.duration) : "Voice note"}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    if (m.type === "file") {
+      if (isImage(m.fileType)) {
+        return (
+          <div style={{ borderRadius: mine ? "18px 18px 4px 18px" : "18px 18px 18px 4px", overflow:"hidden", maxWidth:260, background: bubbleColor }}>
+            <img src={m.fileData} alt={m.fileName} style={{ width:"100%", display:"block", maxHeight:240, objectFit:"cover" }} />
+            <div style={{ padding:"6px 10px 8px", fontSize:11, color: textColor, opacity:.85 }}>{m.fileName}</div>
+          </div>
+        );
+      }
+      return (
+        <div style={{ background: bubbleColor, borderRadius: mine ? "18px 18px 4px 18px" : "18px 18px 18px 4px", padding:"10px 14px", display:"flex", alignItems:"center", gap:10, minWidth:180 }}>
+          <div style={{ width:36, height:36, borderRadius:9, background: mine ? "rgba(255,255,255,.2)" : "rgba(0,119,182,.12)", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0, fontSize:20 }}>
+            {isPdf(m.fileType) ? "📄" : "📎"}
+          </div>
+          <div style={{ flex:1, minWidth:0 }}>
+            <div style={{ fontWeight:700, fontSize:13, color: textColor, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{m.fileName}</div>
+            <div style={{ fontSize:11, color: mine ? "rgba(255,255,255,.7)" : "var(--text3)" }}>{formatFileSize(m.fileSize)}</div>
+          </div>
+          <a href={m.fileData} download={m.fileName} style={{ color: mine ? "white" : "var(--accent)", fontSize:20, textDecoration:"none", flexShrink:0 }} title="Download">⬇</a>
+        </div>
+      );
+    }
+
+    // Text
+    return (
+      <div style={{ background: bubbleColor, borderRadius: mine ? "18px 18px 4px 18px" : "18px 18px 18px 4px", padding:"9px 14px", fontSize:14, color: textColor, boxShadow:"0 1px 4px rgba(0,0,0,.08)", wordBreak:"break-word", opacity: m.id?.startsWith("tmp_") ? 0.6 : 1 }}>
+        {m.text}
+      </div>
+    );
   };
 
-  // Build sidebar list: classmates who have an existing conv OR match search
-  const filteredSearch = search.trim().toLowerCase();
-  const convUserSet = new Set(convs.flatMap(c => c.participants || []));
+  // ── No class assigned guard ────────────────────────────────────────
+  if (!myClassId) {
+    return (
+      <div>
+        <div className="sec-title">💬 Messages</div>
+        <div style={{ textAlign:"center", padding:"60px 20px", color:"var(--text3)" }}>
+          <div style={{ fontSize:52, marginBottom:14 }}>🏫</div>
+          <div style={{ fontWeight:800, fontSize:16, color:"var(--text)", marginBottom:8 }}>No Class Assigned</div>
+          <div style={{ fontSize:13 }}>You need to be assigned to a class to send messages. Contact your admin.</div>
+        </div>
+      </div>
+    );
+  }
 
-  // People panel: all classmates, sorted by recent conv first
-  const sidebarPeople = classmates
-    .filter(u => {
-      if (!filteredSearch) return true;
-      return u.username.toLowerCase().includes(filteredSearch)
-        || (u.displayName||"").toLowerCase().includes(filteredSearch);
-    })
-    .sort((a, b) => {
-      const ca = convs.find(c => c.participants?.includes(a.username));
-      const cb = convs.find(c => c.participants?.includes(b.username));
-      return (cb?.lastAt||0) - (ca?.lastAt||0);
-    });
-
-  const activeConv = convs.find(c => c.id === (activeUser ? _convId(user, activeUser) : null));
-  const hasUnread  = (username) => {
-    const c = convs.find(x => x.id === _convId(user, username));
-    return c && c["unread_" + _safeKey(user)];
-  };
+  const myClass = allClasses.find(c => c.id === myClassId);
 
   return (
-    <div style={{ display:"flex", flexDirection:"column", height:"calc(100vh - 120px)", minHeight:500 }}>
-      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12, flexWrap:"wrap", gap:8 }}>
+    <div style={{ display:"flex", flexDirection:"column", height:"calc(100vh - 110px)", minHeight:500 }}>
+
+      {/* ── Header bar ── */}
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10, flexWrap:"wrap", gap:8 }}>
         <div>
           <div className="sec-title" style={{ marginBottom:2 }}>💬 Messages</div>
-          <div className="sec-sub">Chat privately with your classmates</div>
+          <div className="sec-sub">
+            {myClass ? `🏫 ${myClass.label} classmates only` : "Private class chat"}
+          </div>
         </div>
-        {notifPerm !== "granted" && (
-          <button
-            className="btn btn-sm"
-            style={{ fontSize:11, borderColor:"var(--accent)", color:"var(--accent)" }}
-            onClick={() => Notification.requestPermission().then(p => setNotifPerm(p))}
-          >
-            🔔 Enable Notifications
-          </button>
-        )}
-        {notifPerm === "granted" && (
-          <span style={{ fontSize:11, color:"var(--success)", fontWeight:700 }}>🔔 Notifications on</span>
-        )}
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          {notifPerm === "granted"
+            ? <span style={{ fontSize:11, color:"var(--success)", fontWeight:700 }}>🔔 On</span>
+            : <button className="btn btn-sm" style={{ fontSize:11, borderColor:"var(--accent)", color:"var(--accent)" }}
+                onClick={() => Notification.requestPermission().then(p => setNotifPerm(p))}>
+                🔔 Enable notifications
+              </button>
+          }
+        </div>
       </div>
 
-      <div style={{
-        display:"flex", flex:1, borderRadius:14, overflow:"hidden",
-        border:"1.5px solid var(--border)", background:"var(--card)", minHeight:0,
-      }}>
+      {/* ── Recipient dropdown + chat fills full width ── */}
+      <div style={{ display:"flex", flexDirection:"column", flex:1, borderRadius:14, overflow:"hidden", border:"1.5px solid var(--border)", background:"var(--card)", minHeight:0 }}>
 
-        {/* ── LEFT COLUMN: classmate list ── */}
-        <div style={{
-          width:220, flexShrink:0, borderRight:"1.5px solid var(--border)",
-          display:"flex", flexDirection:"column", background:"var(--bg4)",
-        }}>
-          {/* Search */}
-          <div style={{ padding:"10px 10px 8px" }}>
-            <input
-              className="inp"
-              style={{ marginBottom:0, fontSize:12, padding:"7px 10px" }}
-              placeholder="🔍 Search classmates…"
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-            />
-          </div>
+        {/* Recipient selector bar */}
+        <div style={{ padding:"10px 14px", borderBottom:"1.5px solid var(--border)", background:"var(--bg4)", display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+          <span style={{ fontSize:13, fontWeight:700, color:"var(--text3)", flexShrink:0 }}>To:</span>
 
-          {/* List */}
-          <div style={{ flex:1, overflowY:"auto" }}>
-            {sidebarPeople.length === 0 && (
-              <div style={{ padding:20, textAlign:"center", color:"var(--text3)", fontSize:12 }}>
-                {filteredSearch ? "No classmates found" : "No classmates registered yet"}
-              </div>
-            )}
-            {sidebarPeople.map(u => {
-              const isActive = activeUser === u.username;
-              const unread   = hasUnread(u.username);
-              const conv     = convs.find(c => c.id === _convId(user, u.username));
-              return (
-                <div
-                  key={u.username}
-                  onClick={() => openConv(u.username)}
-                  style={{
-                    display:"flex", alignItems:"center", gap:10, padding:"10px 12px",
-                    cursor:"pointer", transition:"background .15s",
-                    background: isActive ? "var(--accent)22" : "transparent",
-                    borderLeft: isActive ? "3px solid var(--accent)" : "3px solid transparent",
-                    position:"relative",
-                  }}
-                >
-                  {/* Avatar */}
-                  <div style={{
-                    width:36, height:36, borderRadius:"50%", flexShrink:0,
-                    background:"linear-gradient(135deg,var(--accent),var(--accent2))",
-                    display:"flex", alignItems:"center", justifyContent:"center",
-                    fontSize:15, fontWeight:700, color:"white", position:"relative",
-                  }}>
-                    {avatar(u.username)}
-                    {unread && (
-                      <span style={{
-                        position:"absolute", top:-3, right:-3, width:10, height:10,
-                        background:"var(--danger)", borderRadius:"50%",
-                        border:"2px solid var(--bg4)",
-                      }} />
-                    )}
-                  </div>
-                  <div style={{ flex:1, minWidth:0 }}>
-                    <div style={{
-                      fontWeight: unread ? 800 : 600, fontSize:13,
-                      color: isActive ? "var(--accent)" : "var(--text)",
-                      whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
-                    }}>
-                      {displayName(u.username)}
-                    </div>
-                    {conv && (
-                      <div style={{
-                        fontSize:10, color:"var(--text3)", whiteSpace:"nowrap",
-                        overflow:"hidden", textOverflow:"ellipsis",
-                        fontWeight: unread ? 700 : 400,
-                      }}>
-                        {conv.lastFrom === user ? "You: " : ""}{conv.lastMsg}
-                      </div>
-                    )}
-                    {!conv && (
-                      <div style={{ fontSize:10, color:"var(--text3)" }}>
-                        {u.class ? `🏫 ${u.class}` : "Start a conversation"}
-                      </div>
-                    )}
-                  </div>
-                  {conv && (
-                    <div style={{ fontSize:9, color:"var(--text3)", flexShrink:0 }}>
-                      {formatTime(conv.lastAt)}
+          {/* Dropdown trigger */}
+          <div ref={dropRef} style={{ position:"relative", flex:1, minWidth:160, maxWidth:320 }}>
+            <div
+              onClick={() => setDropOpen(o => !o)}
+              style={{ display:"flex", alignItems:"center", gap:8, padding:"8px 12px", borderRadius:20, border:"1.5px solid var(--border)", background:"var(--card)", cursor:"pointer", userSelect:"none", transition:"border-color .15s" }}
+              onMouseEnter={e=>e.currentTarget.style.borderColor="var(--accent)"}
+              onMouseLeave={e=>e.currentTarget.style.borderColor=activeUser?"var(--accent)":"var(--border)"}
+              style={{ display:"flex", alignItems:"center", gap:8, padding:"8px 12px", borderRadius:20, border:`1.5px solid ${activeUser?"var(--accent)":"var(--border)"}`, background:"var(--card)", cursor:"pointer" }}
+            >
+              {activeUser ? (
+                <>
+                  <div style={{ width:24, height:24, borderRadius:"50%", background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:11, fontWeight:700, color:"white", flexShrink:0 }}>{avatarChar(activeUser)}</div>
+                  <span style={{ fontWeight:700, fontSize:13, flex:1 }}>{displayName(activeUser)}</span>
+                  {hasUnread(activeUser) && <span style={{ width:8, height:8, borderRadius:"50%", background:"var(--danger)", flexShrink:0 }} />}
+                </>
+              ) : (
+                <span style={{ color:"var(--text3)", fontSize:13, flex:1 }}>Select a classmate…</span>
+              )}
+              <span style={{ color:"var(--text3)", fontSize:12, flexShrink:0, transition:"transform .2s", transform: dropOpen?"rotate(180deg)":"none" }}>▾</span>
+            </div>
+
+            {/* Dropdown panel */}
+            {dropOpen && (
+              <div style={{ position:"absolute", top:"calc(100% + 6px)", left:0, right:0, zIndex:999, background:"var(--card)", border:"1.5px solid var(--border)", borderRadius:14, boxShadow:"0 8px 32px rgba(0,0,0,.18)", overflow:"hidden", minWidth:240 }}>
+                {/* Search inside dropdown */}
+                <div style={{ padding:"8px 10px", borderBottom:"1px solid var(--border)" }}>
+                  <input
+                    className="inp"
+                    style={{ marginBottom:0, fontSize:12, padding:"7px 12px", borderRadius:20 }}
+                    placeholder="🔍 Search by name…"
+                    value={search}
+                    onChange={e => setSearch(e.target.value)}
+                    autoFocus
+                  />
+                </div>
+                <div style={{ maxHeight:280, overflowY:"auto" }}>
+                  {filteredPeople.length === 0 && (
+                    <div style={{ padding:"20px 16px", textAlign:"center", color:"var(--text3)", fontSize:13 }}>
+                      {search ? "No match found" : classmates.length === 0 ? "No classmates in your class yet" : "No results"}
                     </div>
                   )}
+                  {filteredPeople.map(u => {
+                    const conv   = convs.find(c => c.id === _convId(user, u.username));
+                    const unread = hasUnread(u.username);
+                    const isAct  = activeUser === u.username;
+                    return (
+                      <div
+                        key={u.username}
+                        onClick={() => openConv(u.username)}
+                        style={{ display:"flex", alignItems:"center", gap:10, padding:"10px 14px", cursor:"pointer", background: isAct ? "var(--accent)18" : "transparent", borderLeft: isAct ? "3px solid var(--accent)" : "3px solid transparent", transition:"background .12s" }}
+                        onMouseEnter={e=>{ if(!isAct) e.currentTarget.style.background="var(--bg4)"; }}
+                        onMouseLeave={e=>{ if(!isAct) e.currentTarget.style.background="transparent"; }}
+                      >
+                        <div style={{ position:"relative", flexShrink:0 }}>
+                          <div style={{ width:36, height:36, borderRadius:"50%", background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, fontWeight:700, color:"white" }}>{avatarChar(u.username)}</div>
+                          {unread && <span style={{ position:"absolute", top:-2, right:-2, width:10, height:10, background:"var(--danger)", borderRadius:"50%", border:"2px solid var(--card)" }} />}
+                        </div>
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ fontWeight: unread ? 800 : 600, fontSize:13, color: isAct ? "var(--accent)" : "var(--text)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{displayName(u.username)}</div>
+                          <div style={{ fontSize:10, color:"var(--text3)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                            {conv ? (conv.lastFrom === user ? "You: " : "") + conv.lastMsg : "Start a conversation"}
+                          </div>
+                        </div>
+                        {conv && <div style={{ fontSize:9, color:"var(--text3)", flexShrink:0 }}>{formatTime(conv.lastAt)}</div>}
+                      </div>
+                    );
+                  })}
                 </div>
-              );
-            })}
+              </div>
+            )}
           </div>
+
+          {/* Clear / close */}
+          {activeUser && (
+            <button className="btn btn-sm" style={{ flexShrink:0 }} onClick={() => { setActiveUser(null); setMsgs([]); }}>✕</button>
+          )}
         </div>
 
-        {/* ── RIGHT COLUMN: chat area ── */}
-        <div style={{ flex:1, display:"flex", flexDirection:"column", minWidth:0 }}>
-          {!activeUser ? (
-            /* Empty state */
-            <div style={{
-              flex:1, display:"flex", flexDirection:"column",
-              alignItems:"center", justifyContent:"center",
-              color:"var(--text3)", padding:32, textAlign:"center",
-            }}>
-              <div style={{ fontSize:56, marginBottom:14 }}>💬</div>
-              <div style={{ fontWeight:800, fontSize:16, marginBottom:6, color:"var(--text)" }}>
-                Select a classmate to chat
-              </div>
-              <div style={{ fontSize:13 }}>
-                Pick someone from the list on the left to start a private conversation.
-              </div>
+        {/* ── CHAT AREA (full width) ── */}
+        {!activeUser ? (
+          <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"var(--text3)", padding:32, textAlign:"center" }}>
+            <div style={{ fontSize:60, marginBottom:16 }}>💬</div>
+            <div style={{ fontWeight:800, fontSize:17, color:"var(--text)", marginBottom:8 }}>Select a classmate to start chatting</div>
+            <div style={{ fontSize:13, maxWidth:320, lineHeight:1.7 }}>
+              Click the <b>To:</b> dropdown above to choose someone from <b>{myClass?.label || "your class"}</b>.
+              You can send text, files, and voice notes.
             </div>
-          ) : (
-            <>
-              {/* Chat header */}
-              <div style={{
-                padding:"12px 16px", borderBottom:"1.5px solid var(--border)",
-                display:"flex", alignItems:"center", gap:12, background:"var(--card)",
-              }}>
-                <div style={{
-                  width:38, height:38, borderRadius:"50%", flexShrink:0,
-                  background:"linear-gradient(135deg,var(--accent),var(--accent2))",
-                  display:"flex", alignItems:"center", justifyContent:"center",
-                  fontSize:16, fontWeight:700, color:"white",
-                }}>
-                  {avatar(activeUser)}
-                </div>
-                <div style={{ flex:1 }}>
-                  <div style={{ fontWeight:800, fontSize:14 }}>{displayName(activeUser)}</div>
-                  <div style={{ fontSize:11, color:"var(--text3)" }}>{activeUser}</div>
-                </div>
-                <button
-                  className="btn btn-sm"
-                  onClick={() => { setActiveUser(null); setMsgs([]); }}
-                  style={{ fontSize:11 }}
-                >
-                  ✕ Close
-                </button>
-              </div>
+          </div>
+        ) : (
+          <div style={{ flex:1, display:"flex", flexDirection:"column", minHeight:0 }}>
 
-              {/* Messages */}
-              <div style={{
-                flex:1, overflowY:"auto", padding:"14px 16px",
-                display:"flex", flexDirection:"column", gap:8,
-              }}>
-                {msgs.length === 0 && (
-                  <div style={{
-                    flex:1, display:"flex", alignItems:"center", justifyContent:"center",
-                    color:"var(--text3)", fontSize:13, textAlign:"center",
-                  }}>
-                    No messages yet — say hello! 👋
-                  </div>
-                )}
-                {msgs.map((m, i) => {
-                  const mine = m.from === user;
-                  const showAvatar = !mine && (i === 0 || msgs[i-1]?.from !== m.from);
-                  return (
-                    <div key={m.id} style={{
-                      display:"flex", gap:8,
-                      justifyContent: mine ? "flex-end" : "flex-start",
-                      alignItems:"flex-end",
-                    }}>
-                      {!mine && (
-                        <div style={{
-                          width:28, height:28, borderRadius:"50%", flexShrink:0,
-                          background: showAvatar
-                            ? "linear-gradient(135deg,var(--accent),var(--accent2))"
-                            : "transparent",
-                          display:"flex", alignItems:"center", justifyContent:"center",
-                          fontSize:12, fontWeight:700, color:"white",
-                        }}>
-                          {showAvatar ? avatar(m.from) : ""}
-                        </div>
-                      )}
-                      <div style={{ maxWidth:"68%", display:"flex", flexDirection:"column", alignItems: mine?"flex-end":"flex-start" }}>
-                        <div style={{
-                          background: mine
-                            ? "linear-gradient(135deg,var(--accent),var(--accent2))"
-                            : "var(--card2)",
-                          borderRadius: mine ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
-                          padding:"9px 14px",
-                          fontSize:14,
-                          color: mine ? "white" : "var(--text)",
-                          boxShadow:"0 1px 4px rgba(0,0,0,.08)",
-                          wordBreak:"break-word",
-                          opacity: m.id?.startsWith("tmp_") ? 0.6 : 1,
-                        }}>
-                          {m.text}
-                        </div>
-                        <div style={{ fontSize:10, color:"var(--text3)", marginTop:3, paddingLeft:4, paddingRight:4 }}>
-                          {formatTime(m.sentAt)}
-                          {mine && m.read && !m.id?.startsWith("tmp_") && <span style={{marginLeft:4,color:"var(--accent)"}}>✓✓</span>}
-                          {mine && m.id?.startsWith("tmp_") && <span style={{marginLeft:4}}>⏳</span>}
-                        </div>
+            {/* Messages scroll area */}
+            <div style={{ flex:1, overflowY:"auto", padding:"16px 20px", display:"flex", flexDirection:"column", gap:10 }}>
+              {msgs.length === 0 && (
+                <div style={{ margin:"auto", textAlign:"center", color:"var(--text3)", fontSize:13 }}>
+                  No messages yet — say hello! 👋
+                </div>
+              )}
+              {msgs.map((m, i) => {
+                const mine       = m.from === user;
+                const showAvatar = !mine && (i === 0 || msgs[i-1]?.from !== m.from);
+                return (
+                  <div key={m.id} style={{ display:"flex", gap:8, justifyContent: mine ? "flex-end" : "flex-start", alignItems:"flex-end" }}>
+                    {!mine && (
+                      <div style={{ width:28, height:28, borderRadius:"50%", flexShrink:0, background: showAvatar ? "linear-gradient(135deg,var(--accent),var(--accent2))" : "transparent", display:"flex", alignItems:"center", justifyContent:"center", fontSize:12, fontWeight:700, color:"white" }}>
+                        {showAvatar ? avatarChar(m.from) : ""}
+                      </div>
+                    )}
+                    <div style={{ maxWidth:"72%", display:"flex", flexDirection:"column", alignItems: mine ? "flex-end" : "flex-start" }}>
+                      {renderMsgContent(m)}
+                      <div style={{ fontSize:10, color:"var(--text3)", marginTop:3, paddingLeft:4, paddingRight:4 }}>
+                        {formatTime(m.sentAt)}
+                        {mine && m.read  && !m.id?.startsWith("tmp_") && <span style={{ marginLeft:4, color:"var(--accent)" }}>✓✓</span>}
+                        {mine && m.id?.startsWith("tmp_") && <span style={{ marginLeft:4 }}>⏳</span>}
                       </div>
                     </div>
-                  );
-                })}
-                <div ref={bottomRef} />
-              </div>
+                  </div>
+                );
+              })}
+              <div ref={bottomRef} />
+            </div>
 
-              {/* Input */}
-              <div style={{
-                padding:"10px 14px", borderTop:"1.5px solid var(--border)",
-                display:"flex", gap:8, alignItems:"center", background:"var(--card)",
-              }}>
+            {/* ── Input toolbar ── */}
+            {recording ? (
+              /* Voice recording active */
+              <div style={{ padding:"10px 14px", borderTop:"1.5px solid var(--border)", display:"flex", alignItems:"center", gap:10, background:"var(--bg4)" }}>
+                <div style={{ flex:1, display:"flex", alignItems:"center", gap:10, padding:"10px 16px", borderRadius:20, background:"rgba(239,68,68,.08)", border:"1.5px solid rgba(239,68,68,.3)" }}>
+                  <span style={{ width:10, height:10, borderRadius:"50%", background:"var(--danger)", animation:"pulse 1s infinite", flexShrink:0 }} />
+                  <span style={{ fontWeight:700, fontSize:13, color:"var(--danger)" }}>Recording…</span>
+                  <span style={{ fontFamily:"'DM Mono',monospace", fontSize:13, color:"var(--danger)", marginLeft:"auto" }}>{formatDur(recSeconds)}</span>
+                </div>
+                <button className="btn btn-sm" style={{ flexShrink:0 }} onClick={cancelRecording} title="Cancel">✕</button>
+                <button
+                  onClick={stopRecording}
+                  style={{ width:42, height:42, borderRadius:"50%", background:"var(--danger)", border:"none", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:18, flexShrink:0, boxShadow:"0 2px 8px rgba(239,68,68,.4)" }}
+                  title="Stop & Send"
+                >⏹</button>
+              </div>
+            ) : (
+              <div style={{ padding:"10px 14px", borderTop:"1.5px solid var(--border)", display:"flex", alignItems:"center", gap:8, background:"var(--card)" }}>
+                {/* File attach */}
+                <input ref={fileInputRef} type="file" style={{ display:"none" }} accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.zip" onChange={e => { if (e.target.files[0]) { sendFile(e.target.files[0]); e.target.value=""; } }} />
+                <button
+                  className="btn btn-sm"
+                  style={{ width:38, height:38, borderRadius:"50%", padding:0, display:"flex", alignItems:"center", justifyContent:"center", fontSize:18, flexShrink:0 }}
+                  onClick={() => fileInputRef.current?.click()}
+                  title="Attach file"
+                  disabled={sending}
+                >📎</button>
+
+                {/* Voice note */}
+                <button
+                  className="btn btn-sm"
+                  style={{ width:38, height:38, borderRadius:"50%", padding:0, display:"flex", alignItems:"center", justifyContent:"center", fontSize:18, flexShrink:0 }}
+                  onClick={startRecording}
+                  title="Record voice note"
+                  disabled={sending}
+                >🎤</button>
+
+                {/* Text input */}
                 <input
                   ref={inputRef}
                   className="inp"
                   style={{ flex:1, marginBottom:0, borderRadius:20, padding:"10px 16px" }}
-                  placeholder={`Message ${displayName(activeUser)}…`}
+                  placeholder={"Message " + displayName(activeUser) + "…"}
                   value={input}
                   onChange={e => setInput(e.target.value)}
-                  onKeyDown={e => e.key === "Enter" && !e.shiftKey && send()}
+                  onKeyDown={e => e.key === "Enter" && !e.shiftKey && sendText()}
                   disabled={sending}
                 />
+
+                {/* Send button */}
                 <button
                   className="btn btn-accent"
-                  style={{
-                    borderRadius:"50%", width:40, height:40, padding:0,
-                    display:"flex", alignItems:"center", justifyContent:"center",
-                    fontSize:18, flexShrink:0, opacity: (!input.trim()||sending) ? 0.5 : 1,
-                  }}
-                  onClick={send}
+                  style={{ width:42, height:42, borderRadius:"50%", padding:0, display:"flex", alignItems:"center", justifyContent:"center", fontSize:19, flexShrink:0, opacity: (!input.trim() || sending) ? 0.45 : 1, transition:"opacity .15s" }}
+                  onClick={sendText}
                   disabled={!input.trim() || sending}
-                >
-                  ➤
-                </button>
+                  title="Send"
+                >➤</button>
               </div>
-            </>
-          )}
-        </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
