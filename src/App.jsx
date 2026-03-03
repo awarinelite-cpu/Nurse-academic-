@@ -7574,6 +7574,8 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
       const remoteStream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
       if (remoteAudioRef.current) {
         remoteAudioRef.current.srcObject = remoteStream;
+        remoteAudioRef.current.volume = 1;
+        remoteAudioRef.current.muted = false;
         // Must call play() explicitly — autoPlay alone is blocked on many browsers
         const playPromise = remoteAudioRef.current.play();
         if (playPromise) playPromise.catch(() => {
@@ -7704,9 +7706,9 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
   // ── Mute toggle ───────────────────────────────────────────────────
   const toggleMute = () => {
     if (localStreamRef.current) {
-      const enabled = muted; // flipping: if currently muted, we want to enable
-      localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = enabled; });
-      setMuted(!enabled);
+      const nowMuted = !muted; // toggle muted state
+      localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = !nowMuted; });
+      setMuted(nowMuted);
     }
   };
 
@@ -7723,7 +7725,7 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
   return (
     <div style={{ position:"fixed", inset:0, zIndex:9999, display:"flex", alignItems:"center", justifyContent:"center", background:"rgba(0,0,0,.65)", backdropFilter:"blur(8px)" }}>
       {/* Hidden audio element — plays remote peer's voice */}
-      <audio ref={remoteAudioRef} autoPlay playsInline style={{ display:"none" }} />
+      <audio ref={remoteAudioRef} autoPlay playsInline muted={false} style={{ display:"none" }} />
 
       <div style={{ background:"var(--card)", borderRadius:24, padding:"36px 32px", minWidth:300, maxWidth:360, width:"90vw", textAlign:"center", boxShadow:"0 24px 64px rgba(0,0,0,.4)", border:"1.5px solid var(--border)", position:"relative" }}>
 
