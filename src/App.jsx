@@ -162,10 +162,13 @@ const _loadFirebase = () => {
 // All essay subs live in:         collection("nv") / doc("essays")
 // Password resets:                collection("nv") / doc("resets")
 
-const _DOC_SHARED = "shared";
-const _DOC_EXAMS  = "exams";
-const _DOC_ESSAYS = "essays";
-const _DOC_RESETS = "resets";
+const _DOC_SHARED  = "shared";
+const _DOC_EXAMS   = "exams";
+const _DOC_ESSAYS  = "essays";
+const _DOC_RESETS  = "resets";
+const _DOC_MOCK    = "daily_mock";    // dedicated doc for daily mock pool (up to 250 Qs)
+const _DOC_ARCHIVE = "nc_archive";    // dedicated doc for NC exam archive
+const _DOC_NURSING = "nursing_exams"; // dedicated doc for nursing council exam papers
 
 // In-memory cache to reduce Firestore reads
 const _cache = {};
@@ -225,6 +228,20 @@ const examBsGet = async (key) => {
 };
 const examBsSet = async (key, val) => _setDocField(_DOC_EXAMS, key, val);
 
+// ── Dedicated large-data helpers (bypass the 1MB shared doc limit) ─────────
+// Daily Mock Pool: stored in its own Firestore document (nv/daily_mock)
+const mockBsGet  = async () => { const d=await _getDoc(_DOC_MOCK);  return d?.pool ?? null; };
+const mockTitleGet = async () => { const d=await _getDoc(_DOC_MOCK); return d?.mockTitle ?? null; };
+const mockBsSet  = async (pool, mockTitle) => _setDocFields(_DOC_MOCK, { pool, mockTitle: mockTitle??null });
+
+// NC Archive: stored in its own Firestore document (nv/nc_archive)
+const archiveBsGet = async () => { const d=await _getDoc(_DOC_ARCHIVE); return d?.entries ?? null; };
+const archiveBsSet = async (entries) => _setDocField(_DOC_ARCHIVE, "entries", entries);
+
+// Nursing Exam Papers: stored in its own Firestore document (nv/nursing_exams)
+const nursingBsGet = async () => { const d=await _getDoc(_DOC_NURSING); return d?.data ?? null; };
+const nursingBsSet = async (data) => _setDocField(_DOC_NURSING, "data", data);
+
 // ── REACTIVE SYNC ─────────────────────────────────────────────────────
 const NV_SYNC_EVENT = "nv-sync";
 const dispatchSync = () => window.dispatchEvent(new CustomEvent(NV_SYNC_EVENT));
@@ -280,10 +297,36 @@ const SK = {
 
 const saveShared = async (key, val) => {
   const [lk, bk] = SK[key];
+  // Large NC datasets get their own Firestore document to avoid the 1MB limit
+  if (key === "dailyMock") {
+    lsSet(lk, val); dispatchSync();
+    const title = ls("nv-daily-mock-title", "");
+    return await mockBsSet(val, title);
+  }
+  if (key === "nursingExams") {
+    lsSet(lk, val); dispatchSync();
+    return await nursingBsSet(val);
+  }
+  if (key === "ncArchive") {
+    lsSet(lk, val); dispatchSync();
+    return await archiveBsSet(val);
+  }
   return await dbSet(lk, bk, val);
 };
 const loadShared = async (key, fallback) => {
   const [lk, bk] = SK[key];
+  if (key === "dailyMock") {
+    try { const v = await mockBsGet(); if(v!==null){ lsSet(lk,v); return v; } } catch {}
+    return ls(lk, fallback);
+  }
+  if (key === "nursingExams") {
+    try { const v = await nursingBsGet(); if(v!==null){ lsSet(lk,v); return v; } } catch {}
+    return ls(lk, fallback);
+  }
+  if (key === "ncArchive") {
+    try { const v = await archiveBsGet(); if(v!==null){ lsSet(lk,v); return v; } } catch {}
+    return ls(lk, fallback);
+  }
   return dbLoad(lk, bk, fallback);
 };
 
@@ -482,10 +525,17 @@ const hydrateFromBackend = async () => {
       schoolPQ:      {},  folders:    {}, schoolExams:  [],
     };
     Object.entries(SK).forEach(([key, [lsKey, bk]]) => {
+      // Skip large NC keys — they are loaded from dedicated docs below
+      if (["dailyMock","nursingExams","ncArchive"].includes(key)) return;
       const remote = doc[bk];
       if (remote !== undefined && remote !== null) lsSet(lsKey, remote);
       else if (!localStorage.getItem(lsKey)) lsSet(lsKey, defaults[key] || []);
     });
+    // Load large NC datasets from their dedicated Firestore documents
+    try { const v = await mockBsGet(); if(v!==null) lsSet("nv-daily-mock", v); } catch {}
+    try { const t = await mockTitleGet(); if(t!==null) lsSet("nv-daily-mock-title", t); } catch {}
+    try { const v = await nursingBsGet(); if(v!==null) lsSet("nv-nursing-exams", v); } catch {}
+    try { const v = await archiveBsGet(); if(v!==null) lsSet("nv-nc-archive", v); } catch {}
     dispatchSync();
     console.log("[Sync] Hydrated from Firestore ✅");
   } catch (e) { console.warn("[Sync] Hydration failed:", e.message); }
@@ -8937,6 +8987,7 @@ function CbtStudentView({ toast, currentUser }) {
 // Admin adds/deletes questions. 20 are selected daily by date-seed from the pool.
 function AdminDailyMockManager({ toast }) {
   const [pool, setPool] = useSharedData("nv-daily-mock", []);
+  const [mockTitle, setMockTitle] = useState(() => ls("nv-daily-mock-title", ""));
   const [mode, setMode] = useState("single"); // "single"|"paste"
   const [form, setForm] = useState({q:"", options:["","","",""], ans:0, cat:"General"});
   const [editIdx, setEditIdx] = useState(null);
@@ -8945,10 +8996,20 @@ function AdminDailyMockManager({ toast }) {
   const [parsedQ, setParsedQ] = useState([]);
   const CATS = ["General","Pharmacology","Physiology","Midwifery","Public Health","Paediatrics","Psychiatric","Critical Care","Anatomy"];
 
-  const save = async (newPool) => {
+  const save = async (newPool, newTitle) => {
+    const title = newTitle !== undefined ? newTitle : mockTitle;
     setPool(newPool);
-    const ok = await saveShared("dailyMock", newPool);
+    lsSet("nv-daily-mock", newPool);
+    lsSet("nv-daily-mock-title", title);
+    dispatchSync();
+    const ok = await mockBsSet(newPool, title);
     if (!ok) toast("⚠️ Saved locally — sync failed","warn");
+  };
+
+  const saveTitle = async () => {
+    lsSet("nv-daily-mock-title", mockTitle);
+    const ok = await mockBsSet(pool, mockTitle);
+    toast(ok ? "✅ Exam title saved!" : "⚠️ Saved locally — sync failed", ok?"success":"warn");
   };
 
   const addSingle = () => {
@@ -8957,7 +9018,7 @@ function AdminDailyMockManager({ toast }) {
     const q = {id:Date.now(), q:form.q.trim(), options:form.options.map(o=>o.trim()), ans:form.ans, cat:form.cat};
     let np;
     if (editIdx!==null) { np=pool.map((p,i)=>i===editIdx?q:p); toast("✏️ Question updated","success"); setEditIdx(null); }
-    else { np=[...pool,q]; toast("➕ Question added to pool","success"); }
+    else { np=[...pool,q]; toast(`➕ Question added to pool (${np.length}/250)`,"success"); }
     save(np);
     setForm({q:"",options:["","","",""],ans:0,cat:"General"});
   };
@@ -8985,9 +9046,10 @@ function AdminDailyMockManager({ toast }) {
 
   const importParsed = () => {
     if (!parsedQ.length) return;
-    save([...pool,...parsedQ]);
+    const newPool = [...pool,...parsedQ];
+    save(newPool);
     setParsedQ([]); setPasteText(""); setPasteAnswers("");
-    toast(`✅ ${parsedQ.length} questions added to pool!`,"success");
+    toast(`✅ ${parsedQ.length} questions added! Pool now has ${newPool.length}/250`,"success");
   };
 
   const deleteOne = (i) => {
@@ -9009,12 +9071,26 @@ function AdminDailyMockManager({ toast }) {
         <div>
           <div style={{fontWeight:800,fontSize:15,color:"#4a7a2e"}}>📅 Daily Mock Question Pool</div>
           <div style={{fontSize:12,color:"var(--text3)",marginTop:2}}>
-            {pool.length} question{pool.length!==1?"s":""} in pool · 20 are selected daily by date
+            {pool.length}/250 question{pool.length!==1?"s":""} in pool · up to 250 are used per mock
           </div>
         </div>
         {pool.length>0&&(
           <button className="btn btn-sm btn-danger" onClick={deleteAll}>🗑️ Delete All</button>
         )}
+      </div>
+
+      {/* Mock Exam Title */}
+      <div className="card2" style={{marginBottom:14,border:"1px solid #4a7a2e30",padding:"12px 16px"}}>
+        <div style={{fontWeight:800,fontSize:13,color:"#4a7a2e",marginBottom:8}}>🏷️ Mock Exam Title</div>
+        <div style={{fontSize:11,color:"var(--text3)",marginBottom:8}}>Give this mock exam a title so students know the type of exam (e.g. "Nursing Council Pre-Exam Mock", "Pharmacology Mock Test", "2025 General Mock").</div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <input className="inp" style={{marginBottom:0,flex:1}} value={mockTitle}
+            onChange={e=>setMockTitle(e.target.value)}
+            placeholder="e.g. Nursing Council Pre-Exam Mock · 2025" />
+          <button className="btn btn-accent" style={{background:"linear-gradient(135deg,#4a7a2e,#6aaa40)",border:"none",whiteSpace:"nowrap"}}
+            onClick={saveTitle}>💾 Save Title</button>
+        </div>
+        {mockTitle&&<div style={{marginTop:6,fontSize:11,color:"#4a7a2e",fontWeight:700}}>✓ Current title: "{mockTitle}"</div>}
       </div>
 
       {/* Mode tabs */}
@@ -9116,8 +9192,9 @@ function AdminDailyMockManager({ toast }) {
 
       {/* Pool list */}
       <div style={{fontWeight:800,fontSize:13,marginBottom:10,color:"var(--text)"}}>
-        📋 Question Pool ({pool.length})
+        📋 Question Pool ({pool.length}/250)
         {pool.length<20&&pool.length>0&&<span style={{fontSize:11,color:"var(--warn)",fontWeight:500,marginLeft:8}}>⚠️ Add at least 20 for daily rotation</span>}
+        {pool.length>=250&&<span style={{fontSize:11,color:"var(--danger)",fontWeight:500,marginLeft:8}}>⚠️ Pool is at maximum capacity (250)</span>}
       </div>
       {pool.length===0&&(
         <div style={{textAlign:"center",padding:24,color:"var(--text3)",border:"1px dashed var(--border)",borderRadius:10,fontSize:13}}>
@@ -9365,6 +9442,7 @@ function getDailyMockQuestions(pool) {
 function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
   const isUnlockedFull = isAdmin || useNcAccess(currentUser);
   const [pool] = useSharedData("nv-daily-mock", []);
+  const [mockTitle] = useState(() => ls("nv-daily-mock-title", ""));
   const [archive, setArchive] = useSharedData("nv-nc-archive", []);
   const [phase, setPhase] = useState("intro");
   const [answers, setAnswers] = useState([]);
@@ -9424,7 +9502,7 @@ function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
       <div style={{maxWidth:500,margin:"0 auto"}}>
         <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
           <button className="nc-btn" onClick={onBack}>← Back</button>
-          <div style={{fontWeight:800,fontSize:16,color:"#2d4a1e"}}>📅 Daily Mock Exam</div>
+          <div style={{fontWeight:800,fontSize:16,color:"#2d4a1e"}}>📅 {mockTitle || "Daily Mock Exam"}</div>
         </div>
         <NcPaywall currentUser={currentUser} onUnlocked={()=>setUnlocked(true)} toast={toast} preview={preview} isMock />
       </div>
@@ -9435,8 +9513,11 @@ function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
     <div style={{maxWidth:600,margin:"0 auto"}}>
       <div className="nc-card" style={{textAlign:"center",padding:"32px 28px"}}>
         <div style={{fontSize:52,marginBottom:10}}>📅</div>
-        <div style={{fontWeight:800,fontSize:22,color:"#2d4a1e",marginBottom:4}}>Daily Mock Exam</div>
-        <div style={{fontSize:13,color:"#6b8a52",marginBottom:20}}>{today} · {questions.length} Questions · Mixed Specialties</div>
+        <div style={{fontWeight:800,fontSize:22,color:"#2d4a1e",marginBottom:4}}>
+          {mockTitle || "Daily Mock Exam"}
+        </div>
+        <div style={{fontSize:13,color:"#6b8a52",marginBottom:4}}>{today}</div>
+        <div style={{fontSize:12,color:"#6b8a52",marginBottom:20}}>{questions.length} Questions · Mixed Specialties</div>
         {!isUnlockedFull && (
           <div style={{padding:"8px 14px",borderRadius:9,marginBottom:16,background:"rgba(251,146,60,.1)",border:"1px solid rgba(251,146,60,.3)",fontSize:12,color:"#c05621",fontWeight:700,textAlign:"center"}}>
             ⚠️ Free preview: first {NC_MOCK_FREE_LIMIT} questions — enter a production code to unlock all {questions.length}
@@ -9470,7 +9551,8 @@ function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
       <div style={{maxWidth:640,margin:"0 auto"}}>
         <div className="nc-card" style={{textAlign:"center",marginBottom:20}}>
           <div style={{fontSize:48,marginBottom:6}}>{pct>=80?"🎉":pct>=60?"👍":"📚"}</div>
-          <div style={{fontWeight:800,fontSize:20,color:"#2d4a1e",marginBottom:4}}>Daily Mock Complete!</div>
+          <div style={{fontWeight:800,fontSize:20,color:"#2d4a1e",marginBottom:2}}>{mockTitle || "Daily Mock"} — Complete!</div>
+          <div style={{fontSize:12,color:"#6b8a52",marginBottom:8}}>{today}</div>
           <div style={{fontWeight:800,fontSize:52,color:pct>=70?"#4a7a2e":pct>=50?"#c05621":"#991b1b",lineHeight:1}}>{score}/{questions.length}</div>
           <div style={{fontSize:16,color:"#6b8a52",marginBottom:10}}>{pct}% — {pct>=80?"Excellent":pct>=60?"Good Pass":pct>=40?"Borderline":"Needs Improvement"}</div>
           <div className="nc-progress-wrap" style={{maxWidth:300,margin:"0 auto 16px"}}>
@@ -9518,7 +9600,7 @@ function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
       <div className="nc-card" style={{marginBottom:14}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,flexWrap:"wrap"}}>
           <div>
-            <div style={{fontWeight:800,fontSize:15,color:"#2d4a1e"}}>📅 Daily Mock — {today}</div>
+            <div style={{fontWeight:800,fontSize:15,color:"#2d4a1e"}}>📅 {mockTitle || "Daily Mock"} — {today}</div>
             <div style={{fontSize:11,color:"#6b8a52"}}>{answeredCount}/{questions.length} answered</div>
           </div>
           <button className="nc-btn nc-btn-primary" onClick={()=>{if(confirm("Submit exam now?"))submit();}}>Submit ✓</button>
@@ -9589,6 +9671,9 @@ function NcDashboard({ currentUser, onNavigate }) {
   const results = ls("nv-results",[]).filter(r=>r.type&&r.type.includes("NC"));
   const mockDone = results.some(r=>r.subject?.includes(new Date().toLocaleDateString()));
   const isUnlocked = useNcAccess(currentUser);
+  const mockTitle = ls("nv-daily-mock-title", "");
+  const pool = ls("nv-daily-mock", []);
+  const mockQCount = Math.min(250, pool.length);
   return (
     <div>
       <div style={{marginBottom:16}}>
@@ -9621,10 +9706,10 @@ function NcDashboard({ currentUser, onNavigate }) {
         <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
           <div style={{width:52,height:52,borderRadius:12,background:"linear-gradient(135deg,#4a7a2e,#7bc950)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:26}}>📅</div>
           <div style={{flex:1}}>
-            <div style={{fontWeight:800,fontSize:16,color:"#2d4a1e",marginBottom:2}}>Today's Daily Mock Exam</div>
-            <div style={{fontSize:12,color:"#6b8a52"}}>20 mixed questions · Updates every day · {mockDone?"Completed ✅":"Not taken yet"}</div>
+            <div style={{fontWeight:800,fontSize:16,color:"#2d4a1e",marginBottom:2}}>{mockTitle || "Daily Mock Exam"}</div>
+            <div style={{fontSize:12,color:"#6b8a52"}}>{mockQCount > 0 ? `${mockQCount} questions` : "No questions yet"} · Updates daily · {mockDone?"Completed ✅":"Not taken yet"}</div>
           </div>
-          {!mockDone&&<button className="nc-btn nc-btn-primary" style={{fontSize:13}} onClick={()=>onNavigate("daily")}>Start Now →</button>}
+          {!mockDone&&pool.length>0&&<button className="nc-btn nc-btn-primary" style={{fontSize:13}} onClick={()=>onNavigate("daily")}>Start Now →</button>}
           {mockDone&&<span style={{fontSize:12,fontWeight:700,color:"#4a7a2e"}}>✅ Done for today!</span>}
         </div>
       </div>
