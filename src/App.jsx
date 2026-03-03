@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 
 // ─── EMAILJS CONFIG ──────────────────────────────────────────────────
 // EmailJS free tier: 200 emails/month — sign up at https://www.emailjs.com
@@ -8033,6 +8033,7 @@ function Messages({ user, toast, onUnreadChange }) {
   const myClass = allClasses.find(c => c.id === myClassId);
 
   return (
+    <React.Fragment>
     <div style={{ display:"flex", flexDirection:"column", height:"calc(100vh - 110px)", minHeight:500 }}>
 
       {/* ── Header bar ── */}
@@ -8267,6 +8268,7 @@ function Messages({ user, toast, onUnreadChange }) {
         onEnd={() => setCallModal(null)}
       />
     )}
+    </React.Fragment>
   );
 }
 
