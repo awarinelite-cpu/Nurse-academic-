@@ -401,6 +401,49 @@ const dmSubscribeInbox = (me, onConvs) => {
     .onSnapshot(snap => onConvs(snap.docs.map(d => ({id:d.id,...d.data()}))), ()=>{});
 };
 
+// ── VOICE CALL SIGNALING (WebRTC via Firestore) ───────────────────────
+//  call doc: "voice_calls/{callId}"
+//  Fields: caller, callee, status (ringing|active|ended|rejected),
+//          offer, answer, callerCandidates[], calleeCandidates[]
+
+const _callId = (a, b) => [a, b].map(_safeKey).sort().join("__");
+
+const callSignal = async (caller, callee, data) => {
+  if (!_db) return false;
+  try {
+    const cid = _callId(caller, callee);
+    await _db.collection("voice_calls").doc(cid).set({ caller, callee, ...data, updatedAt: Date.now() });
+    return true;
+  } catch(e) { console.error("[Call] signal failed:", e.message); return false; }
+};
+
+const callAddCandidate = async (caller, callee, role, candidate) => {
+  if (!_db) return;
+  try {
+    const cid = _callId(caller, callee);
+    const field = role === "caller" ? "callerCandidates" : "calleeCandidates";
+    const snap = await _db.collection("voice_calls").doc(cid).get();
+    const existing = snap.exists ? (snap.data()[field] || []) : [];
+    await _db.collection("voice_calls").doc(cid).update({ [field]: [...existing, candidate] });
+  } catch(e) { console.warn("[Call] addCandidate failed:", e.message); }
+};
+
+const callSubscribe = (caller, callee, onChange) => {
+  if (!_db) return () => {};
+  const cid = _callId(caller, callee);
+  return _db.collection("voice_calls").doc(cid).onSnapshot(snap => {
+    if (snap.exists) onChange({ id: snap.id, ...snap.data() });
+  }, () => {});
+};
+
+const callEnd = async (caller, callee) => {
+  if (!_db) return;
+  try {
+    const cid = _callId(caller, callee);
+    await _db.collection("voice_calls").doc(cid).set({ caller, callee, status: "ended", updatedAt: Date.now() });
+  } catch(e) {}
+};
+
 // ── REACTIVE SYNC ─────────────────────────────────────────────────────
 const NV_SYNC_EVENT = "nv-sync";
 const dispatchSync = () => window.dispatchEvent(new CustomEvent(NV_SYNC_EVENT));
@@ -7435,6 +7478,245 @@ function MedCalc() {
   return<div><div className="sec-title">🧮 Med Calculator</div><div className="sec-sub">Drug dosage & BMI</div><div className="grid2"><div className="card"><div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,marginBottom:12}}>💊 Dose Calculator</div><label className="lbl">Dose (mg/kg)</label><input className="inp" type="number" placeholder="10" value={dose} onChange={e=>setDose(e.target.value)} /><label className="lbl">Weight (kg)</label><input className="inp" type="number" placeholder="70" value={weight} onChange={e=>setWeight(e.target.value)} />{result&&<div className="card2" style={{textAlign:"center",marginBottom:12}}><div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>REQUIRED DOSE</div><div style={{fontFamily:"'Syne',sans-serif",fontSize:26,fontWeight:800,color:"var(--accent)"}}>{result} mg</div></div>}<label className="lbl">Drug Available (mg)</label><input className="inp" type="number" value={avail} onChange={e=>setAvail(e.target.value)} /><label className="lbl">Available Volume (mL)</label><input className="inp" type="number" value={vol} onChange={e=>setVol(e.target.value)} />{volume&&<div className="card2" style={{textAlign:"center"}}><div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>GIVE</div><div style={{fontFamily:"'Syne',sans-serif",fontSize:26,fontWeight:800,color:"var(--accent2)"}}>{volume} mL</div></div>}</div><div className="card"><div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,marginBottom:12}}>⚖️ BMI</div><label className="lbl">Height (cm)</label><input className="inp" type="number" value={bmi.h} onChange={e=>setBmi({...bmi,h:e.target.value})} /><label className="lbl">Weight (kg)</label><input className="inp" type="number" value={bmi.w} onChange={e=>setBmi({...bmi,w:e.target.value})} />{bmiVal&&<div className="card2" style={{textAlign:"center"}}><div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>BMI</div><div style={{fontFamily:"'Syne',sans-serif",fontSize:48,fontWeight:800,color:"var(--accent)"}}>{bmiVal}</div><div style={{color:+bmiVal<18.5?"var(--warn)":+bmiVal<25?"var(--success)":+bmiVal<30?"var(--warn)":"var(--danger)",fontWeight:600}}>{bmiCls}</div></div>}</div></div></div>;
 }
 
+// ── VoiceCallModal ─────────────────────────────────────────────────────
+function VoiceCallModal({ user, peer, role, onEnd, toast }) {
+  const [status, setStatus]   = useState(role === "caller" ? "calling" : "incoming"); // calling|incoming|active|ended
+  const [duration, setDuration] = useState(0);
+  const [muted, setMuted]     = useState(false);
+  const [speakerOn, setSpeakerOn] = useState(true);
+  const pcRef        = useRef(null);
+  const localStream  = useRef(null);
+  const remoteAudio  = useRef(null);
+  const timerRef     = useRef(null);
+  const unsubRef     = useRef(null);
+
+  const allUsers = ls("nv-users", []);
+  const peerName = allUsers.find(u => u.username === peer)?.displayName || peer.split("@")[0];
+  const peerAvatar = (peerName[0] || "?").toUpperCase();
+
+  const cleanup = useCallback(() => {
+    clearInterval(timerRef.current);
+    if (pcRef.current) { try { pcRef.current.close(); } catch(e){} pcRef.current = null; }
+    if (localStream.current) { localStream.current.getTracks().forEach(t => t.stop()); localStream.current = null; }
+    if (unsubRef.current) { unsubRef.current(); unsubRef.current = null; }
+  }, []);
+
+  const hangUp = useCallback(async () => {
+    cleanup();
+    await callEnd(user, peer);
+    setStatus("ended");
+    setTimeout(() => onEnd(), 1200);
+  }, [user, peer, cleanup, onEnd]);
+
+  // Set up WebRTC
+  const setupPC = useCallback(async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    localStream.current = stream;
+
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+      ]
+    });
+    pcRef.current = pc;
+
+    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+    pc.ontrack = (e) => {
+      if (remoteAudio.current) {
+        remoteAudio.current.srcObject = e.streams[0];
+        remoteAudio.current.play().catch(() => {});
+      }
+    };
+
+    pc.onicecandidate = async (e) => {
+      if (e.candidate) {
+        const r = role === "caller" ? "caller" : "callee";
+        await callAddCandidate(user, peer, r, e.candidate.toJSON());
+      }
+    };
+
+    return pc;
+  }, [user, peer, role]);
+
+  // Caller flow: create offer
+  const startCall = useCallback(async () => {
+    try {
+      const pc = await setupPC();
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await callSignal(user, peer, { status: "ringing", offer: { type: offer.type, sdp: offer.sdp } });
+
+      // Listen for answer
+      unsubRef.current = callSubscribe(user, peer, async (doc) => {
+        if (doc.status === "rejected" || doc.status === "ended") {
+          cleanup(); setStatus("ended"); setTimeout(() => onEnd(), 1200); return;
+        }
+        if (doc.answer && pc.remoteDescription === null) {
+          await pc.setRemoteDescription(new RTCSessionDescription(doc.answer));
+          setStatus("active");
+          timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
+        }
+        if (doc.calleeCandidates) {
+          for (const c of doc.calleeCandidates) {
+            try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
+          }
+        }
+      });
+    } catch(e) { toast("Microphone access denied", "error"); hangUp(); }
+  }, [setupPC, user, peer, cleanup, onEnd, hangUp, toast]);
+
+  // Callee flow: answer
+  const answerCall = useCallback(async (offerData) => {
+    try {
+      const pc = await setupPC();
+      await pc.setRemoteDescription(new RTCSessionDescription(offerData));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await callSignal(user, peer, { status: "active", answer: { type: answer.type, sdp: answer.sdp } });
+      setStatus("active");
+      timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
+
+      // Listen for end + caller ICE candidates
+      unsubRef.current = callSubscribe(user, peer, async (doc) => {
+        if (doc.status === "ended") { cleanup(); setStatus("ended"); setTimeout(() => onEnd(), 1200); return; }
+        if (doc.callerCandidates) {
+          for (const c of doc.callerCandidates) {
+            try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
+          }
+        }
+      });
+    } catch(e) { toast("Microphone access denied", "error"); hangUp(); }
+  }, [setupPC, user, peer, cleanup, onEnd, hangUp, toast]);
+
+  const rejectCall = useCallback(async () => {
+    await callSignal(user, peer, { status: "rejected" });
+    cleanup(); onEnd();
+  }, [user, peer, cleanup, onEnd]);
+
+  // Init on mount
+  useEffect(() => {
+    if (role === "caller") {
+      startCall();
+    } else {
+      // Fetch offer from Firestore immediately
+      if (_db) {
+        const cid = _callId(user, peer);
+        _db.collection("voice_calls").doc(cid).get().then(snap => {
+          if (snap.exists && snap.data().offer) {
+            // Store offer for answerCall
+            pcRef._offer = snap.data().offer;
+          }
+        });
+      }
+    }
+    return () => cleanup();
+  }, []);
+
+  const toggleMute = () => {
+    if (localStream.current) {
+      localStream.current.getAudioTracks().forEach(t => { t.enabled = !t.enabled; });
+      setMuted(m => !m);
+    }
+  };
+
+  const fmtDur = (s) => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+
+  const statusColors = { calling:"#f59e0b", incoming:"#3b82f6", active:"#22c55e", ended:"#6b7280" };
+  const statusLabel  = { calling:"Calling…", incoming:"Incoming Call", active:fmtDur(duration), ended:"Call Ended" };
+
+  return (
+    <div style={{ position:"fixed", inset:0, zIndex:9999, display:"flex", alignItems:"center", justifyContent:"center", background:"rgba(0,0,0,.65)", backdropFilter:"blur(8px)" }}>
+      <audio ref={remoteAudio} autoPlay playsInline style={{ display:"none" }} />
+      <div style={{ background:"var(--card)", borderRadius:24, padding:"36px 32px", minWidth:300, maxWidth:360, width:"90vw", textAlign:"center", boxShadow:"0 24px 64px rgba(0,0,0,.4)", border:"1.5px solid var(--border)", position:"relative" }}>
+
+        {/* Pulse ring for ringing/calling */}
+        {(status === "calling" || status === "incoming") && (
+          <div style={{ position:"absolute", inset:0, borderRadius:24, border:`2px solid ${statusColors[status]}`, animation:"callPulse 1.4s ease-out infinite", opacity:0.5, pointerEvents:"none" }} />
+        )}
+
+        {/* Avatar */}
+        <div style={{ width:80, height:80, borderRadius:"50%", background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:32, fontWeight:800, color:"white", margin:"0 auto 16px", boxShadow:`0 0 0 4px ${statusColors[status]}40` }}>
+          {peerAvatar}
+        </div>
+
+        <div style={{ fontWeight:800, fontSize:20, color:"var(--text)", marginBottom:6 }}>{peerName}</div>
+        <div style={{ fontSize:13, fontWeight:700, color: statusColors[status], marginBottom:28, fontFamily:"'DM Mono',monospace" }}>
+          {statusLabel[status]}
+        </div>
+
+        {/* Buttons */}
+        {status === "incoming" ? (
+          <div style={{ display:"flex", justifyContent:"center", gap:28 }}>
+            {/* Reject */}
+            <div style={{ textAlign:"center" }}>
+              <button onClick={rejectCall} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 8px", boxShadow:"0 4px 16px rgba(239,68,68,.4)", transition:"transform .15s" }}
+                onMouseEnter={e=>e.currentTarget.style.transform="scale(1.08)"} onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
+                📵
+              </button>
+              <div style={{ fontSize:11, color:"var(--text3)", fontWeight:700 }}>Decline</div>
+            </div>
+            {/* Answer */}
+            <div style={{ textAlign:"center" }}>
+              <button onClick={() => {
+                if (_db) {
+                  const cid = _callId(user, peer);
+                  _db.collection("voice_calls").doc(cid).get().then(snap => {
+                    if (snap.exists) answerCall(snap.data().offer);
+                  });
+                }
+              }} style={{ width:60, height:60, borderRadius:"50%", background:"#22c55e", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 8px", boxShadow:"0 4px 16px rgba(34,197,94,.4)", transition:"transform .15s" }}
+                onMouseEnter={e=>e.currentTarget.style.transform="scale(1.08)"} onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
+                📞
+              </button>
+              <div style={{ fontSize:11, color:"var(--text3)", fontWeight:700 }}>Answer</div>
+            </div>
+          </div>
+        ) : status === "active" ? (
+          <div style={{ display:"flex", justifyContent:"center", gap:20 }}>
+            {/* Mute */}
+            <div style={{ textAlign:"center" }}>
+              <button onClick={toggleMute} style={{ width:50, height:50, borderRadius:"50%", background: muted ? "var(--danger)" : "var(--bg4)", border:"1.5px solid var(--border)", cursor:"pointer", fontSize:20, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", transition:"all .15s" }}>
+                {muted ? "🔇" : "🎙️"}
+              </button>
+              <div style={{ fontSize:10, color:"var(--text3)", fontWeight:700 }}>{muted ? "Unmute" : "Mute"}</div>
+            </div>
+            {/* End */}
+            <div style={{ textAlign:"center" }}>
+              <button onClick={hangUp} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", boxShadow:"0 4px 16px rgba(239,68,68,.4)", transition:"transform .15s" }}
+                onMouseEnter={e=>e.currentTarget.style.transform="scale(1.08)"} onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
+                📵
+              </button>
+              <div style={{ fontSize:10, color:"var(--text3)", fontWeight:700 }}>End Call</div>
+            </div>
+            {/* Speaker */}
+            <div style={{ textAlign:"center" }}>
+              <button onClick={() => setSpeakerOn(s => !s)} style={{ width:50, height:50, borderRadius:"50%", background: speakerOn ? "var(--bg4)" : "var(--bg3)", border:"1.5px solid var(--border)", cursor:"pointer", fontSize:20, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", transition:"all .15s" }}>
+                {speakerOn ? "🔊" : "🔕"}
+              </button>
+              <div style={{ fontSize:10, color:"var(--text3)", fontWeight:700 }}>{speakerOn ? "Speaker" : "Quiet"}</div>
+            </div>
+          </div>
+        ) : status === "calling" ? (
+          <button onClick={hangUp} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto", boxShadow:"0 4px 16px rgba(239,68,68,.4)" }}>
+            📵
+          </button>
+        ) : (
+          <div style={{ color:"var(--text3)", fontSize:13 }}>Call ended</div>
+        )}
+      </div>
+      <style>{`
+        @keyframes callPulse {
+          0%  { transform:scale(1);   opacity:.5; }
+          70% { transform:scale(1.08);opacity:0;  }
+          100%{ transform:scale(1.08);opacity:0;  }
+        }
+      `}</style>
+    </div>
+  );
+}
+
 function Messages({ user, toast, onUnreadChange }) {
   const allUsers  = ls("nv-users", []);
   const allClasses = ls("nv-classes", []);
@@ -7461,6 +7743,9 @@ function Messages({ user, toast, onUnreadChange }) {
   const [notifPerm,   setNotifPerm]   = useState(() =>
     typeof Notification !== "undefined" ? Notification.permission : "default"
   );
+  // Voice call state
+  const [callModal,   setCallModal]   = useState(null); // null | { peer, role: "caller"|"callee" }
+  const callUnsubRef  = useRef(null);
   // Voice note recording
   const [recording,   setRecording]   = useState(false);
   const [recSeconds,  setRecSeconds]  = useState(0);
@@ -7527,6 +7812,32 @@ function Messages({ user, toast, onUnreadChange }) {
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
   useEffect(() => { if (activeUser) setTimeout(() => inputRef.current?.focus(), 100); }, [activeUser]);
+
+  // ── Listen for incoming calls ─────────────────────────────────────
+  useEffect(() => {
+    if (!user || !_db) return;
+    // Subscribe to any voice_call doc where user is callee
+    const unsub = _db.collection("voice_calls")
+      .where("callee", "==", user)
+      .where("status", "==", "ringing")
+      .onSnapshot(snap => {
+        snap.docChanges().forEach(change => {
+          if (change.type === "added" || change.type === "modified") {
+            const d = change.doc.data();
+            if (d.status === "ringing" && !callModal) {
+              setCallModal({ peer: d.caller, role: "callee" });
+            }
+          }
+        });
+      }, () => {});
+    callUnsubRef.current = unsub;
+    return () => { unsub(); };
+  }, [user, callModal]);
+
+  const startVoiceCall = () => {
+    if (!activeUser) return;
+    setCallModal({ peer: activeUser, role: "caller" });
+  };
 
   // ── Send text ─────────────────────────────────────────────────────
   const sendText = async () => {
@@ -7821,6 +8132,17 @@ function Messages({ user, toast, onUnreadChange }) {
           {activeUser && (
             <button className="btn btn-sm" style={{ flexShrink:0 }} onClick={() => { setActiveUser(null); setMsgs([]); }}>✕</button>
           )}
+          {/* Voice call button */}
+          {activeUser && (
+            <button
+              className="btn btn-sm"
+              style={{ flexShrink:0, width:36, height:36, borderRadius:"50%", padding:0, display:"flex", alignItems:"center", justifyContent:"center", fontSize:17, background:"linear-gradient(135deg,#22c55e,#16a34a)", border:"none", color:"white", boxShadow:"0 2px 8px rgba(34,197,94,.35)", cursor:"pointer", transition:"transform .15s" }}
+              title={`Call ${displayName(activeUser)}`}
+              onClick={startVoiceCall}
+              onMouseEnter={e=>e.currentTarget.style.transform="scale(1.08)"}
+              onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}
+            >📞</button>
+          )}
         </div>
 
         {/* ── CHAT AREA (full width) ── */}
@@ -7930,6 +8252,16 @@ function Messages({ user, toast, onUnreadChange }) {
         )}
       </div>
     </div>
+    {/* ── Voice Call Modal ── */}
+    {callModal && (
+      <VoiceCallModal
+        user={user}
+        peer={callModal.peer}
+        role={callModal.role}
+        toast={toast}
+        onEnd={() => setCallModal(null)}
+      />
+    )}
   );
 }
 
