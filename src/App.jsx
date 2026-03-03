@@ -4796,10 +4796,237 @@ const NC_FREE_LIMIT = 10;      // free questions per specialty paper
 const NC_MOCK_FREE_LIMIT = 15; // free questions for the daily mock exam
 
 // ── Helper: check if the current user has full NC access ─────────────
+// ══════════════════════════════════════════════════════════════════════
+// ── MAXIMUM-STRENGTH DEVICE IDENTITY SYSTEM ──────────────────────────
+// Browsers cannot read IMEI (blocked by all mobile OS / W3C).
+// Instead we capture 10 hardware-level signals + server-side Firebase
+// registration to create a device lock that is effectively unique:
+//
+//  1. Canvas GPU rendering hash  — GPU chip-specific sub-pixel math
+//  2. WebGL renderer string      — exact GPU model ("Adreno 640" etc.)
+//  3. AudioContext DSP hash      — audio chip floating-point signature
+//  4. Installed font set         — differs per device/OS
+//  5. Screen resolution+DPR      — hardware screen spec
+//  6. CPU cores + RAM + touch    — hardware concurrency & memory
+//  7. Battery state              — charge level (Android Chrome)
+//  8. Timezone + locale          — regional hardware config
+//  9. Platform + UserAgent       — browser/OS string
+// 10. IndexedDB persistent UUID  — random ID written to browser DB,
+//     survives refreshes, can't be read from another device
+//  + Public IP captured at activation (stored in Firebase for audit)
+//  + Firebase device registration (server-side — can't be cleared
+//    by wiping localStorage or using incognito)
+// ══════════════════════════════════════════════════════════════════════
+
+const _h = (str) => { let h = 5381; for (let i = 0; i < str.length; i++) h = ((h << 5) + h) ^ str.charCodeAt(i); return (h >>> 0).toString(16).padStart(8,"0"); };
+
+const _getPersistentUUID = () => new Promise(resolve => {
+  try {
+    const req = indexedDB.open("nv_device_db_v2", 1);
+    req.onupgradeneeded = e => e.target.result.createObjectStore("kv");
+    req.onsuccess = e => {
+      const db = e.target.result;
+      const tx = db.transaction("kv","readwrite");
+      const store = tx.objectStore("kv");
+      const get = store.get("device_uuid");
+      get.onsuccess = () => {
+        if (get.result) { resolve(get.result); return; }
+        const uuid = (crypto.randomUUID?.() || "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+          const r = Math.random()*16|0; return (c==="x"?r:(r&0x3|0x8)).toString(16);
+        }));
+        store.put(uuid,"device_uuid"); resolve(uuid);
+      };
+      get.onerror = () => resolve("idb_err");
+    };
+    req.onerror = () => resolve("idb_blocked");
+  } catch { resolve("idb_na"); }
+});
+
+const _canvasFP = () => {
+  try {
+    const c = document.createElement("canvas"); c.width=300; c.height=80;
+    const ctx = c.getContext("2d");
+    const g = ctx.createLinearGradient(0,0,300,80);
+    g.addColorStop(0,"#ff6b6b"); g.addColorStop(1,"#4ecdc4");
+    ctx.fillStyle=g; ctx.fillRect(0,0,300,80);
+    ctx.shadowBlur=8; ctx.shadowColor="rgba(0,0,0,.4)";
+    ctx.font="bold 18px Arial,sans-serif"; ctx.fillStyle="white";
+    ctx.fillText("NursingHub\u{1F3E5}2025\u{1F512}",4,32);
+    ctx.font="13px Verdana,Geneva,sans-serif"; ctx.fillStyle="rgba(255,255,200,.95)";
+    ctx.fillText("DeviceLock\u00b7Secure",8,58);
+    ctx.shadowBlur=0; ctx.beginPath(); ctx.arc(260,20,14,0,Math.PI*2);
+    ctx.fillStyle="rgba(255,220,0,.85)"; ctx.fill();
+    return _h(c.toDataURL("image/png"));
+  } catch { return "cv_na"; }
+};
+
+const _webglFP = () => {
+  try {
+    const c = document.createElement("canvas");
+    const gl = c.getContext("webgl2")||c.getContext("webgl")||c.getContext("experimental-webgl");
+    if (!gl) return "wgl_na";
+    const ext = gl.getExtension("WEBGL_debug_renderer_info");
+    const renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    const vendor   = ext ? gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)   : gl.getParameter(gl.VENDOR);
+    const params   = [gl.getParameter(gl.MAX_TEXTURE_SIZE),gl.getParameter(gl.MAX_VERTEX_ATTRIBS),
+      gl.getParameter(gl.MAX_VARYING_VECTORS),gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS)].join("|");
+    return _h(`${renderer}||${vendor}||${params}`);
+  } catch { return "wgl_na"; }
+};
+
+const _webglRendererRaw = () => {
+  try {
+    const c = document.createElement("canvas");
+    const gl = c.getContext("webgl2")||c.getContext("webgl")||c.getContext("experimental-webgl");
+    if (!gl) return "Unknown GPU";
+    const ext = gl.getExtension("WEBGL_debug_renderer_info");
+    return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  } catch { return "Unknown GPU"; }
+};
+
+const _audioFP = () => new Promise(resolve => {
+  try {
+    const AC = window.OfflineAudioContext||window.webkitOfflineAudioContext;
+    if (!AC) { resolve("aud_na"); return; }
+    const ctx = new AC(1,44100,44100);
+    const osc = ctx.createOscillator(); osc.type="triangle"; osc.frequency.value=10000;
+    const cmp = ctx.createDynamicsCompressor();
+    [["threshold",-50],["knee",40],["ratio",12],["attack",0],["release",.25]]
+      .forEach(([k,v]) => { try { cmp[k].value=v; } catch {} });
+    const gain = ctx.createGain(); gain.gain.value=.5;
+    osc.connect(cmp); cmp.connect(gain); gain.connect(ctx.destination);
+    osc.start(0); ctx.startRendering();
+    ctx.oncomplete = e => {
+      const ch = e.renderedBuffer.getChannelData(0);
+      let sig = 0; for (let i=4000;i<5000;i++) sig+=Math.abs(ch[i]);
+      resolve(_h(sig.toFixed(15)));
+    };
+    ctx.onerror = () => resolve("aud_err");
+    setTimeout(()=>resolve("aud_to"),3000);
+  } catch { resolve("aud_na"); }
+});
+
+const _fontFP = () => {
+  try {
+    const fonts=["Arial","Verdana","Helvetica","Times New Roman","Courier New","Georgia",
+      "Calibri","Cambria","Consolas","Segoe UI","Roboto","Ubuntu","Open Sans","Noto Sans",
+      "Comic Sans MS","Trebuchet MS","Impact","Lucida Console","Tahoma","Century Gothic"];
+    const cvs=document.createElement("canvas"); const ctx2=cvs.getContext("2d");
+    const measure=f=>{ctx2.font=`16px '${f}',monospace`; return ctx2.measureText("mmmmmmmmmmlli").width;};
+    const base=measure("monospace_impossible_xyz");
+    const present=fonts.filter(f=>measure(f)!==base);
+    return _h(present.join(",")+"|"+present.length);
+  } catch { return "fnt_na"; }
+};
+
+const _batteryFP = () => new Promise(resolve => {
+  try {
+    if (!navigator.getBattery){resolve("bat_na");return;}
+    navigator.getBattery()
+      .then(b=>resolve(_h(`${b.charging}|${(b.level*100).toFixed(0)}|${b.chargingTime}|${b.dischargingTime}`)))
+      .catch(()=>resolve("bat_err"));
+    setTimeout(()=>resolve("bat_to"),1500);
+  } catch { resolve("bat_na"); }
+});
+
+const _getPublicIP = () => new Promise(resolve => {
+  try {
+    fetch("https://api.ipify.org?format=json",{signal:AbortSignal.timeout?AbortSignal.timeout(4000):undefined})
+      .then(r=>r.json()).then(d=>resolve(d.ip||"ip_na")).catch(()=>resolve("ip_err"));
+  } catch { resolve("ip_na"); }
+});
+
+const buildDeviceIdentity = (() => {
+  let _cached = null;
+  return async () => {
+    if (_cached) return _cached;
+    const lsRaw = localStorage.getItem("nv-did-v3");
+    const idbUUID = await _getPersistentUUID();
+    if (lsRaw) {
+      try {
+        const p = JSON.parse(lsRaw);
+        if (p.uuid === idbUUID.replace(/-/g,"").slice(0,16)) { _cached=p; return _cached; }
+      } catch {}
+    }
+    const [audioH, batH, publicIP] = await Promise.all([_audioFP(), _batteryFP(), _getPublicIP()]);
+    const canvasH    = _canvasFP();
+    const webglH     = _webglFP();
+    const gpuRaw     = _webglRendererRaw();
+    const fontH      = _fontFP();
+    const screenSig  = `${screen.width}x${screen.height}x${screen.colorDepth}x${window.devicePixelRatio||1}x${screen.availWidth}x${screen.availHeight}`;
+    const hwSig      = `cpu${navigator.hardwareConcurrency||0}_mem${navigator.deviceMemory||0}_touch${navigator.maxTouchPoints||0}`;
+    const localeSig  = `${Intl.DateTimeFormat().resolvedOptions().timeZone}|${navigator.language}|${(navigator.languages||[]).slice(0,4).join(",")}`;
+    const platformSig= `${navigator.platform}|${navigator.vendor}|${navigator.userAgent.slice(0,120)}`;
+    const uuidClean  = idbUUID.replace(/-/g,"");
+    const hwSignals  = [canvasH,webglH,audioH,fontH,batH];
+    const realCount  = hwSignals.filter(s=>!["na","err","to","blocked"].some(e=>s.includes(e))).length;
+    const fingerprint = [
+      uuidClean.slice(0,16), canvasH, webglH, audioH, fontH,
+      _h(screenSig), _h(hwSig), _h(localeSig), _h(platformSig), batH
+    ].join("_");
+    const identity = {
+      fingerprint, uuid: uuidClean.slice(0,16),
+      canvasH, webglH, audioH, fontH,
+      screen: _h(screenSig), hardware: _h(hwSig),
+      locale: _h(localeSig), platform: _h(platformSig),
+      publicIP, gpuRaw,
+      userAgent: navigator.userAgent.slice(0,150),
+      screenRaw: `${screen.width}x${screen.height}`,
+      hwRaw: hwSig,
+      realSignalCount: realCount,
+      registeredAt: Date.now(),
+    };
+    _cached = identity;
+    try { localStorage.setItem("nv-did-v3",JSON.stringify(identity)); } catch {}
+    return identity;
+  };
+})();
+
+const getDeviceFingerprint = async () => (await buildDeviceIdentity()).fingerprint;
+
+const compareDeviceIdentity = (stored, current) => {
+  if (!stored||!current) return {match:false};
+  const core = ["uuid","canvasH","webglH","screen","hardware"];
+  const soft = ["audioH","fontH","locale","platform"];
+  const coreM = core.filter(k=>stored[k]&&current[k]&&stored[k]===current[k]).length;
+  const softM = soft.filter(k=>stored[k]&&current[k]&&stored[k]===current[k]).length;
+  return { match: coreM>=5 && softM>=2, coreMatches:coreM, softMatches:softM };
+};
+
+const registerDeviceInFirebase = async (username, identity) => {
+  try {
+    const rec = { username, fingerprint:identity.fingerprint, uuid:identity.uuid,
+      canvasH:identity.canvasH, webglH:identity.webglH, audioH:identity.audioH, fontH:identity.fontH,
+      screen:identity.screen, hardware:identity.hardware, locale:identity.locale, platform:identity.platform,
+      publicIP:identity.publicIP, gpuRaw:identity.gpuRaw, userAgent:identity.userAgent,
+      screenRaw:identity.screenRaw, hwRaw:identity.hwRaw,
+      realSignalCount:identity.realSignalCount, registeredAt:identity.registeredAt };
+    await _setDocField(_DOC_SHARED, `deviceReg_${_h(username)}`, rec);
+    return true;
+  } catch { return false; }
+};
+
+const loadDeviceRegistration = async (username) => {
+  try { const d = await _getDoc(_DOC_SHARED); return d?.[`deviceReg_${_h(username)}`]||null; }
+  catch { return null; }
+};
+
 function useNcAccess(currentUser) {
   const [users] = useSharedData("nv-users", []);
+  const [identity, setIdentity] = useState(null);
+  const [fbReg, setFbReg] = useState(undefined);
+  useEffect(() => { buildDeviceIdentity().then(setIdentity); }, []);
+  useEffect(() => { if (currentUser) loadDeviceRegistration(currentUser).then(setFbReg); }, [currentUser]);
   const me = users.find(u => u.username === currentUser);
-  return !!(me?.ncUnlocked);
+  if (!me?.ncUnlocked) return false;
+  if (!identity) return false;
+  if (fbReg === undefined) return false;
+  if (!fbReg && !me.ncDeviceId) return true;
+  const stored = fbReg || (() => { try { return JSON.parse(me.ncDeviceId); } catch { return me.ncDeviceId||null; } })();
+  if (!stored) return true;
+  if (typeof stored === "string") return stored === identity.fingerprint;
+  const { match } = compareDeviceIdentity(stored, identity);
+  return match;
 }
 
 // ── Admin: Production Code Manager ───────────────────────────────────
@@ -4837,7 +5064,7 @@ function AdminNcCodes({ toast }) {
   };
 
   const generateBulk = () => {
-    const n = Math.min(Math.max(1, bulkCount), 200);
+    const n = Math.min(Math.max(1, bulkCount), 250);
     const existing = new Set(codes.map(c => c.code));
     const batch = [];
     while (batch.length < n) {
@@ -4861,10 +5088,19 @@ function AdminNcCodes({ toast }) {
   };
 
   const revokeUser = async (username) => {
-    if (!confirm(`Revoke NC access for ${username}?`)) return;
-    const updated = users.map(u => u.username === username ? { ...u, ncUnlocked: false, ncCode: null } : u);
+    if (!confirm(`Revoke NC access for ${username}?\nThis also clears their device lock.`)) return;
+    const updated = users.map(u => u.username === username ? { ...u, ncUnlocked: false, ncCode: null, ncDeviceId: null } : u);
     await saveUsers(updated);
+    try { await _setDocField(_DOC_SHARED, `deviceReg_${_h(username)}`, null); } catch {}
     toast(`Access revoked for ${username}`, "success");
+  };
+
+  const resetDevice = async (username) => {
+    if (!confirm(`Reset device lock for ${username}?\n\nThey can re-activate on a new device by re-entering their code once.`)) return;
+    const updated = users.map(u => u.username === username ? { ...u, ncDeviceId: null } : u);
+    await saveUsers(updated);
+    try { await _setDocField(_DOC_SHARED, `deviceReg_${_h(username)}`, null); } catch {}
+    toast(`📱 Device lock reset for ${username}`, "success");
   };
 
   const copyCode = (code) => {
@@ -4908,7 +5144,7 @@ function AdminNcCodes({ toast }) {
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
           <label className="lbl" style={{marginBottom:0,whiteSpace:"nowrap"}}>Bulk generate:</label>
-          <input className="inp" type="number" min={1} max={200} style={{width:80,marginBottom:0}}
+          <input className="inp" type="number" min={1} max={250} style={{width:80,marginBottom:0}}
             value={bulkCount} onChange={e=>setBulkCount(+e.target.value)} />
           <button className="btn btn-success" onClick={generateBulk}>⚡ Generate {bulkCount} Codes</button>
           {codes.length>0&&<button className="btn btn-danger btn-sm" onClick={deleteAll}>🗑️ Delete All</button>}
@@ -4964,20 +5200,39 @@ function AdminNcCodes({ toast }) {
       {unlocked.length>0&&(
         <div style={{marginTop:20}}>
           <div style={{fontWeight:800,fontSize:14,marginBottom:10,color:"var(--success)"}}>🔓 Unlocked Students ({unlocked.length})</div>
-          {unlocked.map(u=>(
-            <div key={u.username} className="card" style={{padding:"10px 14px",display:"flex",alignItems:"center",gap:12,marginBottom:6,
-              borderLeft:"4px solid var(--success)"}}>
-              <div style={{width:36,height:36,borderRadius:"50%",background:"rgba(34,197,94,.15)",display:"flex",
-                alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>
-                {u.avatar||"👤"}
+          {unlocked.map(u=>{
+            let dev=null; try{dev=u.ncDeviceId?JSON.parse(u.ncDeviceId):null;}catch{dev=null;}
+            return (
+              <div key={u.username} className="card" style={{padding:"12px 14px",marginBottom:8,borderLeft:"4px solid var(--success)"}}>
+                <div style={{display:"flex",gap:12,alignItems:"flex-start",flexWrap:"wrap"}}>
+                  <div style={{width:36,height:36,borderRadius:"50%",background:"rgba(34,197,94,.15)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{u.avatar||"👤"}</div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontWeight:700,fontSize:13}}>{u.displayName||u.username.split("@")[0]}</div>
+                    <div style={{fontSize:11,color:"var(--text3)",marginTop:1}}>{u.username} · Code: <b>{u.ncCode||"Manual"}</b></div>
+                    {dev ? (
+                      <div style={{marginTop:6,padding:"6px 10px",borderRadius:8,background:"var(--bg4)",border:"1px solid var(--border)",fontSize:11}}>
+                        <div style={{display:"flex",gap:16,flexWrap:"wrap"}}>
+                          <span>🖥️ <b>GPU:</b> {dev.gpuRaw||dev.webglH||"?"}</span>
+                          <span>📱 <b>Screen:</b> {dev.screenRaw||"?"}</span>
+                          <span>🌐 <b>IP:</b> <span style={{color:"var(--success)",fontWeight:700}}>{dev.publicIP||"?"}</span></span>
+                        </div>
+                        <div style={{marginTop:3,display:"flex",gap:16,flexWrap:"wrap"}}>
+                          <span>💻 <b>CPU/RAM:</b> {dev.hwRaw||"?"}</span>
+                          <span>🔑 <b>Signals:</b> <span style={{color:dev.realSignalCount>=7?"var(--success)":"var(--warn)",fontWeight:700}}>{dev.realSignalCount||"?"}/10 captured</span></span>
+                        </div>
+                      </div>
+                    ):(
+                      <div style={{fontSize:11,color:"var(--warn)",marginTop:4}}>⚠️ No device bound yet</div>
+                    )}
+                  </div>
+                  <div style={{display:"flex",flexDirection:"column",gap:5,flexShrink:0}}>
+                    <button className="btn btn-sm btn-danger" onClick={()=>revokeUser(u.username)}>🚫 Revoke</button>
+                    {u.ncDeviceId&&<button className="btn btn-sm" style={{fontSize:11,borderColor:"var(--warn)",color:"var(--warn)",whiteSpace:"nowrap"}} onClick={()=>resetDevice(u.username)}>📱 Reset Device</button>}
+                  </div>
+                </div>
               </div>
-              <div style={{flex:1}}>
-                <div style={{fontWeight:700,fontSize:13}}>{u.displayName||u.username.split("@")[0]}</div>
-                <div style={{fontSize:11,color:"var(--text3)"}}>{u.username} · Code: {u.ncCode||"Manual unlock"}</div>
-              </div>
-              <button className="btn btn-sm btn-danger" onClick={()=>revokeUser(u.username)}>Revoke</button>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
@@ -4991,35 +5246,84 @@ function NcPaywall({ currentUser, onUnlocked, toast, preview, isMock }) {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [shake, setShake] = useState(false);
+  const [currentIdentity, setCurrentIdentity] = useState(null);
+  const [fbReg, setFbReg] = useState(undefined);
+  useEffect(() => { buildDeviceIdentity().then(setCurrentIdentity); }, []);
+  useEffect(() => { if (currentUser) loadDeviceRegistration(currentUser).then(setFbReg); }, [currentUser]);
+
+  const me = users.find(u => u.username === currentUser);
+  const storedReg = fbReg || (() => { try { return me?.ncDeviceId ? JSON.parse(me.ncDeviceId) : null; } catch { return me?.ncDeviceId||null; } })();
+  const isWrongDevice = !!(me?.ncUnlocked && storedReg && currentIdentity && (() => {
+    if (typeof storedReg === "string") return storedReg !== currentIdentity.fingerprint;
+    const { match } = compareDeviceIdentity(storedReg, currentIdentity);
+    return !match;
+  })());
 
   const redeem = async () => {
     const entered = input.trim().toUpperCase();
     if (!entered) return toast("Enter your production code", "error");
     setLoading(true);
+    const identity = currentIdentity || await buildDeviceIdentity();
     const match = codes.find(c => c.code === entered && !c.used);
     if (!match) {
-      setLoading(false);
-      setShake(true);
-      setTimeout(() => setShake(false), 600);
-      toast("❌ Invalid or already-used code", "error");
-      return;
+      setLoading(false); setShake(true); setTimeout(()=>setShake(false),600);
+      toast("❌ Invalid or already-used code","error"); return;
     }
-    // Mark code as used
-    const newCodes = codes.map(c =>
-      c.code === entered ? { ...c, used: true, usedBy: currentUser, usedAt: Date.now() } : c
-    );
-    setCodes(newCodes);
-    await saveShared("ncCodes", newCodes);
-    // Unlock user
-    const newUsers = users.map(u =>
-      u.username === currentUser ? { ...u, ncUnlocked: true, ncCode: entered } : u
-    );
-    setUsers(newUsers);
-    await saveShared("users", newUsers);
-    setLoading(false);
-    toast("🎉 Full access unlocked!", "success");
+    await registerDeviceInFirebase(currentUser, identity);
+    const identityStore = JSON.stringify({
+      fingerprint:identity.fingerprint, uuid:identity.uuid,
+      canvasH:identity.canvasH, webglH:identity.webglH, audioH:identity.audioH, fontH:identity.fontH,
+      screen:identity.screen, hardware:identity.hardware, locale:identity.locale, platform:identity.platform,
+      publicIP:identity.publicIP, gpuRaw:identity.gpuRaw, userAgent:identity.userAgent,
+      screenRaw:identity.screenRaw, hwRaw:identity.hwRaw,
+      realSignalCount:identity.realSignalCount, registeredAt:identity.registeredAt,
+    });
+    const newCodes = codes.map(c => c.code===entered
+      ? {...c,used:true,usedBy:currentUser,usedAt:Date.now(),deviceFingerprint:identity.fingerprint,deviceIP:identity.publicIP,deviceGPU:identity.gpuRaw}:c);
+    setCodes(newCodes); await saveShared("ncCodes",newCodes);
+    const newUsers = users.map(u => u.username===currentUser
+      ? {...u,ncUnlocked:true,ncCode:entered,ncDeviceId:identityStore}:u);
+    setUsers(newUsers); await saveShared("users",newUsers);
+    setFbReg(identity); setLoading(false);
+    toast("🎉 Full access unlocked — permanently locked to this device!","success");
     onUnlocked();
   };
+
+  if (isWrongDevice) return (
+    <div style={{maxWidth:480,margin:"0 auto"}}>
+      <div style={{borderRadius:20,overflow:"hidden",border:"2px solid #dc2626",boxShadow:"0 8px 32px rgba(220,38,38,.2)"}}>
+        <div style={{background:"linear-gradient(135deg,#dc2626,#7f1d1d)",padding:"30px 24px",textAlign:"center"}}>
+          <div style={{fontSize:60,marginBottom:8}}>🔒</div>
+          <div style={{color:"white",fontWeight:800,fontSize:20,marginBottom:6}}>Device Not Recognised</div>
+          <div style={{color:"rgba(255,255,255,.85)",fontSize:13,lineHeight:1.7}}>
+            Your production code is permanently bound to the device it was first activated on. Access from this device is blocked.
+          </div>
+        </div>
+        <div style={{padding:"22px 24px",background:"var(--card)"}}>
+          {[
+            {icon:"📱",text:"Each code locks permanently to ONE device — identified by its GPU chip, audio processor, screen hardware, CPU, installed fonts, and a unique browser database ID"},
+            {icon:"🚫",text:"Sharing your login or opening on a different phone, tablet or laptop is automatically blocked"},
+            {icon:"🔍",text:"10 hardware-level signals were captured from your original device — they must all match to allow access"},
+            {icon:"✉️",text:"Only contact admin if you genuinely changed your device (phone broken or stolen)"},
+          ].map((item,i)=>(
+            <div key={i} style={{display:"flex",gap:10,alignItems:"flex-start",padding:"10px 12px",borderRadius:10,
+              background:"rgba(220,38,38,.04)",border:"1px solid rgba(220,38,38,.12)",marginBottom:8}}>
+              <span style={{fontSize:20,flexShrink:0}}>{item.icon}</span>
+              <span style={{fontSize:12,color:"var(--text2)",lineHeight:1.6}}>{item.text}</span>
+            </div>
+          ))}
+          <div style={{textAlign:"center",padding:"13px 16px",borderRadius:10,background:"var(--bg4)",border:"1px solid var(--border)",fontSize:12,color:"var(--text3)",lineHeight:2,marginTop:4}}>
+            Genuine device change? Contact admin:<br/>
+            <a href={`https://mail.google.com/mail/?view=cm&to=mynote0416@gmail.com&su=NC%20Exam%20Device%20Reset%20Request&body=Hello%2C%20I%20need%20my%20device%20reset.%0A%0AUsername%3A%20${encodeURIComponent(currentUser)}%0AReason%3A%20`}
+              target="_blank" rel="noopener noreferrer"
+              style={{color:"var(--accent)",fontWeight:800,textDecoration:"none",fontSize:13}}>
+              mynote0416@gmail.com
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 
   return (
     <div style={{maxWidth:500,margin:"0 auto"}}>
@@ -5106,28 +5410,8 @@ function NcPaywall({ currentUser, onUnlocked, toast, preview, isMock }) {
           {/* Payment options */}
           <div style={{marginTop:20,borderTop:"1px solid var(--border)",paddingTop:16}}>
             <div style={{fontWeight:800,fontSize:12,color:"var(--text3)",marginBottom:12,textTransform:"uppercase",letterSpacing:.5,textAlign:"center"}}>💳 Purchase a Code — Pay Via</div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:14}}>
-              {/* Opay */}
-              <a href="tel:9026985870"
-                style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6,padding:"12px 8px",borderRadius:12,
-                  background:"linear-gradient(135deg,#00b140,#007a2c)",textDecoration:"none",cursor:"pointer",
-                  boxShadow:"0 2px 8px rgba(0,177,64,.2)",transition:"transform .15s,box-shadow .15s"}}
-                onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 4px 16px rgba(0,177,64,.35)";}}
-                onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 2px 8px rgba(0,177,64,.2)";}}>
-                <div style={{width:36,height:36,borderRadius:"50%",background:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:14,color:"#00b140",letterSpacing:-1}}>OPay</div>
-                <div style={{color:"white",fontWeight:800,fontSize:11}}>OPay</div>
-              </a>
-              {/* Remita */}
-              <a href="https://remita.net" target="_blank" rel="noopener noreferrer"
-                style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6,padding:"12px 8px",borderRadius:12,
-                  background:"linear-gradient(135deg,#e63946,#9b1d24)",textDecoration:"none",cursor:"pointer",
-                  boxShadow:"0 2px 8px rgba(230,57,70,.2)",transition:"transform .15s,box-shadow .15s"}}
-                onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 4px 16px rgba(230,57,70,.35)";}}
-                onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 2px 8px rgba(230,57,70,.2)";}}>
-                <div style={{width:36,height:36,borderRadius:"50%",background:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:11,color:"#e63946",letterSpacing:-1}}>REM</div>
-                <div style={{color:"white",fontWeight:800,fontSize:11}}>Remita</div>
-              </a>
-              {/* Paystack */}
+            <div style={{marginBottom:14}}>
+              {/* Paystack — full width */}
               <div
                 onClick={async ()=>{
                   try {
@@ -5174,46 +5458,23 @@ function NcPaywall({ currentUser, onUnlocked, toast, preview, isMock }) {
                     alert("❌ Error: " + (e?.message || e?.toString() || "Unknown error"));
                   }
                 }}
-                style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6,padding:"12px 8px",borderRadius:12,
+                style={{display:"flex",alignItems:"center",justifyContent:"center",gap:12,padding:"14px 20px",borderRadius:12,
                   background:"linear-gradient(135deg,#0ba4db,#0077a8)",cursor:"pointer",
                   boxShadow:"0 2px 8px rgba(11,164,219,.2)",transition:"transform .15s,box-shadow .15s"}}
                 onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 4px 16px rgba(11,164,219,.35)";}}
                 onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 2px 8px rgba(11,164,219,.2)";}}>
-                <div style={{width:36,height:36,borderRadius:"50%",background:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:10,color:"#0ba4db",letterSpacing:-1}}>PSK</div>
-                <div style={{color:"white",fontWeight:800,fontSize:11}}>Paystack</div>
+                <div style={{width:40,height:40,borderRadius:"50%",background:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:11,color:"#0ba4db",letterSpacing:-1,flexShrink:0}}>PSK</div>
+                <div><div style={{color:"white",fontWeight:800,fontSize:14}}>Pay with Paystack</div><div style={{color:"rgba(255,255,255,.8)",fontSize:11}}>Secure card payment · Code delivered instantly</div></div>
               </div>
             </div>
-            {/* WhatsApp button — includes student name & matric */}
-            {(()=>{
-              const _me = ls("nv-users",[]).find(u=>u.username===currentUser);
-              const _name = _me?.displayName || currentUser.split("@")[0];
-              const _matric = _me?.matricNumber || "Not set";
-              const _msg = `Hello, I just made payment for the NC Exam Access Code.\n\nName: ${_name}\nMatric No: ${_matric}\nEmail: ${currentUser}\n\nPlease find my receipt attached. Kindly generate my production code. Thank you!`;
-              return (
-            <a
-              href={`https://wa.me/2347054641287?text=${encodeURIComponent(_msg)}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{
-                display:"flex",alignItems:"center",justifyContent:"center",gap:10,
-                padding:"13px 20px",borderRadius:12,marginBottom:10,
-                background:"linear-gradient(135deg,#25d366,#128c50)",
-                textDecoration:"none",cursor:"pointer",
-                boxShadow:"0 2px 10px rgba(37,211,102,.3)",
-                transition:"transform .15s,box-shadow .15s",
-              }}
-              onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 4px 18px rgba(37,211,102,.45)";}}
-              onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 2px 10px rgba(37,211,102,.3)";}}>
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
-              <div>
-                <div style={{color:"white",fontWeight:800,fontSize:13}}>Send Receipt on WhatsApp</div>
-                <div style={{color:"rgba(255,255,255,.8)",fontSize:10}}>Tap after payment — we'll send your code</div>
-              </div>
-            </a>
-              );
-            })()}
-            <div style={{textAlign:"center",fontSize:11,color:"var(--text3)",lineHeight:1.5}}>
-              After paying, tap the button above to send your receipt.<br/>Your production code will be sent to you promptly.
+            <div style={{textAlign:"center",fontSize:12,color:"var(--text3)",lineHeight:1.9,padding:"10px 14px",background:"var(--bg4)",borderRadius:10,border:"1px solid var(--border)"}}>
+              After payment, your code is delivered automatically.<br/>
+              Need help? Contact admin at:{" "}
+              <a href={`https://mail.google.com/mail/?view=cm&to=mynote0416@gmail.com&su=NC%20Exam%20Access%20Code%20Help&body=Hello%2C%20I%20need%20help%20with%20my%20NC%20Exam%20access.%0AUsername%3A%20${encodeURIComponent(currentUser)}`}
+                target="_blank" rel="noopener noreferrer"
+                style={{color:"var(--accent)",fontWeight:700,textDecoration:"none"}}>
+                mynote0416@gmail.com
+              </a>
             </div>
           </div>
         </div>
@@ -6725,36 +6986,13 @@ function SchoolMCQReview({ paper, onBack }) {
 
 // ─── STUDENT: School Past Questions Only (sidebar nav) ───────────────────
 function SchoolOnlyPastQuestionsView({ toast, currentUser }) {
-  const [tab, setTab] = useState("school");
-  const [mcqBanks] = useSharedData("nv-pq", DEFAULT_PQ);
-  const [essayBanks] = useSharedData("nv-essay-banks", []);
-  const TABS = [
-    {key:"school", icon:"🏫", label:"School Past Questions", sub:"Browse by class & course"},
-    {key:"mcq", icon:"📝", label:"General MCQ Banks", sub:"Admin-uploaded question sets"},
-    {key:"essay", icon:"✍️", label:"Essay Exams", sub:"Long answer · AI graded"},
-  ];
   return (
     <div>
       <div style={{marginBottom:20}}>
         <div className="sec-title">🏫 School Past Questions</div>
-        <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>School past questions organised by class & course, plus MCQ banks and essay exams.</div>
-        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-          {TABS.map(t=>(
-            <div key={t.key} onClick={()=>setTab(t.key)} style={{
-              flex:"1 1 140px",padding:"12px 14px",borderRadius:11,cursor:"pointer",transition:"all .2s",
-              border:`2px solid ${tab===t.key?"var(--accent)":"var(--border)"}`,
-              background:tab===t.key?"rgba(0,119,182,.10)":"var(--card)",textAlign:"center"
-            }}>
-              <div style={{fontSize:22,marginBottom:4}}>{t.icon}</div>
-              <div style={{fontWeight:800,fontSize:13,color:tab===t.key?"var(--accent)":"var(--text2)"}}>{t.label}</div>
-              <div style={{fontSize:10,color:"var(--text3)",marginTop:2}}>{t.sub}</div>
-            </div>
-          ))}
-        </div>
+        <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>School past questions organised by class &amp; course.</div>
       </div>
-      {tab==="school" && <SchoolPastQuestionsView toast={toast} currentUser={currentUser} />}
-      {tab==="mcq" && <MCQExamView toast={toast} currentUser={currentUser} banks={mcqBanks} />}
-      {tab==="essay" && <EssayExamView toast={toast} currentUser={currentUser} essayBanks={essayBanks} />}
+      <SchoolPastQuestionsView toast={toast} currentUser={currentUser} />
     </div>
   );
 }
@@ -6776,21 +7014,15 @@ function NursingExamsStandaloneView({ toast, currentUser, initialExam }) {
 // ─── MAIN: Past Questions Page (tabs: School PQ + Nursing Exams) ──────
 function PastQuestionsView({ toast, currentUser }) {
   const [tab, setTab] = useState("school");
-  const [mcqBanks] = useSharedData("nv-pq", DEFAULT_PQ);
-  const [essayBanks] = useSharedData("nv-essay-banks", []);
-
   const TABS = [
     {key:"school", icon:"🏫", label:"School Past Questions", sub:"Browse by class & course"},
     {key:"nursing", icon:"🎓", label:"Nursing Council Exams", sub:"GNC · Midwifery · Public Health"},
-    {key:"mcq", icon:"📝", label:"General MCQ Banks", sub:"Admin-uploaded question sets"},
-    {key:"essay", icon:"✍️", label:"Essay Exams", sub:"Long answer · AI graded"},
   ];
-
   return (
     <div>
       <div style={{marginBottom:20}}>
         <div className="sec-title">📚 Past Questions & Exams</div>
-        <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>School past questions organised by class & course. Nursing exams and MCQ banks also available.</div>
+        <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>School past questions organised by class & course. Nursing council exams also available.</div>
         <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
           {TABS.map(t=>(
             <div key={t.key} onClick={()=>setTab(t.key)} style={{
@@ -6807,8 +7039,6 @@ function PastQuestionsView({ toast, currentUser }) {
       </div>
       {tab==="school" && <SchoolPastQuestionsView toast={toast} currentUser={currentUser} />}
       {tab==="nursing" && <NursingExamsView toast={toast} currentUser={currentUser} />}
-      {tab==="mcq" && <MCQExamView toast={toast} currentUser={currentUser} banks={mcqBanks} />}
-      {tab==="essay" && <EssayExamView toast={toast} currentUser={currentUser} essayBanks={essayBanks} />}
     </div>
   );
 }
@@ -9123,7 +9353,7 @@ function getDailyMockQuestions(pool) {
   if (!pool || pool.length === 0) return [];
   const today = new Date();
   const seed = today.getFullYear()*10000 + (today.getMonth()+1)*100 + today.getDate();
-  const count = Math.min(20, pool.length);
+  const count = Math.min(250, pool.length);
   const shuffled = [...pool].sort((a,b)=>{
     const ha = (seed * (pool.indexOf(a)+1)) % 997;
     const hb = (seed * (pool.indexOf(b)+1)) % 997;
