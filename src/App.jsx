@@ -161,14 +161,112 @@ const _loadFirebase = () => {
 // All exam results live in:       collection("nv") / doc("exams")
 // All essay subs live in:         collection("nv") / doc("essays")
 // Password resets:                collection("nv") / doc("resets")
+//
+// LARGE QUESTION STORES (up to 250 Qs) use CHUNKED MULTI-DOC storage:
+//   dailyMock    → nv/mock_meta  + nv/mock_chunk_0 … mock_chunk_N
+//   nursingExams → nv/nex_meta   + nv/nex_chunk_0  … nex_chunk_N
+//   ncArchive    → nv/arc_meta   + nv/arc_chunk_0  … arc_chunk_N
+// Each chunk holds ≤60 items so every doc stays well under Firestore's 1 MB limit.
 
-const _DOC_SHARED  = "shared";
-const _DOC_EXAMS   = "exams";
-const _DOC_ESSAYS  = "essays";
-const _DOC_RESETS  = "resets";
-const _DOC_MOCK    = "daily_mock";    // dedicated doc for daily mock pool (up to 250 Qs)
-const _DOC_ARCHIVE = "nc_archive";    // dedicated doc for NC exam archive
-const _DOC_NURSING = "nursing_exams"; // dedicated doc for nursing council exam papers
+const _DOC_SHARED = "shared";
+const _DOC_EXAMS  = "exams";
+const _DOC_ESSAYS = "essays";
+const _DOC_RESETS = "resets";
+
+// ── Chunked array save/load ───────────────────────────────────────────
+// Stores a JS array across multiple Firestore docs to bypass the 1 MB limit.
+const _CHUNK = 60; // items per chunk doc
+
+const _chunkSave = async (prefix, items, extraMeta) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    const chunks = [];
+    for (let i = 0; i < items.length; i += _CHUNK) chunks.push(items.slice(i, i + _CHUNK));
+    // Write all chunk docs in parallel
+    await Promise.all(chunks.map((ch, ci) =>
+      _db.collection("nv").doc(`${prefix}_chunk_${ci}`).set({ items: ch })
+    ));
+    // Delete stale chunks from a previous larger upload
+    const metaSnap = await _db.collection("nv").doc(`${prefix}_meta`).get().catch(()=>null);
+    const prevCount = metaSnap?.exists ? (metaSnap.data().chunks || 0) : 0;
+    if (prevCount > chunks.length) {
+      await Promise.all(
+        Array.from({length: prevCount - chunks.length}, (_, i) =>
+          _db.collection("nv").doc(`${prefix}_chunk_${chunks.length + i}`).delete()
+        )
+      );
+    }
+    await _db.collection("nv").doc(`${prefix}_meta`).set({
+      chunks: chunks.length, total: items.length, updatedAt: Date.now(), ...(extraMeta||{})
+    });
+    return true;
+  } catch(e) { console.error("[Firebase] chunkSave failed:", prefix, e.message); return false; }
+};
+
+const _chunkLoad = async (prefix) => {
+  const ready = await _loadFirebase(); if (!ready) return null;
+  try {
+    const metaSnap = await _db.collection("nv").doc(`${prefix}_meta`).get();
+    if (!metaSnap.exists) return null;
+    const { chunks = 0, ...meta } = metaSnap.data();
+    if (chunks === 0) return { items: [], meta };
+    const snaps = await Promise.all(
+      Array.from({length: chunks}, (_, ci) =>
+        _db.collection("nv").doc(`${prefix}_chunk_${ci}`).get()
+      )
+    );
+    const items = snaps.flatMap(s => s.exists ? (s.data().items || []) : []);
+    return { items, meta };
+  } catch(e) { console.error("[Firebase] chunkLoad failed:", prefix, e.message); return null; }
+};
+
+// ── JSON-string chunked save/load (for complex nested objects) ────────
+const _PIECE = 800000; // 800 KB per Firestore doc (well under 1 MB limit)
+const _jsonChunkSave = async (prefix, obj) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    const json = JSON.stringify(obj);
+    const pieces = [];
+    for (let i = 0; i < json.length; i += _PIECE) pieces.push(json.slice(i, i + _PIECE));
+    await Promise.all(pieces.map((p, pi) =>
+      _db.collection("nv").doc(`${prefix}_chunk_${pi}`).set({ part: p })
+    ));
+    const metaSnap = await _db.collection("nv").doc(`${prefix}_meta`).get().catch(()=>null);
+    const prev = metaSnap?.exists ? (metaSnap.data().pieces || 0) : 0;
+    if (prev > pieces.length) {
+      await Promise.all(
+        Array.from({length: prev - pieces.length}, (_,i) =>
+          _db.collection("nv").doc(`${prefix}_chunk_${pieces.length+i}`).delete()
+        )
+      );
+    }
+    await _db.collection("nv").doc(`${prefix}_meta`).set({ pieces: pieces.length, updatedAt: Date.now() });
+    return true;
+  } catch(e) { console.error("[Firebase] jsonChunkSave failed:", prefix, e.message); return false; }
+};
+const _jsonChunkLoad = async (prefix) => {
+  const ready = await _loadFirebase(); if (!ready) return null;
+  try {
+    const metaSnap = await _db.collection("nv").doc(`${prefix}_meta`).get();
+    if (!metaSnap.exists) return null;
+    const { pieces = 0 } = metaSnap.data();
+    if (pieces === 0) return {};
+    const snaps = await Promise.all(
+      Array.from({length: pieces}, (_, pi) =>
+        _db.collection("nv").doc(`${prefix}_chunk_${pi}`).get()
+      )
+    );
+    return JSON.parse(snaps.map(s => s.exists ? (s.data().part||"") : "").join(""));
+  } catch(e) { console.error("[Firebase] jsonChunkLoad failed:", prefix, e.message); return null; }
+};
+
+// Named helpers used throughout the app
+const mockChunkSave    = (pool, meta) => _chunkSave("mock", pool, meta);
+const mockChunkLoad    = ()           => _chunkLoad("mock");
+const archiveChunkSave = (entries)    => _chunkSave("arc", entries);
+const archiveChunkLoad = ()           => _chunkLoad("arc");
+const nursingChunkSave = (data)       => _jsonChunkSave("nex", data);
+const nursingChunkLoad = ()           => _jsonChunkLoad("nex");
 
 // In-memory cache to reduce Firestore reads
 const _cache = {};
@@ -228,20 +326,6 @@ const examBsGet = async (key) => {
 };
 const examBsSet = async (key, val) => _setDocField(_DOC_EXAMS, key, val);
 
-// ── Dedicated large-data helpers (bypass the 1MB shared doc limit) ─────────
-// Daily Mock Pool: stored in its own Firestore document (nv/daily_mock)
-const mockBsGet  = async () => { const d=await _getDoc(_DOC_MOCK);  return d?.pool ?? null; };
-const mockTitleGet = async () => { const d=await _getDoc(_DOC_MOCK); return d?.mockTitle ?? null; };
-const mockBsSet  = async (pool, mockTitle) => _setDocFields(_DOC_MOCK, { pool, mockTitle: mockTitle??null });
-
-// NC Archive: stored in its own Firestore document (nv/nc_archive)
-const archiveBsGet = async () => { const d=await _getDoc(_DOC_ARCHIVE); return d?.entries ?? null; };
-const archiveBsSet = async (entries) => _setDocField(_DOC_ARCHIVE, "entries", entries);
-
-// Nursing Exam Papers: stored in its own Firestore document (nv/nursing_exams)
-const nursingBsGet = async () => { const d=await _getDoc(_DOC_NURSING); return d?.data ?? null; };
-const nursingBsSet = async (data) => _setDocField(_DOC_NURSING, "data", data);
-
 // ── REACTIVE SYNC ─────────────────────────────────────────────────────
 const NV_SYNC_EVENT = "nv-sync";
 const dispatchSync = () => window.dispatchEvent(new CustomEvent(NV_SYNC_EVENT));
@@ -295,38 +379,18 @@ const SK = {
   cbtResults:    ["nv-cbt-results",   "cbtResults"],
 };
 
-const saveShared = async (key, val) => {
+const saveShared = async (key, val, extraMeta) => {
   const [lk, bk] = SK[key];
-  // Large NC datasets get their own Firestore document to avoid the 1MB limit
-  if (key === "dailyMock") {
-    lsSet(lk, val); dispatchSync();
-    const title = ls("nv-daily-mock-title", "");
-    return await mockBsSet(val, title);
-  }
-  if (key === "nursingExams") {
-    lsSet(lk, val); dispatchSync();
-    return await nursingBsSet(val);
-  }
-  if (key === "ncArchive") {
-    lsSet(lk, val); dispatchSync();
-    return await archiveBsSet(val);
-  }
+  if (key === "dailyMock")    { lsSet(lk,val); dispatchSync(); return mockChunkSave(val, extraMeta||{}); }
+  if (key === "nursingExams") { lsSet(lk,val); dispatchSync(); return nursingChunkSave(val); }
+  if (key === "ncArchive")    { lsSet(lk,val); dispatchSync(); return archiveChunkSave(val); }
   return await dbSet(lk, bk, val);
 };
 const loadShared = async (key, fallback) => {
   const [lk, bk] = SK[key];
-  if (key === "dailyMock") {
-    try { const v = await mockBsGet(); if(v!==null){ lsSet(lk,v); return v; } } catch {}
-    return ls(lk, fallback);
-  }
-  if (key === "nursingExams") {
-    try { const v = await nursingBsGet(); if(v!==null){ lsSet(lk,v); return v; } } catch {}
-    return ls(lk, fallback);
-  }
-  if (key === "ncArchive") {
-    try { const v = await archiveBsGet(); if(v!==null){ lsSet(lk,v); return v; } } catch {}
-    return ls(lk, fallback);
-  }
+  if (key === "dailyMock")    { try { const r=await mockChunkLoad();    if(r){lsSet(lk,r.items);return r.items;} } catch{} return ls(lk,fallback); }
+  if (key === "nursingExams") { try { const r=await nursingChunkLoad(); if(r){lsSet(lk,r);return r;} }           catch{} return ls(lk,fallback); }
+  if (key === "ncArchive")    { try { const r=await archiveChunkLoad(); if(r){lsSet(lk,r.items);return r.items;} } catch{} return ls(lk,fallback); }
   return dbLoad(lk, bk, fallback);
 };
 
@@ -525,17 +589,15 @@ const hydrateFromBackend = async () => {
       schoolPQ:      {},  folders:    {}, schoolExams:  [],
     };
     Object.entries(SK).forEach(([key, [lsKey, bk]]) => {
-      // Skip large NC keys — they are loaded from dedicated docs below
-      if (["dailyMock","nursingExams","ncArchive"].includes(key)) return;
+      if (["dailyMock","nursingExams","ncArchive"].includes(key)) return; // loaded from chunked docs below
       const remote = doc[bk];
       if (remote !== undefined && remote !== null) lsSet(lsKey, remote);
       else if (!localStorage.getItem(lsKey)) lsSet(lsKey, defaults[key] || []);
     });
-    // Load large NC datasets from their dedicated Firestore documents
-    try { const v = await mockBsGet(); if(v!==null) lsSet("nv-daily-mock", v); } catch {}
-    try { const t = await mockTitleGet(); if(t!==null) lsSet("nv-daily-mock-title", t); } catch {}
-    try { const v = await nursingBsGet(); if(v!==null) lsSet("nv-nursing-exams", v); } catch {}
-    try { const v = await archiveBsGet(); if(v!==null) lsSet("nv-nc-archive", v); } catch {}
+    // Load large NC datasets from their own chunked documents
+    try { const r=await mockChunkLoad();    if(r){ lsSet("nv-daily-mock",r.items); if(r.meta?.mockTitle) lsSet("nv-daily-mock-title",r.meta.mockTitle); } } catch(e){ console.warn("[Sync] mock chunk load:",e.message); }
+    try { const r=await nursingChunkLoad(); if(r){ lsSet("nv-nursing-exams",r); } }           catch(e){ console.warn("[Sync] nursing chunk load:",e.message); }
+    try { const r=await archiveChunkLoad(); if(r){ lsSet("nv-nc-archive",r.items); } }         catch(e){ console.warn("[Sync] archive chunk load:",e.message); }
     dispatchSync();
     console.log("[Sync] Hydrated from Firestore ✅");
   } catch (e) { console.warn("[Sync] Hydration failed:", e.message); }
@@ -8984,113 +9046,200 @@ function CbtStudentView({ toast, currentUser }) {
 // ════════════════════════════════════════════════════════════════════════════
 
 // ── Admin: Daily Mock Manager ─────────────────────────────────────────────
-// Admin adds/deletes questions. 20 are selected daily by date-seed from the pool.
+// Admin adds/deletes questions. All questions (up to 250) are served per mock.
+// Uses chunked Firestore storage to bypass the 1 MB document limit.
+
+// ── ROBUST QUESTION PARSER ─────────────────────────────────────────────────
+// Handles: numbered (1. 2. 3.), Q: format, with/without blank lines,
+// inline Answer: lines, and a separate answer-key column.
+function robustParseQuestions(pasteText, pasteAnswers) {
+  const text = (pasteText||"").trim();
+  const ansLines = (pasteAnswers||"").trim().split("\n").map(l=>l.trim()).filter(Boolean);
+  if (!text) return [];
+
+  const lines = text.split("\n");
+  const blocks = [];
+  let cur = [];
+
+  // Detect the start of a new question
+  const isQStart = (line) =>
+    /^\d{1,3}[\.\)]\s+\S/.test(line) ||          // "1. text" / "1) text"
+    /^Q\s*\d*\s*[:\.\-]\s*\S/i.test(line) ||     // "Q:" / "Q1:" / "Q 1."
+    /^Question\s*\d*\s*[:\.\-]\s*\S/i.test(line);// "Question 1:"
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) { if (cur.length) cur.push(""); continue; }
+
+    if (isQStart(line) && cur.length > 0) {
+      // End current block if it already has option lines or an answer
+      const hasOpts = cur.some(l => /^[A-D][\.\)\s:]/i.test(l));
+      const hasAns  = cur.some(l => /^(?:ans|answer)\s*[:\.\)]/i.test(l));
+      if (hasOpts || hasAns) { blocks.push([...cur]); cur = []; }
+    }
+    cur.push(line);
+    // End block immediately after an inline answer line
+    if (/^(?:ANS(?:WER)?)\s*[:\.\)]\s*[A-D]/i.test(line)) {
+      blocks.push([...cur]); cur = [];
+    }
+  }
+  if (cur.some(l=>l.trim())) blocks.push(cur);
+
+  return blocks.map((blockLines, idx) => {
+    const clean = blockLines.map(l=>l.trim()).filter(Boolean);
+    let q = "", options = ["","","",""], ans = 0;
+    let qLines = [], inQ = true;
+
+    clean.forEach(line => {
+      // Inline answer: "Answer: B" / "ANS: B" / "Ans: B"
+      const ansM = line.match(/^(?:ANS(?:WER)?)\s*[:\.\)]\s*([A-D])/i);
+      if (ansM) { ans = "ABCD".indexOf(ansM[1].toUpperCase()); if(ans<0) ans=0; inQ=false; return; }
+
+      // Option line: "A. text" / "A) text" / "A: text" / "(A) text"
+      const optM = line.match(/^\(?([A-D])\)?[\.\)\s:]\s*(.+)$/i);
+      if (optM) {
+        const idx2 = "ABCD".indexOf(optM[1].toUpperCase());
+        if (idx2 >= 0) { options[idx2] = optM[2].trim(); inQ = false; return; }
+      }
+
+      // "Q: text" or "Q1: text" prefix — strip prefix, rest is question
+      const qM = line.match(/^(?:Q\s*\d*\s*[:\.\-]|Question\s*\d*\s*[:\.\-])\s*(.+)$/i);
+      if (qM) { qLines.push(qM[1].trim()); inQ = true; return; }
+
+      // "1. text" / "1) text" — strip number
+      const numM = line.match(/^\d{1,3}[\.\)]\s+(.+)$/);
+      if (numM && inQ) { qLines.push(numM[1].trim()); return; }
+
+      if (inQ) qLines.push(line);
+    });
+
+    q = qLines.join(" ").trim();
+
+    // Use separate answer column if provided and no inline answer was found
+    if (ansLines[idx]) {
+      const a = "ABCD".indexOf(ansLines[idx][0]?.toUpperCase());
+      if (a >= 0) ans = a;
+    }
+
+    return { id: Date.now()+idx, q, options, ans, cat: "General" };
+  }).filter(item => item.q && item.options.some(o => o));
+}
+
 function AdminDailyMockManager({ toast }) {
   const [pool, setPool] = useSharedData("nv-daily-mock", []);
-  const [mockTitle, setMockTitle] = useState(() => ls("nv-daily-mock-title", ""));
+  const [mockTitle, setMockTitle] = useState(()=>ls("nv-daily-mock-title",""));
+  const [saving, setSaving] = useState(false);
   const [mode, setMode] = useState("single"); // "single"|"paste"
   const [form, setForm] = useState({q:"", options:["","","",""], ans:0, cat:"General"});
   const [editIdx, setEditIdx] = useState(null);
   const [pasteText, setPasteText] = useState("");
   const [pasteAnswers, setPasteAnswers] = useState("");
   const [parsedQ, setParsedQ] = useState([]);
-  const CATS = ["General","Pharmacology","Physiology","Midwifery","Public Health","Paediatrics","Psychiatric","Critical Care","Anatomy"];
+  const [previewPage, setPreviewPage] = useState(0);
+  const PREVIEW_PER_PAGE = 20;
+  const CATS = ["General","Pharmacology","Physiology","Midwifery","Public Health","Paediatrics","Psychiatric","Critical Care","Anatomy","Medical-Surgical","Community Health","Obstetrics","Paediatrics"];
 
-  const save = async (newPool, newTitle) => {
-    const title = newTitle !== undefined ? newTitle : mockTitle;
+  const save = async (newPool, titleOverride) => {
+    const title = titleOverride !== undefined ? titleOverride : mockTitle;
     setPool(newPool);
     lsSet("nv-daily-mock", newPool);
     lsSet("nv-daily-mock-title", title);
     dispatchSync();
-    const ok = await mockBsSet(newPool, title);
-    if (!ok) toast("⚠️ Saved locally — sync failed","warn");
-  };
-
-  const saveTitle = async () => {
-    lsSet("nv-daily-mock-title", mockTitle);
-    const ok = await mockBsSet(pool, mockTitle);
-    toast(ok ? "✅ Exam title saved!" : "⚠️ Saved locally — sync failed", ok?"success":"warn");
+    setSaving(true);
+    const ok = await mockChunkSave(newPool, { mockTitle: title });
+    setSaving(false);
+    if (!ok) toast("⚠️ Saved locally — cloud sync failed","warn");
+    else toast(`✅ ${newPool.length} questions saved to cloud!`, "success");
   };
 
   const addSingle = () => {
     if (!form.q.trim()) return toast("Question text required","error");
     if (!form.options[0]||!form.options[1]) return toast("At least options A & B required","error");
+    if (pool.length >= 250 && editIdx===null) return toast("Pool is full (250). Delete some first.","error");
     const q = {id:Date.now(), q:form.q.trim(), options:form.options.map(o=>o.trim()), ans:form.ans, cat:form.cat};
     let np;
-    if (editIdx!==null) { np=pool.map((p,i)=>i===editIdx?q:p); toast("✏️ Question updated","success"); setEditIdx(null); }
-    else { np=[...pool,q]; toast(`➕ Question added to pool (${np.length}/250)`,"success"); }
+    if (editIdx!==null) { np=pool.map((p,i)=>i===editIdx?q:p); setEditIdx(null); }
+    else { np=[...pool,q]; }
     save(np);
     setForm({q:"",options:["","","",""],ans:0,cat:"General"});
   };
 
-  const parsePaste = () => {
-    const blocks = pasteText.trim().split(/\n\s*\n+/).filter(b=>b.trim());
-    const ansLines = pasteAnswers.trim().split("\n").map(l=>l.trim()).filter(Boolean);
-    const items = blocks.map((block,idx)=>{
-      const lines=block.split("\n").map(l=>l.trim()).filter(Boolean);
-      let q="",options=["","","",""],ans=0;
-      lines.forEach(line=>{
-        const am=line.match(/^(?:ANS|ANSWER)[.:)]\s*([A-Da-d])/i);
-        if(am){ans="ABCD".indexOf(am[1].toUpperCase());if(ans<0)ans=0;return;}
-        const m=line.match(/^([QqAaBbCcDd])[.):\s]\s*(.+)$/);
-        if(m){const L=m[1].toUpperCase();if(L==="Q")q=m[2];else if(L==="A")options[0]=m[2];else if(L==="B")options[1]=m[2];else if(L==="C")options[2]=m[2];else if(L==="D")options[3]=m[2];}
-        else if(!q) q=line.replace(/^\d+[.)]\s*/,"");
-      });
-      if(ansLines[idx]){const a="ABCD".indexOf(ansLines[idx][0]?.toUpperCase());if(a>=0)ans=a;}
-      return {id:Date.now()+idx,q:q.trim(),options,ans,cat:"General"};
-    }).filter(i=>i.q&&i.options.some(o=>o));
-    setParsedQ(items);
-    if(!items.length) toast("No questions parsed","error");
-    else toast(`✅ ${items.length} parsed!`,"success");
+  const doParse = () => {
+    const items = robustParseQuestions(pasteText, pasteAnswers);
+    const remaining = 250 - pool.length;
+    const capped = items.slice(0, remaining);
+    setParsedQ(capped);
+    setPreviewPage(0);
+    if (!capped.length) toast("No questions parsed — check format below","error");
+    else toast(
+      `✅ ${capped.length} question${capped.length!==1?"s":""} parsed!`
+      + (items.length > capped.length ? ` (${items.length-capped.length} skipped — would exceed 250)` : ""),
+      "success"
+    );
   };
 
-  const importParsed = () => {
+  const importParsed = async () => {
     if (!parsedQ.length) return;
-    const newPool = [...pool,...parsedQ];
-    save(newPool);
-    setParsedQ([]); setPasteText(""); setPasteAnswers("");
-    toast(`✅ ${parsedQ.length} questions added! Pool now has ${newPool.length}/250`,"success");
+    const newPool = [...pool, ...parsedQ];
+    await save(newPool);
+    setParsedQ([]); setPasteText(""); setPasteAnswers(""); setPreviewPage(0);
   };
 
   const deleteOne = (i) => {
     if (!confirm("Delete this question?")) return;
-    save(pool.filter((_,idx)=>idx!==i));
-    if(editIdx===i) { setEditIdx(null); setForm({q:"",options:["","","",""],ans:0,cat:"General"}); }
-    toast("Deleted","success");
+    const np = pool.filter((_,idx)=>idx!==i);
+    save(np);
+    if(editIdx===i){ setEditIdx(null); setForm({q:"",options:["","","",""],ans:0,cat:"General"}); }
   };
 
   const deleteAll = () => {
-    if (!confirm(`Delete ALL ${pool.length} questions from the daily mock pool? This cannot be undone.`)) return;
+    if (!confirm(`Delete ALL ${pool.length} questions? This cannot be undone.`)) return;
     save([]);
-    toast("🗑️ All questions deleted","success");
   };
+
+  const pct = Math.min(100, Math.round((pool.length/250)*100));
+  const barColor = pool.length>=250 ? "#ef4444" : pool.length>=200 ? "#fb923c" : "#4a7a2e";
+
+  // Paginated preview
+  const previewPages = Math.ceil(parsedQ.length / PREVIEW_PER_PAGE);
+  const previewSlice = parsedQ.slice(previewPage*PREVIEW_PER_PAGE, (previewPage+1)*PREVIEW_PER_PAGE);
 
   return (
     <div>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4,flexWrap:"wrap",gap:8}}>
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8,flexWrap:"wrap",gap:8}}>
         <div>
           <div style={{fontWeight:800,fontSize:15,color:"#4a7a2e"}}>📅 Daily Mock Question Pool</div>
           <div style={{fontSize:12,color:"var(--text3)",marginTop:2}}>
-            {pool.length}/250 question{pool.length!==1?"s":""} in pool · up to 250 are used per mock
+            {pool.length}/250 questions
+            {saving&&<span style={{color:"#4a7a2e",marginLeft:8,fontWeight:700}}>⏳ Saving to cloud…</span>}
           </div>
         </div>
-        {pool.length>0&&(
-          <button className="btn btn-sm btn-danger" onClick={deleteAll}>🗑️ Delete All</button>
-        )}
+        {pool.length>0&&<button className="btn btn-sm btn-danger" onClick={deleteAll}>🗑️ Delete All</button>}
       </div>
 
-      {/* Mock Exam Title */}
+      {/* Capacity bar */}
+      <div style={{marginBottom:14}}>
+        <div style={{height:8,borderRadius:8,background:"var(--border)",overflow:"hidden"}}>
+          <div style={{height:"100%",borderRadius:8,background:barColor,width:`${pct}%`,transition:"width .4s"}}/>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"var(--text3)",marginTop:3}}>
+          <span style={{fontWeight:700,color:barColor}}>{pool.length} loaded</span>
+          <span>{250-pool.length} slots remaining</span>
+        </div>
+      </div>
+
+      {/* Exam title */}
       <div className="card2" style={{marginBottom:14,border:"1px solid #4a7a2e30",padding:"12px 16px"}}>
-        <div style={{fontWeight:800,fontSize:13,color:"#4a7a2e",marginBottom:8}}>🏷️ Mock Exam Title</div>
-        <div style={{fontSize:11,color:"var(--text3)",marginBottom:8}}>Give this mock exam a title so students know the type of exam (e.g. "Nursing Council Pre-Exam Mock", "Pharmacology Mock Test", "2025 General Mock").</div>
-        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+        <div style={{fontWeight:800,fontSize:13,color:"#4a7a2e",marginBottom:6}}>🏷️ Exam Title (shown to students)</div>
+        <div style={{display:"flex",gap:8}}>
           <input className="inp" style={{marginBottom:0,flex:1}} value={mockTitle}
             onChange={e=>setMockTitle(e.target.value)}
-            placeholder="e.g. Nursing Council Pre-Exam Mock · 2025" />
+            placeholder="e.g. Nursing Council Pre-Exam Mock 2025" />
           <button className="btn btn-accent" style={{background:"linear-gradient(135deg,#4a7a2e,#6aaa40)",border:"none",whiteSpace:"nowrap"}}
-            onClick={saveTitle}>💾 Save Title</button>
+            onClick={()=>save(pool,mockTitle)}>💾 Save</button>
         </div>
-        {mockTitle&&<div style={{marginTop:6,fontSize:11,color:"#4a7a2e",fontWeight:700}}>✓ Current title: "{mockTitle}"</div>}
+        {mockTitle&&<div style={{marginTop:5,fontSize:11,color:"#4a7a2e",fontWeight:700}}>✓ "{mockTitle}"</div>}
       </div>
 
       {/* Mode tabs */}
@@ -9100,7 +9249,7 @@ function AdminDailyMockManager({ toast }) {
           onClick={()=>{setMode("single");setEditIdx(null);setForm({q:"",options:["","","",""],ans:0,cat:"General"});}}>✏️ Single</button>
         <button className={`btn btn-sm${mode==="paste"?" btn-accent":""}`}
           style={mode==="paste"?{background:"#4a7a2e",border:"none"}:{}}
-          onClick={()=>setMode("paste")}>📋 Paste Multiple</button>
+          onClick={()=>setMode("paste")}>📋 Paste 250 Questions</button>
       </div>
 
       {/* Single form */}
@@ -9146,90 +9295,135 @@ function AdminDailyMockManager({ toast }) {
       {/* Paste form */}
       {mode==="paste"&&(
         <div className="card2" style={{marginBottom:14,border:"1px solid #4a7a2e30"}}>
-          <div style={{fontWeight:800,fontSize:13,color:"#4a7a2e",marginBottom:8}}>📋 Paste Multiple Questions</div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:8}}>
+          <div style={{fontWeight:800,fontSize:13,color:"#4a7a2e",marginBottom:4}}>📋 Paste Up to 250 Questions</div>
+          <div style={{fontSize:11,color:"var(--text3)",marginBottom:10,lineHeight:1.7,background:"var(--bg4)",borderRadius:8,padding:"8px 12px"}}>
+            <b>Supported formats (can mix):</b><br/>
+            <code>1. Question text</code> or <code>Q: Question text</code><br/>
+            <code>A. Option &nbsp; B. Option &nbsp; C. Option &nbsp; D. Option</code><br/>
+            <code>Answer: B</code> &nbsp;(inline) — OR use the Answers box on the right<br/>
+            Blank lines between questions are <b>optional</b> — parser handles both.
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 260px",gap:12,marginBottom:10}}>
             <div>
-              <div style={{fontSize:11,fontWeight:800,color:"#4a7a2e",marginBottom:4}}>📝 Questions</div>
-              <textarea className="paste-box" rows={12}
-                placeholder={"Q: Normal adult temp is:\nA: 35°C\nB: 36.1-37.2°C\nC: 38.5°C\nD: 40°C\n\nQ: Insulin is produced by:\nA: Alpha cells\nB: Beta cells\nC: Delta cells\nD: Acinar cells"}
-                value={pasteText} onChange={e=>{setPasteText(e.target.value);setParsedQ([]);}} />
+              <div style={{fontSize:11,fontWeight:800,color:"#4a7a2e",marginBottom:4}}>📝 Questions (paste all 250 here)</div>
+              <textarea className="paste-box" style={{minHeight:260,resize:"vertical"}}
+                placeholder={"1. What is the normal adult temperature?\nA. 35.0°C\nB. 36.1–37.2°C\nC. 38.5°C\nD. 40.0°C\nAnswer: B\n2. Which organ produces insulin?\nA. Liver\nB. Kidney\nC. Pancreas\nD. Spleen\nAnswer: C"}
+                value={pasteText} onChange={e=>{setPasteText(e.target.value);setParsedQ([]);setPreviewPage(0);}} />
             </div>
             <div>
-              <div style={{fontSize:11,fontWeight:800,color:"var(--success)",marginBottom:4}}>✅ Answers (A/B/C/D)</div>
-              <textarea className="paste-box" rows={12} placeholder={"B\nB"} style={{borderColor:"rgba(34,197,94,.35)"}}
-                value={pasteAnswers} onChange={e=>{setPasteAnswers(e.target.value);setParsedQ([]);}} />
+              <div style={{fontSize:11,fontWeight:800,color:"var(--success)",marginBottom:4}}>✅ Answer Key (optional)<br/><span style={{fontWeight:500,color:"var(--text3)"}}>One per line: A / B / C / D<br/>Only needed if answers aren't<br/>included in the questions box.</span></div>
+              <textarea className="paste-box" style={{minHeight:260,resize:"vertical",borderColor:"rgba(34,197,94,.35)"}}
+                placeholder={"B\nC\nA\n..."} style={{borderColor:"rgba(34,197,94,.35)",minHeight:260,resize:"vertical"}}
+                value={pasteAnswers} onChange={e=>{setPasteAnswers(e.target.value);setParsedQ([]);setPreviewPage(0);}} />
             </div>
           </div>
-          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-            <button className="btn btn-accent" style={{background:"linear-gradient(135deg,#4a7a2e,#6aaa40)",border:"none"}}
-              onClick={parsePaste}>🔍 Parse</button>
-            {parsedQ.length>0&&<button className="btn btn-success" onClick={importParsed}>✅ Add {parsedQ.length} to Pool</button>}
-            <button className="btn" onClick={()=>{setParsedQ([]);setPasteText("");setPasteAnswers("");}}>🗑️ Clear</button>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+            <button className="btn btn-accent" style={{background:"linear-gradient(135deg,#4a7a2e,#6aaa40)",border:"none",fontSize:14,padding:"10px 20px"}}
+              onClick={doParse}>🔍 Parse Questions</button>
+            {parsedQ.length>0&&(
+              <button className="btn btn-success" style={{fontSize:14,padding:"10px 20px"}}
+                onClick={importParsed} disabled={saving}>
+                {saving?"⏳ Saving…":`✅ Add ${parsedQ.length} to Pool`}
+              </button>
+            )}
+            <button className="btn" onClick={()=>{setParsedQ([]);setPasteText("");setPasteAnswers("");setPreviewPage(0);}}>🗑️ Clear</button>
           </div>
+
+          {/* Parsed preview — paginated so DOM doesn't freeze with 250 items */}
           {parsedQ.length>0&&(
-            <div style={{marginTop:10,border:"1px solid var(--success)",borderRadius:8,overflow:"hidden"}}>
-              <div style={{padding:"8px 14px",background:"rgba(34,197,94,.1)",fontSize:12,fontWeight:800,color:"var(--success)"}}>
-                ✓ {parsedQ.length} parsed — import below
-              </div>
-              {parsedQ.map((p,i)=>(
-                <div key={i} style={{padding:"8px 14px",borderTop:"1px solid var(--border)"}}>
-                  <div style={{fontWeight:700,fontSize:12,marginBottom:4}}>{i+1}. {p.q}</div>
-                  <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
-                    {p.options.filter(o=>o).map((opt,oi)=>(
-                      <span key={oi} style={{fontSize:11,padding:"2px 8px",borderRadius:5,
-                        background:oi===p.ans?"rgba(34,197,94,.15)":"var(--bg4)",
-                        border:`1px solid ${oi===p.ans?"var(--success)":"var(--border)"}`,
-                        color:oi===p.ans?"var(--success)":"var(--text3)",fontWeight:oi===p.ans?800:400
-                      }}>{"ABCD"[oi]}. {opt}{oi===p.ans?" ✓":""}</span>
-                    ))}
+            <div style={{marginTop:12,border:"1px solid var(--success)",borderRadius:8,overflow:"hidden"}}>
+              <div style={{padding:"10px 14px",background:"rgba(34,197,94,.1)",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+                <span style={{fontSize:13,fontWeight:800,color:"var(--success)"}}>✓ {parsedQ.length} questions parsed — review then click "Add to Pool"</span>
+                {previewPages>1&&(
+                  <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                    <button className="btn btn-sm" disabled={previewPage===0} onClick={()=>setPreviewPage(p=>p-1)}>← Prev</button>
+                    <span style={{fontSize:11,color:"var(--text3)"}}>Page {previewPage+1}/{previewPages}</span>
+                    <button className="btn btn-sm" disabled={previewPage>=previewPages-1} onClick={()=>setPreviewPage(p=>p+1)}>Next →</button>
                   </div>
-                </div>
-              ))}
+                )}
+              </div>
+              {previewSlice.map((p,i)=>{
+                const globalI = previewPage*PREVIEW_PER_PAGE + i;
+                return (
+                  <div key={globalI} style={{padding:"8px 14px",borderTop:"1px solid var(--border)"}}>
+                    <div style={{fontWeight:700,fontSize:12,marginBottom:4}}>{globalI+1}. {p.q}</div>
+                    <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                      {p.options.map((opt,oi)=> opt ? (
+                        <span key={oi} style={{fontSize:11,padding:"2px 8px",borderRadius:5,
+                          background:oi===p.ans?"rgba(34,197,94,.15)":"var(--bg4)",
+                          border:`1px solid ${oi===p.ans?"var(--success)":"var(--border)"}`,
+                          color:oi===p.ans?"var(--success)":"var(--text3)",fontWeight:oi===p.ans?800:400
+                        }}>{"ABCD"[oi]}. {opt}{oi===p.ans?" ✓":""}</span>
+                      ) : null)}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
       )}
 
-      {/* Pool list */}
-      <div style={{fontWeight:800,fontSize:13,marginBottom:10,color:"var(--text)"}}>
-        📋 Question Pool ({pool.length}/250)
-        {pool.length<20&&pool.length>0&&<span style={{fontSize:11,color:"var(--warn)",fontWeight:500,marginLeft:8}}>⚠️ Add at least 20 for daily rotation</span>}
-        {pool.length>=250&&<span style={{fontSize:11,color:"var(--danger)",fontWeight:500,marginLeft:8}}>⚠️ Pool is at maximum capacity (250)</span>}
-      </div>
+      {/* Pool list — also paginated */}
+      {pool.length>0&&(
+        <PoolList pool={pool} editIdx={editIdx} setForm={setForm} setEditIdx={setEditIdx} setMode={setMode} deleteOne={deleteOne} />
+      )}
       {pool.length===0&&(
         <div style={{textAlign:"center",padding:24,color:"var(--text3)",border:"1px dashed var(--border)",borderRadius:10,fontSize:13}}>
           No questions yet — add above.
         </div>
       )}
-      {pool.map((q,i)=>(
-        <div key={q.id||i} className="card2" style={{marginBottom:8,borderLeft:`3px solid ${i===editIdx?"#4a7a2e":"var(--border)"}`}}>
-          <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
-            <div style={{width:26,height:26,borderRadius:7,background:"rgba(74,122,46,.15)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800,color:"#4a7a2e",flexShrink:0}}>{i+1}</div>
-            <div style={{flex:1}}>
-              <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:5,flexWrap:"wrap"}}>
-                <div style={{fontWeight:700,fontSize:13,flex:1}}>{q.q}</div>
-                <span style={{fontSize:10,padding:"2px 7px",borderRadius:5,background:"rgba(74,122,46,.1)",color:"#2d4a1e",fontWeight:700,flexShrink:0}}>{q.cat}</span>
+    </div>
+  );
+}
+
+// Paginated pool list (prevents DOM overload with 250 items)
+function PoolList({ pool, editIdx, setForm, setEditIdx, setMode, deleteOne }) {
+  const [page, setPage] = useState(0);
+  const PER_PAGE = 25;
+  const pages = Math.ceil(pool.length / PER_PAGE);
+  const slice = pool.slice(page*PER_PAGE, (page+1)*PER_PAGE);
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,flexWrap:"wrap",gap:8}}>
+        <div style={{fontWeight:800,fontSize:13,color:"var(--text)"}}>📋 Question Pool ({pool.length}/250)</div>
+        {pages>1&&(
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            <button className="btn btn-sm" disabled={page===0} onClick={()=>setPage(p=>p-1)}>← Prev</button>
+            <span style={{fontSize:11,color:"var(--text3)"}}>Page {page+1}/{pages} · Q{page*PER_PAGE+1}–{Math.min((page+1)*PER_PAGE,pool.length)}</span>
+            <button className="btn btn-sm" disabled={page>=pages-1} onClick={()=>setPage(p=>p+1)}>Next →</button>
+          </div>
+        )}
+      </div>
+      {slice.map((q,i)=>{
+        const gi = page*PER_PAGE+i;
+        return (
+          <div key={q.id||gi} className="card2" style={{marginBottom:8,borderLeft:`3px solid ${gi===editIdx?"#4a7a2e":"var(--border)"}`}}>
+            <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+              <div style={{width:28,height:28,borderRadius:7,background:"rgba(74,122,46,.15)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800,color:"#4a7a2e",flexShrink:0}}>{gi+1}</div>
+              <div style={{flex:1}}>
+                <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:5,flexWrap:"wrap"}}>
+                  <div style={{fontWeight:700,fontSize:13,flex:1}}>{q.q}</div>
+                  <span style={{fontSize:10,padding:"2px 7px",borderRadius:5,background:"rgba(74,122,46,.1)",color:"#2d4a1e",fontWeight:700,flexShrink:0}}>{q.cat}</span>
+                </div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+                  {q.options.map((opt,oi)=> opt ? (
+                    <span key={oi} style={{fontSize:11,padding:"2px 9px",borderRadius:5,
+                      background:oi===q.ans?"rgba(34,197,94,.12)":"transparent",
+                      border:`1px solid ${oi===q.ans?"var(--success)":"var(--border)"}`,
+                      color:oi===q.ans?"var(--success)":"var(--text3)",fontWeight:oi===q.ans?800:400
+                    }}>{"ABCD"[oi]}. {opt}{oi===q.ans?" ✓":""}</span>
+                  ) : null)}
+                </div>
               </div>
-              <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
-                {q.options.filter(o=>o).map((opt,oi)=>(
-                  <span key={oi} style={{fontSize:11,padding:"2px 9px",borderRadius:5,
-                    background:oi===q.ans?"rgba(34,197,94,.12)":"transparent",
-                    border:`1px solid ${oi===q.ans?"var(--success)":"var(--border)"}`,
-                    color:oi===q.ans?"var(--success)":"var(--text3)",fontWeight:oi===q.ans?800:400
-                  }}>{"ABCD"[oi]}. {opt}{oi===q.ans?" ✓":""}</span>
-                ))}
+              <div style={{display:"flex",gap:4,flexShrink:0}}>
+                <button className="btn btn-sm" onClick={()=>{ setForm({q:q.q,options:[...q.options],ans:q.ans,cat:q.cat||"General"}); setEditIdx(gi); setMode("single"); }}>✏️</button>
+                <button className="btn btn-sm btn-danger" onClick={()=>deleteOne(gi)}>🗑️</button>
               </div>
-            </div>
-            <div style={{display:"flex",gap:4,flexShrink:0}}>
-              <button className="btn btn-sm" onClick={()=>{
-                setForm({q:q.q,options:[...q.options],ans:q.ans,cat:q.cat||"General"});
-                setEditIdx(i); setMode("single");
-              }}>✏️</button>
-              <button className="btn btn-sm btn-danger" onClick={()=>deleteOne(i)}>🗑️</button>
             </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -9428,21 +9622,23 @@ function NcArchiveView({ toast, currentUser }) {
 // ── Daily Mock Exam (questions from admin-managed synced pool) ─────────────
 function getDailyMockQuestions(pool) {
   if (!pool || pool.length === 0) return [];
+  // Serve ALL questions (up to 250) in a date-seeded shuffle
   const today = new Date();
   const seed = today.getFullYear()*10000 + (today.getMonth()+1)*100 + today.getDate();
   const count = Math.min(250, pool.length);
-  const shuffled = [...pool].sort((a,b)=>{
-    const ha = (seed * (pool.indexOf(a)+1)) % 997;
-    const hb = (seed * (pool.indexOf(b)+1)) % 997;
-    return ha - hb;
-  });
-  return shuffled.slice(0, count);
+  const arr = [...pool];
+  // Fisher-Yates with deterministic seed
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.abs((seed * (i + 1) * 2654435761) >> 0) % (i + 1);
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr.slice(0, count);
 }
 
 function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
   const isUnlockedFull = isAdmin || useNcAccess(currentUser);
   const [pool] = useSharedData("nv-daily-mock", []);
-  const [mockTitle] = useState(() => ls("nv-daily-mock-title", ""));
+  const mockTitle = ls("nv-daily-mock-title", "");
   const [archive, setArchive] = useSharedData("nv-nc-archive", []);
   const [phase, setPhase] = useState("intro");
   const [answers, setAnswers] = useState([]);
@@ -9513,11 +9709,8 @@ function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
     <div style={{maxWidth:600,margin:"0 auto"}}>
       <div className="nc-card" style={{textAlign:"center",padding:"32px 28px"}}>
         <div style={{fontSize:52,marginBottom:10}}>📅</div>
-        <div style={{fontWeight:800,fontSize:22,color:"#2d4a1e",marginBottom:4}}>
-          {mockTitle || "Daily Mock Exam"}
-        </div>
-        <div style={{fontSize:13,color:"#6b8a52",marginBottom:4}}>{today}</div>
-        <div style={{fontSize:12,color:"#6b8a52",marginBottom:20}}>{questions.length} Questions · Mixed Specialties</div>
+        <div style={{fontWeight:800,fontSize:22,color:"#2d4a1e",marginBottom:4}}>{mockTitle || "Daily Mock Exam"}</div>
+        <div style={{fontSize:13,color:"#6b8a52",marginBottom:20}}>{today} · {questions.length} Questions · Mixed Specialties</div>
         {!isUnlockedFull && (
           <div style={{padding:"8px 14px",borderRadius:9,marginBottom:16,background:"rgba(251,146,60,.1)",border:"1px solid rgba(251,146,60,.3)",fontSize:12,color:"#c05621",fontWeight:700,textAlign:"center"}}>
             ⚠️ Free preview: first {NC_MOCK_FREE_LIMIT} questions — enter a production code to unlock all {questions.length}
@@ -9551,8 +9744,7 @@ function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
       <div style={{maxWidth:640,margin:"0 auto"}}>
         <div className="nc-card" style={{textAlign:"center",marginBottom:20}}>
           <div style={{fontSize:48,marginBottom:6}}>{pct>=80?"🎉":pct>=60?"👍":"📚"}</div>
-          <div style={{fontWeight:800,fontSize:20,color:"#2d4a1e",marginBottom:2}}>{mockTitle || "Daily Mock"} — Complete!</div>
-          <div style={{fontSize:12,color:"#6b8a52",marginBottom:8}}>{today}</div>
+          <div style={{fontWeight:800,fontSize:20,color:"#2d4a1e",marginBottom:4}}>{mockTitle || "Daily Mock"} — Complete!</div>
           <div style={{fontWeight:800,fontSize:52,color:pct>=70?"#4a7a2e":pct>=50?"#c05621":"#991b1b",lineHeight:1}}>{score}/{questions.length}</div>
           <div style={{fontSize:16,color:"#6b8a52",marginBottom:10}}>{pct}% — {pct>=80?"Excellent":pct>=60?"Good Pass":pct>=40?"Borderline":"Needs Improvement"}</div>
           <div className="nc-progress-wrap" style={{maxWidth:300,margin:"0 auto 16px"}}>
@@ -9671,9 +9863,9 @@ function NcDashboard({ currentUser, onNavigate }) {
   const results = ls("nv-results",[]).filter(r=>r.type&&r.type.includes("NC"));
   const mockDone = results.some(r=>r.subject?.includes(new Date().toLocaleDateString()));
   const isUnlocked = useNcAccess(currentUser);
-  const mockTitle = ls("nv-daily-mock-title", "");
-  const pool = ls("nv-daily-mock", []);
-  const mockQCount = Math.min(250, pool.length);
+  const mockTitle = ls("nv-daily-mock-title","");
+  const mockPool  = ls("nv-daily-mock",[]);
+  const mockQCount = Math.min(250, mockPool.length);
   return (
     <div>
       <div style={{marginBottom:16}}>
@@ -9707,9 +9899,9 @@ function NcDashboard({ currentUser, onNavigate }) {
           <div style={{width:52,height:52,borderRadius:12,background:"linear-gradient(135deg,#4a7a2e,#7bc950)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:26}}>📅</div>
           <div style={{flex:1}}>
             <div style={{fontWeight:800,fontSize:16,color:"#2d4a1e",marginBottom:2}}>{mockTitle || "Daily Mock Exam"}</div>
-            <div style={{fontSize:12,color:"#6b8a52"}}>{mockQCount > 0 ? `${mockQCount} questions` : "No questions yet"} · Updates daily · {mockDone?"Completed ✅":"Not taken yet"}</div>
+            <div style={{fontSize:12,color:"#6b8a52"}}>{mockQCount>0?`${mockQCount} questions`:"No questions yet"} · Updates daily · {mockDone?"Completed ✅":"Not taken yet"}</div>
           </div>
-          {!mockDone&&pool.length>0&&<button className="nc-btn nc-btn-primary" style={{fontSize:13}} onClick={()=>onNavigate("daily")}>Start Now →</button>}
+          {!mockDone&&mockQCount>0&&<button className="nc-btn nc-btn-primary" style={{fontSize:13}} onClick={()=>onNavigate("daily")}>Start Now →</button>}
           {mockDone&&<span style={{fontSize:12,fontWeight:700,color:"#4a7a2e"}}>✅ Done for today!</span>}
         </div>
       </div>
