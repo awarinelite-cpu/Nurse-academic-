@@ -7487,233 +7487,300 @@ function MedCalc() {
 
 // ── VoiceCallModal ─────────────────────────────────────────────────────
 function VoiceCallModal({ user, peer, role, onEnd, toast }) {
-  const [status, setStatus]   = useState(role === "caller" ? "calling" : "incoming"); // calling|incoming|active|ended
+  const [status, setStatus]     = useState(role === "caller" ? "calling" : "incoming");
   const [duration, setDuration] = useState(0);
-  const [muted, setMuted]     = useState(false);
-  const [speakerOn, setSpeakerOn] = useState(true);
-  const pcRef        = useRef(null);
-  const localStream  = useRef(null);
-  const remoteAudio  = useRef(null);
-  const timerRef     = useRef(null);
-  const unsubRef     = useRef(null);
-  const appliedCallerIce = useRef(0); // track how many callerCandidates already applied
-  const appliedCalleeIce = useRef(0); // track how many calleeCandidates already applied
+  const [muted, setMuted]       = useState(false);
+  const [connState, setConnState] = useState(""); // for debug display
+
+  // Refs — never cause re-renders, safe to use inside async callbacks
+  const pcRef             = useRef(null);
+  const localStreamRef    = useRef(null);
+  const remoteAudioRef    = useRef(null);
+  const timerRef          = useRef(null);
+  const unsubRef          = useRef(null);
+  const appliedCalleeIce  = useRef(0);
+  const appliedCallerIce  = useRef(0);
+  const remoteDescSet     = useRef(false); // guard: only set remote desc once
+  const pendingCandidates = useRef([]);    // queue ICE candidates before remote desc is ready
 
   const allUsers = ls("nv-users", []);
-  const peerName = allUsers.find(u => u.username === peer)?.displayName || peer.split("@")[0];
+  const peerName   = allUsers.find(u => u.username === peer)?.displayName || peer.split("@")[0];
   const peerAvatar = (peerName[0] || "?").toUpperCase();
 
+  // ── Flush queued ICE candidates once remote desc is set ──────────
+  const flushPending = useCallback(async (pc) => {
+    for (const c of pendingCandidates.current) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
+    }
+    pendingCandidates.current = [];
+  }, []);
+
+  // ── Safely add a single ICE candidate ────────────────────────────
+  const safeAddIce = useCallback(async (pc, candidate) => {
+    if (!pc || pc.signalingState === "closed") return;
+    if (!remoteDescSet.current) {
+      pendingCandidates.current.push(candidate); // queue until remote desc ready
+      return;
+    }
+    try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch(e) {}
+  }, []);
+
+  // ── Cleanup everything ────────────────────────────────────────────
   const cleanup = useCallback(() => {
     clearInterval(timerRef.current);
-    if (pcRef.current) { try { pcRef.current.close(); } catch(e){} pcRef.current = null; }
-    if (localStream.current) { localStream.current.getTracks().forEach(t => t.stop()); localStream.current = null; }
-    if (unsubRef.current) { unsubRef.current(); unsubRef.current = null; }
+    if (unsubRef.current)    { unsubRef.current(); unsubRef.current = null; }
+    if (pcRef.current)       { try { pcRef.current.close(); } catch(e){} pcRef.current = null; }
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(t => t.stop());
+      localStreamRef.current = null;
+    }
+    remoteDescSet.current = false;
+    pendingCandidates.current = [];
   }, []);
 
   const hangUp = useCallback(async () => {
     cleanup();
     await callEnd(user, peer);
     setStatus("ended");
-    setTimeout(() => onEnd(), 1200);
+    setTimeout(() => onEnd(), 1500);
   }, [user, peer, cleanup, onEnd]);
 
-  // Set up WebRTC
+  // ── Build RTCPeerConnection + attach local audio ──────────────────
   const setupPC = useCallback(async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    localStream.current = stream;
+    // Request mic — echoCancellation + noiseSuppression improve call quality
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 48000 },
+      video: false,
+    });
+    localStreamRef.current = stream;
 
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
-      ]
+        { urls: "stun:stun2.l.google.com:19302" },
+        // Free TURN fallback so calls work behind symmetric NATs
+        { urls: "turn:openrelay.metered.ca:80",  username: "openrelayproject", credential: "openrelayproject" },
+        { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+      ],
     });
     pcRef.current = pc;
 
+    // Add local tracks BEFORE creating offer/answer
     stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
+    // ── Receive remote audio ──────────────────────────────────────
     pc.ontrack = (e) => {
-      if (remoteAudio.current) {
-        remoteAudio.current.srcObject = e.streams[0];
-        remoteAudio.current.play().catch(() => {});
+      const remoteStream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
+      if (remoteAudioRef.current) {
+        remoteAudioRef.current.srcObject = remoteStream;
+        // Must call play() explicitly — autoPlay alone is blocked on many browsers
+        const playPromise = remoteAudioRef.current.play();
+        if (playPromise) playPromise.catch(() => {
+          // Retry on next user gesture (browser autoplay policy)
+          const retry = () => {
+            remoteAudioRef.current && remoteAudioRef.current.play().catch(()=>{});
+            document.removeEventListener("click", retry);
+          };
+          document.addEventListener("click", retry);
+        });
       }
     };
 
+    // ── Send ICE candidates to Firestore ──────────────────────────
     pc.onicecandidate = async (e) => {
       if (e.candidate) {
-        const r = role === "caller" ? "caller" : "callee";
-        await callAddCandidate(user, peer, r, e.candidate.toJSON());
+        const myRole = role === "caller" ? "caller" : "callee";
+        await callAddCandidate(user, peer, myRole, e.candidate.toJSON());
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      const s = pc.connectionState;
+      setConnState(s);
+      if (s === "failed") {
+        toast("Call connection failed", "error");
+        hangUp();
       }
     };
 
     return pc;
-  }, [user, peer, role]);
+  }, [user, peer, role, hangUp, toast]);
 
-  // Caller flow: create offer
+  // ── CALLER: create offer ──────────────────────────────────────────
   const startCall = useCallback(async () => {
     try {
       const pc = await setupPC();
-      const offer = await pc.createOffer();
+      const offer = await pc.createOffer({ offerToReceiveAudio: true });
       await pc.setLocalDescription(offer);
-      await callSignal(user, peer, { caller: user, callee: peer, status: "ringing", offer: { type: offer.type, sdp: offer.sdp } });
 
-      // Listen for answer
+      await callSignal(user, peer, {
+        caller: user, callee: peer, status: "ringing",
+        offer: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+      });
+
       unsubRef.current = callSubscribe(user, peer, async (doc) => {
         if (doc.status === "rejected" || doc.status === "ended") {
-          cleanup(); setStatus("ended"); setTimeout(() => onEnd(), 1200); return;
+          cleanup(); setStatus("ended"); setTimeout(() => onEnd(), 1500); return;
         }
-        if (doc.answer && pc.remoteDescription === null) {
-          await pc.setRemoteDescription(new RTCSessionDescription(doc.answer));
-          setStatus("active");
-          timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
+        // Set remote description (answer) exactly once
+        if (doc.answer && !remoteDescSet.current && pc.signalingState !== "closed") {
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(doc.answer));
+            remoteDescSet.current = true;
+            await flushPending(pc);
+            setStatus("active");
+            timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
+          } catch(err) { console.warn("[Call] setRemoteDescription failed:", err.message); }
         }
+        // Apply any new callee ICE candidates
         if (doc.calleeCandidates) {
-          const newCandidates = doc.calleeCandidates.slice(appliedCalleeIce.current);
-          for (const c of newCandidates) {
-            try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
-          }
+          const fresh = doc.calleeCandidates.slice(appliedCalleeIce.current);
+          for (const c of fresh) await safeAddIce(pc, c);
           appliedCalleeIce.current = doc.calleeCandidates.length;
         }
       });
-    } catch(e) { toast("Microphone access denied", "error"); hangUp(); }
-  }, [setupPC, user, peer, cleanup, onEnd, hangUp, toast]);
+    } catch(e) {
+      console.error("[Call] startCall error:", e);
+      toast("Could not start call: " + (e.message || "mic denied"), "error");
+      hangUp();
+    }
+  }, [setupPC, user, peer, cleanup, onEnd, hangUp, toast, flushPending, safeAddIce]);
 
-  // Callee flow: answer
-  const answerCall = useCallback(async (offerData) => {
+  // ── CALLEE: answer call ───────────────────────────────────────────
+  const answerCall = useCallback(async () => {
     try {
       const pc = await setupPC();
+
+      // Fetch the offer fresh from Firestore
+      const cid  = _callId(user, peer);
+      const snap = await _db.collection("voice_calls").doc(cid).get();
+      if (!snap.exists || !snap.data().offer) {
+        toast("Call offer not found", "error"); hangUp(); return;
+      }
+      const offerData = snap.data().offer;
+
       await pc.setRemoteDescription(new RTCSessionDescription(offerData));
+      remoteDescSet.current = true;
+      await flushPending(pc);
+
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      await callSignal(user, peer, { status: "active", answer: { type: answer.type, sdp: answer.sdp } });
+
+      await callSignal(user, peer, {
+        status: "active",
+        answer: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+      });
+
       setStatus("active");
       timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
 
-      // Listen for end + caller ICE candidates
       unsubRef.current = callSubscribe(user, peer, async (doc) => {
-        if (doc.status === "ended") { cleanup(); setStatus("ended"); setTimeout(() => onEnd(), 1200); return; }
+        if (doc.status === "ended") { cleanup(); setStatus("ended"); setTimeout(() => onEnd(), 1500); return; }
         if (doc.callerCandidates) {
-          const newCandidates = doc.callerCandidates.slice(appliedCallerIce.current);
-          for (const c of newCandidates) {
-            try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
-          }
+          const fresh = doc.callerCandidates.slice(appliedCallerIce.current);
+          for (const c of fresh) await safeAddIce(pc, c);
           appliedCallerIce.current = doc.callerCandidates.length;
         }
       });
-    } catch(e) { toast("Microphone access denied", "error"); hangUp(); }
-  }, [setupPC, user, peer, cleanup, onEnd, hangUp, toast]);
+    } catch(e) {
+      console.error("[Call] answerCall error:", e);
+      toast("Could not answer call: " + (e.message || "mic denied"), "error");
+      hangUp();
+    }
+  }, [setupPC, user, peer, cleanup, onEnd, hangUp, toast, flushPending, safeAddIce]);
 
   const rejectCall = useCallback(async () => {
     await callSignal(user, peer, { status: "rejected" });
     cleanup(); onEnd();
   }, [user, peer, cleanup, onEnd]);
 
-  // Init on mount
+  // ── Mount: auto-start for caller ──────────────────────────────────
   useEffect(() => {
-    if (role === "caller") {
-      startCall();
-    }
-    // callee: no action on mount — wait for user to tap Answer (offer fetched then)
+    if (role === "caller") startCall();
     return () => cleanup();
-  }, []);
+  }, []); // eslint-disable-line
 
+  // ── Mute toggle ───────────────────────────────────────────────────
   const toggleMute = () => {
-    if (localStream.current) {
-      localStream.current.getAudioTracks().forEach(t => { t.enabled = !t.enabled; });
-      setMuted(m => !m);
+    if (localStreamRef.current) {
+      const enabled = muted; // flipping: if currently muted, we want to enable
+      localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = enabled; });
+      setMuted(!enabled);
     }
   };
 
-  const fmtDur = (s) => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+  const fmtDur = (s) => String(Math.floor(s/60)).padStart(2,"0") + ":" + String(s%60).padStart(2,"0");
 
   const statusColors = { calling:"#f59e0b", incoming:"#3b82f6", active:"#22c55e", ended:"#6b7280" };
-  const statusLabel  = { calling:"Calling…", incoming:"Incoming Call", active:fmtDur(duration), ended:"Call Ended" };
+  const statusLabel  = {
+    calling:  "Calling…",
+    incoming: "Incoming Call",
+    active:   fmtDur(duration) + (connState === "connecting" ? " (connecting…)" : ""),
+    ended:    "Call Ended",
+  };
 
   return (
     <div style={{ position:"fixed", inset:0, zIndex:9999, display:"flex", alignItems:"center", justifyContent:"center", background:"rgba(0,0,0,.65)", backdropFilter:"blur(8px)" }}>
-      <audio ref={remoteAudio} autoPlay playsInline style={{ display:"none" }} />
+      {/* Hidden audio element — plays remote peer's voice */}
+      <audio ref={remoteAudioRef} autoPlay playsInline style={{ display:"none" }} />
+
       <div style={{ background:"var(--card)", borderRadius:24, padding:"36px 32px", minWidth:300, maxWidth:360, width:"90vw", textAlign:"center", boxShadow:"0 24px 64px rgba(0,0,0,.4)", border:"1.5px solid var(--border)", position:"relative" }}>
 
-        {/* Pulse ring for ringing/calling */}
         {(status === "calling" || status === "incoming") && (
-          <div style={{ position:"absolute", inset:0, borderRadius:24, border:`2px solid ${statusColors[status]}`, animation:"callPulse 1.4s ease-out infinite", opacity:0.5, pointerEvents:"none" }} />
+          <div style={{ position:"absolute", inset:0, borderRadius:24, border:"2px solid " + statusColors[status], animation:"callPulse 1.4s ease-out infinite", opacity:0.5, pointerEvents:"none" }} />
         )}
 
-        {/* Avatar */}
-        <div style={{ width:80, height:80, borderRadius:"50%", background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:32, fontWeight:800, color:"white", margin:"0 auto 16px", boxShadow:`0 0 0 4px ${statusColors[status]}40` }}>
+        <div style={{ width:80, height:80, borderRadius:"50%", background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:32, fontWeight:800, color:"white", margin:"0 auto 16px", boxShadow:"0 0 0 4px " + statusColors[status] + "40" }}>
           {peerAvatar}
         </div>
 
         <div style={{ fontWeight:800, fontSize:20, color:"var(--text)", marginBottom:6 }}>{peerName}</div>
-        <div style={{ fontSize:13, fontWeight:700, color: statusColors[status], marginBottom:28, fontFamily:"'DM Mono',monospace" }}>
+        <div style={{ fontSize:13, fontWeight:700, color:statusColors[status], marginBottom:28, fontFamily:"'DM Mono',monospace" }}>
           {statusLabel[status]}
         </div>
 
-        {/* Buttons */}
-        {status === "incoming" ? (
+        {status === "incoming" && (
           <div style={{ display:"flex", justifyContent:"center", gap:28 }}>
-            {/* Reject */}
             <div style={{ textAlign:"center" }}>
-              <button onClick={rejectCall} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 8px", boxShadow:"0 4px 16px rgba(239,68,68,.4)", transition:"transform .15s" }}
-                onMouseEnter={e=>e.currentTarget.style.transform="scale(1.08)"} onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
-                📵
-              </button>
+              <button onClick={rejectCall} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 8px", boxShadow:"0 4px 16px rgba(239,68,68,.4)" }}>📵</button>
               <div style={{ fontSize:11, color:"var(--text3)", fontWeight:700 }}>Decline</div>
             </div>
-            {/* Answer */}
             <div style={{ textAlign:"center" }}>
-              <button onClick={() => {
-                if (_db) {
-                  const cid = _callId(user, peer);
-                  _db.collection("voice_calls").doc(cid).get().then(snap => {
-                    if (snap.exists) answerCall(snap.data().offer);
-                  });
-                }
-              }} style={{ width:60, height:60, borderRadius:"50%", background:"#22c55e", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 8px", boxShadow:"0 4px 16px rgba(34,197,94,.4)", transition:"transform .15s" }}
-                onMouseEnter={e=>e.currentTarget.style.transform="scale(1.08)"} onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
-                📞
-              </button>
+              <button onClick={answerCall} style={{ width:60, height:60, borderRadius:"50%", background:"#22c55e", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 8px", boxShadow:"0 4px 16px rgba(34,197,94,.4)" }}>📞</button>
               <div style={{ fontSize:11, color:"var(--text3)", fontWeight:700 }}>Answer</div>
             </div>
           </div>
-        ) : status === "active" ? (
+        )}
+
+        {status === "active" && (
           <div style={{ display:"flex", justifyContent:"center", gap:20 }}>
-            {/* Mute */}
             <div style={{ textAlign:"center" }}>
-              <button onClick={toggleMute} style={{ width:50, height:50, borderRadius:"50%", background: muted ? "var(--danger)" : "var(--bg4)", border:"1.5px solid var(--border)", cursor:"pointer", fontSize:20, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", transition:"all .15s" }}>
+              <button onClick={toggleMute} style={{ width:50, height:50, borderRadius:"50%", background:muted ? "var(--danger)" : "var(--bg4)", border:"1.5px solid var(--border)", cursor:"pointer", fontSize:20, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px" }}>
                 {muted ? "🔇" : "🎙️"}
               </button>
               <div style={{ fontSize:10, color:"var(--text3)", fontWeight:700 }}>{muted ? "Unmute" : "Mute"}</div>
             </div>
-            {/* End */}
             <div style={{ textAlign:"center" }}>
-              <button onClick={hangUp} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", boxShadow:"0 4px 16px rgba(239,68,68,.4)", transition:"transform .15s" }}
-                onMouseEnter={e=>e.currentTarget.style.transform="scale(1.08)"} onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
-                📵
-              </button>
+              <button onClick={hangUp} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", boxShadow:"0 4px 16px rgba(239,68,68,.4)" }}>📵</button>
               <div style={{ fontSize:10, color:"var(--text3)", fontWeight:700 }}>End Call</div>
             </div>
-            {/* Speaker */}
-            <div style={{ textAlign:"center" }}>
-              <button onClick={() => setSpeakerOn(s => !s)} style={{ width:50, height:50, borderRadius:"50%", background: speakerOn ? "var(--bg4)" : "var(--bg3)", border:"1.5px solid var(--border)", cursor:"pointer", fontSize:20, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", transition:"all .15s" }}>
-                {speakerOn ? "🔊" : "🔕"}
-              </button>
-              <div style={{ fontSize:10, color:"var(--text3)", fontWeight:700 }}>{speakerOn ? "Speaker" : "Quiet"}</div>
-            </div>
           </div>
-        ) : status === "calling" ? (
-          <button onClick={hangUp} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto", boxShadow:"0 4px 16px rgba(239,68,68,.4)" }}>
-            📵
-          </button>
-        ) : (
+        )}
+
+        {status === "calling" && (
+          <button onClick={hangUp} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto", boxShadow:"0 4px 16px rgba(239,68,68,.4)" }}>📵</button>
+        )}
+
+        {status === "ended" && (
           <div style={{ color:"var(--text3)", fontSize:13 }}>Call ended</div>
         )}
       </div>
       <style>{`
         @keyframes callPulse {
-          0%  { transform:scale(1);   opacity:.5; }
-          70% { transform:scale(1.08);opacity:0;  }
-          100%{ transform:scale(1.08);opacity:0;  }
+          0%   { transform:scale(1);    opacity:.5; }
+          70%  { transform:scale(1.08); opacity:0;  }
+          100% { transform:scale(1.08); opacity:0;  }
         }
       `}</style>
     </div>
