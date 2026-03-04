@@ -4,6 +4,14 @@ import React, { useState, useEffect, useCallback, useRef, Fragment } from "react
 // ─── EMAILJS CONFIG ──────────────────────────────────────────────────
 // EmailJS free tier: 200 emails/month — sign up at https://www.emailjs.com
 // Fill in your own IDs below after creating a free account:
+// ── PWA: capture install prompt as early as possible ──
+let _pwaPrompt = null;
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();
+  _pwaPrompt = e;
+  window.dispatchEvent(new Event("pwa-prompt-ready"));
+});
+
 const EMAILJS_PUBLIC_KEY  = "PDEu7sKFo4tLDnn0x";
 const EMAILJS_SERVICE_ID  = "service_jqh2a8i";
 const EMAILJS_TEMPLATE_ID = "template_60264xt";
@@ -3881,6 +3889,165 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
 // ═══════════════════════════════════════════════════════════════════════
 const AVATAR_EMOJIS = ["👩‍⚕️","👨‍⚕️","🧑‍⚕️","👩‍🎓","👨‍🎓","🧑‍🎓","👩‍💼","👨‍💼","🌟","🏆","💡","🦋","🌺","🎯","🩺","🧬","💊","🏥"];
 const YEAR_OPTIONS = ["Year 1","Year 2","Year 3","Year 4","Year 5","Postgraduate","Intern","Other"];
+
+
+// ─── PWA Install Banner ───────────────────────────────────────────────
+// Shows on every login until the user installs the app.
+// No snooze/dismiss memory - only hides once installed or user taps X for this session.
+function PWAInstallBanner({ show }) {
+  const [visible, setVisible] = useState(false);
+  const [installing, setInstalling] = useState(false);
+  const [installed, setInstalled] = useState(false);
+  const [isIOS, setIsIOS] = useState(false);
+
+  useEffect(() => {
+    if (!show) { setVisible(false); return; }
+
+    // Already running as installed PWA - never show
+    const isStandalone =
+      window.matchMedia("(display-mode: standalone)").matches ||
+      window.navigator.standalone === true;
+    if (isStandalone) return;
+
+    const ios = /iphone|ipad|ipod/i.test(navigator.userAgent) && !window.MSStream;
+    setIsIOS(ios);
+
+    if (ios) {
+      // iOS: show manual instructions immediately
+      setTimeout(() => setVisible(true), 1800);
+      return;
+    }
+
+    // Android/Desktop: wait for browser install prompt
+    if (_pwaPrompt) {
+      setTimeout(() => setVisible(true), 1800);
+    } else {
+      const onReady = () => setTimeout(() => setVisible(true), 1800);
+      window.addEventListener("pwa-prompt-ready", onReady, { once: true });
+      return () => window.removeEventListener("pwa-prompt-ready", onReady);
+    }
+  }, [show]);
+
+  const handleInstall = async () => {
+    if (!_pwaPrompt) return;
+    setInstalling(true);
+    try {
+      await _pwaPrompt.prompt();
+      const { outcome } = await _pwaPrompt.userChoice;
+      if (outcome === "accepted") {
+        setInstalled(true);
+        _pwaPrompt = null;
+        setTimeout(() => setVisible(false), 2800);
+      }
+    } catch {}
+    setInstalling(false);
+  };
+
+  const dismiss = () => setVisible(false); // session-only dismiss, reappears next login
+
+  if (!visible) return null;
+
+  return (
+    <div style={{
+      position:"fixed", bottom:20, left:"50%", transform:"translateX(-50%)",
+      zIndex:99999, width:"min(430px,calc(100vw - 28px))",
+      background:"linear-gradient(135deg,#0077b6 0%,#00b4d8 100%)",
+      borderRadius:22, boxShadow:"0 10px 48px rgba(0,100,160,.5)",
+      padding:"20px 20px 18px", color:"white",
+      animation:"pwa-up .45s cubic-bezier(.34,1.56,.64,1) both",
+    }}>
+      <style>{`
+        @keyframes pwa-up {
+          from{opacity:0;transform:translateX(-50%) translateY(40px)}
+          to  {opacity:1;transform:translateX(-50%) translateY(0)}
+        }
+      `}</style>
+
+      {/* Close (session-only) */}
+      {!installed && (
+        <button onClick={dismiss} style={{
+          position:"absolute",top:12,right:14,background:"rgba(255,255,255,.18)",
+          border:"none",color:"white",width:28,height:28,borderRadius:"50%",
+          fontSize:14,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",
+          fontWeight:700,lineHeight:1,
+        }}>✕</button>
+      )}
+
+      {installed ? (
+        <div style={{textAlign:"center",padding:"10px 0 6px"}}>
+          <div style={{fontSize:42,marginBottom:8}}>🎉</div>
+          <div style={{fontWeight:800,fontSize:17,marginBottom:4}}>App installed!</div>
+          <div style={{fontSize:13,opacity:.88}}>Launch Nursing Hub from your home screen anytime.</div>
+        </div>
+      ) : (
+        <>
+          {/* Header row */}
+          <div style={{display:"flex",alignItems:"center",gap:14,marginBottom:14,paddingRight:20}}>
+            <div style={{
+              width:54,height:54,borderRadius:15,flexShrink:0,
+              background:"rgba(255,255,255,.2)",border:"2px solid rgba(255,255,255,.35)",
+              display:"flex",alignItems:"center",justifyContent:"center",fontSize:30,
+            }}>🏥</div>
+            <div>
+              <div style={{fontWeight:800,fontSize:16,marginBottom:3}}>Install Nursing Hub</div>
+              <div style={{fontSize:12.5,opacity:.9,lineHeight:1.5}}>
+                {isIOS
+                  ? "Add to your home screen for the best experience."
+                  : "Works offline · Faster · Feels like a native app."}
+              </div>
+            </div>
+          </div>
+
+          {isIOS ? (
+            <div style={{
+              background:"rgba(255,255,255,.18)",borderRadius:13,
+              padding:"12px 15px",marginBottom:14,
+              display:"flex",alignItems:"center",gap:12,fontSize:13,
+            }}>
+              <span style={{fontSize:22,flexShrink:0}}>📤</span>
+              <div>Tap <strong>Share</strong> <span style={{opacity:.8}}>(</span>⎙<span style={{opacity:.8}}>)</span> → <strong>Add to Home Screen</strong> → <strong>Add</strong></div>
+            </div>
+          ) : (
+            <div style={{display:"flex",gap:7,marginBottom:14,flexWrap:"wrap"}}>
+              {["⚡ Offline access","📲 Home screen","🔔 Notifications","🚀 Faster load"].map(f=>(
+                <span key={f} style={{
+                  background:"rgba(255,255,255,.17)",borderRadius:20,
+                  padding:"4px 11px",fontSize:11,fontWeight:700,
+                }}>{f}</span>
+              ))}
+            </div>
+          )}
+
+          <div style={{display:"flex",gap:10}}>
+            {!isIOS && (
+              <button onClick={handleInstall} disabled={installing} style={{
+                flex:1,padding:"12px 0",borderRadius:13,border:"none",
+                background:"white",color:"#0077b6",fontWeight:800,fontSize:14,
+                cursor:installing?"wait":"pointer",opacity:installing?.75:1,
+                transition:"opacity .2s, transform .15s",
+                boxShadow:"0 4px 16px rgba(0,0,0,.12)",
+              }}>
+                {installing ? "Installing…" : "📲 Install App"}
+              </button>
+            )}
+            <button onClick={dismiss} style={{
+              padding:"12px 18px",borderRadius:13,
+              border:"1.5px solid rgba(255,255,255,.4)",
+              background:"transparent",color:"white",fontWeight:700,fontSize:13,
+              cursor:"pointer",flexShrink:0,transition:"background .2s",
+            }}>
+              {isIOS ? "Got it" : "Later"}
+            </button>
+          </div>
+
+          <div style={{textAlign:"center",marginTop:10,fontSize:11,opacity:.65}}>
+            This reminder will appear each login until you install the app.
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 function StudentProfile({ currentUser, toast }) {
   const [users, setUsers] = useSharedData("nv-users", []);
@@ -14142,6 +14309,7 @@ self.addEventListener('notificationclick', e => {
   const [bypassPin,     setBypassPin]     = useState(false);  // user chose "use password"
   // Offline indicator
   const [isOffline, setIsOffline] = useState(!navigator.onLine);
+  const [showPWABanner, setShowPWABanner] = useState(false);
   // Forgot password states
   const [forgotMode, setForgotMode] = useState(false); // false | "email" | "code"
   const [forgotEmail, setForgotEmail] = useState("");
@@ -14364,6 +14532,7 @@ self.addEventListener('notificationclick', e => {
       setPage("app");
       toast(`Welcome back! 👋`, "success");
       saveCredential(username, password);
+      setShowPWABanner(true);
       // Show PIN setup if not yet configured and not skipped
       if (!getSavedPin(username) && !hasBiometric(username) && !ls("nv-pin-skipped-" + username.replace(/[^a-z0-9]/gi,"_"))) {
         setTimeout(() => setShowPinSetup(true), 1200);
@@ -14390,6 +14559,7 @@ self.addEventListener('notificationclick', e => {
       setPage("app");
       toast(`Welcome back! 👋`, "success");
       saveCredential(username, password);
+      setShowPWABanner(true);
       if (!getSavedPin(username) && !hasBiometric(username) && !ls("nv-pin-skipped-" + username.replace(/[^a-z0-9]/gi,"_"))) {
         setTimeout(() => setShowPinSetup(true), 1200);
       }
@@ -14417,6 +14587,7 @@ self.addEventListener('notificationclick', e => {
     setPage("app");
     toast(`Welcome, ${regName.trim().split(" ")[0]}! 🎉`, "success");
     saveCredential(regUser, regPw);
+    setShowPWABanner(true);
     setTimeout(() => setShowPinSetup(true), 1500);
   };
 
@@ -14626,6 +14797,7 @@ self.addEventListener('notificationclick', e => {
         </div>
       </div>
       <Toasts list={toasts} />
+      <PWAInstallBanner show={showPWABanner} />
     </>
   );
 
@@ -14750,7 +14922,7 @@ self.addEventListener('notificationclick', e => {
             <div className="nav-item" style={{color:"#7bc950",background:"rgba(90,158,53,.15)",borderRadius:9,marginBottom:4}} onClick={switchToNursing}>
               <span className="nav-icon">🏛️</span>NC Exam Centre
             </div>
-            <div className="nav-item" style={{color:"var(--danger)",marginBottom:12}} onClick={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);setNavHistory([]);}}>
+            <div className="nav-item" style={{color:"var(--danger)",marginBottom:12}} onClick={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);setNavHistory([]);setShowPWABanner(false);}}>
               <span className="nav-icon">🚪</span>Sign Out
             </div>
 
@@ -14831,6 +15003,7 @@ self.addEventListener('notificationclick', e => {
         </div>
       </div>
       <Toasts list={toasts} />
+      <PWAInstallBanner show={showPWABanner} />
     </>
   );
 }
