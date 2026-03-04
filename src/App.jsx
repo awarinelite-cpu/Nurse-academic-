@@ -12724,26 +12724,27 @@ function ResearchRequestPage({ currentUser, toast }) {
 
   // ── Detail modal ──
   if (selected) {
-    const s = RR_STATUSES[selected.status] || RR_STATUSES.pending;
+    const live = requests.find(r => r.id === selected.id) || selected;
+    const s = RR_STATUSES[live.status] || RR_STATUSES.pending;
     return (
       <div style={{maxWidth:600,margin:"0 auto",paddingBottom:40}}>
         <button onClick={()=>setSelected(null)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--accent)",fontWeight:700,fontSize:13,marginBottom:16,padding:0}}>← Back to My Requests</button>
         <div style={{background:"var(--card)",border:`2px solid ${s.color}44`,borderRadius:18,padding:24}}>
           <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:16,gap:12,flexWrap:"wrap"}}>
             <div>
-              <div style={{fontWeight:900,fontSize:17,color:"var(--text)",marginBottom:6}}>{selected.topic}</div>
-              <StatusBadge status={selected.status} />
+              <div style={{fontWeight:900,fontSize:17,color:"var(--text)",marginBottom:6}}>{live.topic}</div>
+              <StatusBadge status={live.status} />
             </div>
-            <div style={{fontSize:11,color:"var(--text3)"}}>Submitted {new Date(selected.createdAt).toLocaleDateString()}</div>
+            <div style={{fontSize:11,color:"var(--text3)"}}>Submitted {new Date(live.createdAt).toLocaleDateString()}</div>
           </div>
 
           {/* Details grid */}
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
             {[
-              ["Programme/Level", selected.level],
-              ["Deadline", selected.deadline ? new Date(selected.deadline).toLocaleDateString() : "—"],
-              ["Phone", selected.phone],
-              ["Matric No.", selected.matricNumber],
+              ["Programme/Level", live.level],
+              ["Deadline", live.deadline ? new Date(live.deadline).toLocaleDateString() : "—"],
+              ["Phone", live.phone],
+              ["Matric No.", live.matricNumber],
             ].map(([k,v])=>(
               <div key={k} style={{background:"var(--bg4)",borderRadius:10,padding:"10px 14px"}}>
                 <div style={{fontSize:10,color:"var(--text3)",fontWeight:700,textTransform:"uppercase",marginBottom:3}}>{k}</div>
@@ -12752,76 +12753,100 @@ function ResearchRequestPage({ currentUser, toast }) {
             ))}
           </div>
 
-          {selected.notes && (
+          {live.notes && (
             <div style={{background:"var(--bg4)",borderRadius:10,padding:"12px 14px",marginBottom:16}}>
               <div style={{fontSize:10,color:"var(--text3)",fontWeight:700,textTransform:"uppercase",marginBottom:3}}>Additional Notes</div>
-              <div style={{fontSize:13,fontWeight:700}}>{selected.notes}</div>
+              <div style={{fontSize:13,fontWeight:700}}>{live.notes}</div>
             </div>
           )}
 
           {/* Quote section */}
-          {selected.price && (
-            <div style={{
-              background:"linear-gradient(135deg,rgba(59,130,246,.12),rgba(139,92,246,.08))",
-              border:"1.5px solid rgba(59,130,246,.3)",
-              borderRadius:14, padding:"16px 18px", marginBottom:16
-            }}>
-              <div style={{fontWeight:900,fontSize:15,color:"#3b82f6",marginBottom:6}}>💰 Admin Quote</div>
-              <div style={{fontWeight:900,fontSize:28,color:"var(--text)",marginBottom:6}}>₦{Number(selected.price).toLocaleString()}</div>
-              {selected.adminNote && <div style={{fontSize:13,color:"var(--text2)",fontWeight:700}}>{selected.adminNote}</div>}
-
-              {selected.status === "quoted" && (
-                <div style={{display:"flex",gap:10,marginTop:14,flexWrap:"wrap"}}>
-                  <button
-                    onClick={()=>acceptQuote(selected)}
-                    disabled={accepting}
-                    style={{flex:1,padding:"12px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14}}
-                  >{accepting?"⏳ Accepting…":"✅ Accept Quote"}</button>
-                  <button
-                    onClick={()=>declineQuote(selected)}
-                    style={{padding:"12px 20px",borderRadius:10,background:"rgba(239,68,68,.1)",color:"var(--danger)",border:"1px solid rgba(239,68,68,.3)",cursor:"pointer",fontWeight:700}}
-                  >❌ Decline</button>
+          {(() => {
+            // Always pull live data so admin quote shows up immediately
+            const live = requests.find(r => r.id === selected.id) || selected;
+            return (<>
+              {/* Quote section — shown as soon as admin sets a price */}
+              {live.price ? (
+                <div style={{
+                  background:"linear-gradient(135deg,rgba(59,130,246,.12),rgba(139,92,246,.08))",
+                  border:"1.5px solid rgba(59,130,246,.3)",
+                  borderRadius:14, padding:"16px 18px", marginBottom:16
+                }}>
+                  <div style={{fontWeight:900,fontSize:15,color:"#3b82f6",marginBottom:6}}>💰 Admin Quote</div>
+                  <div style={{fontWeight:900,fontSize:28,color:"var(--text)",marginBottom:6}}>₦{Number(live.price).toLocaleString()}</div>
+                  {live.adminNote && (
+                    <div style={{
+                      background:"rgba(59,130,246,.08)",borderRadius:10,
+                      padding:"10px 14px",marginBottom:10,
+                      fontSize:13,color:"var(--text)",fontWeight:600,
+                      borderLeft:"3px solid #3b82f6"
+                    }}>
+                      💬 <b>Message from Admin:</b> {live.adminNote}
+                    </div>
+                  )}
+                  {live.status === "quoted" && (
+                    <div style={{display:"flex",gap:10,marginTop:14,flexWrap:"wrap"}}>
+                      <button
+                        onClick={()=>acceptQuote(live)}
+                        disabled={accepting}
+                        style={{flex:1,padding:"12px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14}}
+                      >{accepting?"⏳ Accepting…":"✅ Accept Quote"}</button>
+                      <button
+                        onClick={()=>declineQuote(live)}
+                        style={{padding:"12px 20px",borderRadius:10,background:"rgba(239,68,68,.1)",color:"var(--danger)",border:"1px solid rgba(239,68,68,.3)",cursor:"pointer",fontWeight:700}}
+                      >❌ Decline</button>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{
+                  background:"rgba(245,158,11,.06)",border:"1.5px dashed rgba(245,158,11,.3)",
+                  borderRadius:14,padding:"16px 18px",marginBottom:16,textAlign:"center"
+                }}>
+                  <div style={{fontSize:24,marginBottom:6}}>⏳</div>
+                  <div style={{fontWeight:700,color:"var(--text3)",fontSize:13}}>Waiting for admin to send a quote…</div>
+                  <div style={{fontSize:11,color:"var(--text3)",marginTop:4}}>You'll see the price and message here once admin reviews your topic.</div>
                 </div>
               )}
-            </div>
-          )}
 
-          {/* Completed — download project */}
-          {selected.status === "completed" && selected.projectFile && (
-            <div style={{
-              background:"rgba(34,197,94,.08)",border:"1.5px solid rgba(34,197,94,.3)",
-              borderRadius:14,padding:"16px 18px",marginBottom:16,textAlign:"center"
-            }}>
-              <div style={{fontSize:32,marginBottom:8}}>🎉</div>
-              <div style={{fontWeight:900,fontSize:15,color:"var(--success)",marginBottom:4}}>Your project is ready!</div>
-              <a
-                href={selected.projectFile}
-                download={`${selected.topic.slice(0,30)}.pdf`}
-                style={{display:"inline-block",padding:"12px 28px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",fontWeight:800,fontSize:14,textDecoration:"none",marginTop:8}}
-              >📥 Download Project</a>
-            </div>
-          )}
-
-          {/* Status timeline */}
-          <div style={{marginTop:16}}>
-            <div style={{fontSize:11,color:"var(--text3)",fontWeight:700,textTransform:"uppercase",marginBottom:10}}>Request Timeline</div>
-            <div style={{display:"flex",flexDirection:"column",gap:6}}>
-              {[
-                ["pending","⏳","Request submitted",selected.createdAt],
-                selected.price ? ["quoted","💰","Quote sent by admin",selected.quotedAt] : null,
-                selected.acceptedAt ? ["accepted","✅","Quote accepted",selected.acceptedAt] : null,
-                selected.startedAt ? ["inprogress","🔄","Work started",selected.startedAt] : null,
-                selected.completedAt ? ["completed","🎉","Project completed",selected.completedAt] : null,
-                selected.declinedAt ? ["declined","❌","Declined",selected.declinedAt] : null,
-              ].filter(Boolean).map(([st,ic,lbl,ts])=>(
-                <div key={st} style={{display:"flex",alignItems:"center",gap:10}}>
-                  <div style={{width:26,height:26,borderRadius:"50%",background:(RR_STATUSES[st]||RR_STATUSES.pending).bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,flexShrink:0}}>{ic}</div>
-                  <div style={{flex:1,fontSize:12,fontWeight:700}}>{lbl}</div>
-                  <div style={{fontSize:11,color:"var(--text3)"}}>{ts?new Date(ts).toLocaleDateString():""}</div>
+              {/* Completed — download project */}
+              {live.status === "completed" && live.projectFile && (
+                <div style={{
+                  background:"rgba(34,197,94,.08)",border:"1.5px solid rgba(34,197,94,.3)",
+                  borderRadius:14,padding:"16px 18px",marginBottom:16,textAlign:"center"
+                }}>
+                  <div style={{fontSize:32,marginBottom:6}}>🎉</div>
+                  <div style={{fontWeight:900,fontSize:15,color:"var(--success)",marginBottom:4}}>Your project is ready!</div>
+                  <a
+                    href={live.projectFile}
+                    download={`${live.topic.slice(0,30)}.pdf`}
+                    style={{display:"inline-block",padding:"12px 28px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",fontWeight:800,fontSize:14,textDecoration:"none",marginTop:8}}
+                  >📥 Download Project</a>
                 </div>
-              ))}
-            </div>
-          </div>
+              )}
+
+              {/* Status timeline */}
+              <div style={{marginTop:16}}>
+                <div style={{fontSize:11,color:"var(--text3)",fontWeight:700,textTransform:"uppercase",marginBottom:10}}>Request Timeline</div>
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  {[
+                    ["pending","⏳","Request submitted",live.createdAt],
+                    live.price ? ["quoted","💰","Quote sent by admin",live.quotedAt] : null,
+                    live.acceptedAt ? ["accepted","✅","Quote accepted",live.acceptedAt] : null,
+                    live.startedAt ? ["inprogress","🔄","Work started",live.startedAt] : null,
+                    live.completedAt ? ["completed","🎉","Project completed",live.completedAt] : null,
+                    live.declinedAt ? ["declined","❌","Declined",live.declinedAt] : null,
+                  ].filter(Boolean).map(([st,ic,lbl,ts])=>(
+                    <div key={st} style={{display:"flex",alignItems:"center",gap:10}}>
+                      <div style={{width:28,height:28,borderRadius:"50%",background:(RR_STATUSES[st]||RR_STATUSES.pending).bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,flexShrink:0}}>{ic}</div>
+                      <div style={{flex:1,fontSize:12,fontWeight:700}}>{lbl}</div>
+                      <div style={{fontSize:11,color:"var(--text3)"}}>{ts?new Date(ts).toLocaleDateString():""}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>);
+          })()}
         </div>
       </div>
     );
