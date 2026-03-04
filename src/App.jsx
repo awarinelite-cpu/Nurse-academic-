@@ -2899,6 +2899,58 @@ function AdminHandouts({ toast }) {
   // Rename lecturer modal
   const [renameLec, setRenameLec] = useState(null); // {classId, course, oldName}
   const [renameLecVal, setRenameLecVal] = useState("");
+  // ── Multi-select deletion state ──
+  const [selMode, setSelMode] = useState(false);
+  const [selClasses, setSelClasses] = useState(new Set());     // selected class IDs
+  const [selCourses, setSelCourses] = useState(new Set());     // "classId::course"
+  const [selHandouts, setSelHandouts] = useState(new Set());   // handout IDs (list view)
+
+  const togClass   = (id)  => setSelClasses(s=>{const n=new Set(s);n.has(id)?n.delete(id):n.add(id);return n;});
+  const togCourse  = (key) => setSelCourses(s=>{const n=new Set(s);n.has(key)?n.delete(key):n.add(key);return n;});
+  const togHandout = (id)  => setSelHandouts(s=>{const n=new Set(s);n.has(id)?n.delete(id):n.add(id);return n;});
+
+  const clearSel = () => { setSelClasses(new Set()); setSelCourses(new Set()); setSelHandouts(new Set()); };
+
+  const deleteSelected = () => {
+    const classCount  = selClasses.size;
+    const courseCount = selCourses.size;
+    const hCount      = selHandouts.size;
+    const total = classCount + courseCount + hCount;
+    if (!total) return toast("Nothing selected","error");
+    const parts = [];
+    if (classCount)  parts.push(`${classCount} class folder${classCount>1?"s":""}`);
+    if (courseCount) parts.push(`${courseCount} course folder${courseCount>1?"s":""}`);
+    if (hCount)      parts.push(`${hCount} handout${hCount>1?"s":""}`);
+    if (!confirm(`Delete ${parts.join(", ")} and all their contents? This cannot be undone.`)) return;
+
+    let f = {...folders};
+    let updatedHandouts = [...handouts];
+
+    // Delete selected class folders (removes all courses + handouts inside)
+    selClasses.forEach(classId => {
+      delete f[classId];
+      updatedHandouts = updatedHandouts.filter(h => h.classId !== classId);
+    });
+
+    // Delete selected course folders (only if their class wasn't already deleted)
+    selCourses.forEach(key => {
+      const [classId, ...courseParts] = key.split("::");
+      const course = courseParts.join("::");
+      if (selClasses.has(classId)) return; // already deleted
+      if (f[classId]) delete f[classId][course];
+      updatedHandouts = updatedHandouts.filter(h => !(h.classId===classId && h.course===course));
+    });
+
+    // Delete individually selected handouts
+    updatedHandouts = updatedHandouts.filter(h => !selHandouts.has(h.id));
+
+    saveFolders(f);
+    setHandouts(updatedHandouts); saveShared("handouts", updatedHandouts);
+    toast(`🗑️ Deleted: ${parts.join(", ")}`, "success");
+    clearSel();
+  };
+
+  const totalSelected = selClasses.size + selCourses.size + selHandouts.size;
 
   const del = (id) => { const u=handouts.filter(h=>h.id!==id); setHandouts(u); saveShared("handouts",u); toast("Deleted","success"); };
   const clearAll = () => { if(!confirm("Delete ALL handouts?"))return; setHandouts([]); saveShared("handouts",[]); toast("All handouts cleared","warn"); };
@@ -2982,11 +3034,30 @@ function AdminHandouts({ toast }) {
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
         <div className="sec-title">📄 Handouts Management ({handouts.length})</div>
         <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-          <button className={`btn btn-sm${viewTab==="list"?" btn-accent":""}`} onClick={()=>setViewTab("list")}>📋 Handouts List</button>
-          <button className={`btn btn-sm${viewTab==="folders"?" btn-accent":""}`} onClick={()=>setViewTab("folders")}>📁 Folder Structure</button>
+          <button className={`btn btn-sm${viewTab==="list"?" btn-accent":""}`} onClick={()=>{setViewTab("list");clearSel();}}>📋 Handouts List</button>
+          <button className={`btn btn-sm${viewTab==="folders"?" btn-accent":""}`} onClick={()=>{setViewTab("folders");clearSel();}}>📁 Folder Structure</button>
+          <button className={`btn btn-sm${selMode?" btn-warn":""}`} onClick={()=>{setSelMode(s=>!s);clearSel();}}>{selMode?"✕ Exit Select":"☑️ Select"}</button>
           {handouts.length>0&&<button className="btn btn-danger btn-sm" onClick={clearAll}>🗑️ Clear All</button>}
         </div>
       </div>
+
+      {/* ── Bulk-delete toolbar ── */}
+      {selMode&&totalSelected>0&&(
+        <div className="bulk-bar" style={{marginBottom:12}}>
+          <span className="bulk-bar-count">☑ {totalSelected} selected
+            {selClasses.size>0&&<span style={{marginLeft:8,fontSize:11,opacity:.85}}>({selClasses.size} class{selClasses.size>1?"es":""})</span>}
+            {selCourses.size>0&&<span style={{marginLeft:4,fontSize:11,opacity:.85}}>({selCourses.size} course folder{selCourses.size>1?"s":""})</span>}
+            {selHandouts.size>0&&<span style={{marginLeft:4,fontSize:11,opacity:.85}}>({selHandouts.size} handout{selHandouts.size>1?"s":""})</span>}
+          </span>
+          <button className="btn btn-sm btn-danger" onClick={deleteSelected}>🗑️ Delete Selected</button>
+          <button className="btn btn-sm" onClick={clearSel}>✕ Clear</button>
+        </div>
+      )}
+      {selMode&&totalSelected===0&&(
+        <div style={{marginBottom:12,fontSize:12,color:"var(--text3)",padding:"8px 12px",background:"var(--bg4)",borderRadius:8,border:"1px dashed var(--border2)"}}>
+          ☑️ Select mode active — click checkboxes on classes, course folders, or handouts to select them for deletion.
+        </div>
+      )}
 
       {viewTab==="folders"&&(
         <div>
@@ -3005,9 +3076,16 @@ function AdminHandouts({ toast }) {
               return (
                 <div key={cls.id} className="card" style={{borderLeft:`4px solid ${cls.color||"var(--accent)"}`}}>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:courseList.length?12:0}}>
-                    <div>
-                      <div style={{fontWeight:800,fontSize:14}}>{cls.label}</div>
-                      <div style={{fontSize:11,color:"var(--text3)"}}>{cls.desc} · {courseList.length} course folder{courseList.length!==1?"s":""}</div>
+                    <div style={{display:"flex",alignItems:"center",gap:10}}>
+                      {selMode&&(
+                        <input type="checkbox" checked={selClasses.has(cls.id)} onChange={()=>togClass(cls.id)}
+                          style={{width:17,height:17,cursor:"pointer",accentColor:"var(--danger)",flexShrink:0}}
+                          title="Select entire class folder for deletion" />
+                      )}
+                      <div>
+                        <div style={{fontWeight:800,fontSize:14}}>{cls.label}</div>
+                        <div style={{fontSize:11,color:"var(--text3)"}}>{cls.desc} · {courseList.length} course folder{courseList.length!==1?"s":""}</div>
+                      </div>
                     </div>
                     <button className="btn btn-sm" onClick={()=>{
                       const existing=folders[cls.id]||{};
@@ -3029,13 +3107,21 @@ function AdminHandouts({ toast }) {
                           <div key={course} style={{background:"var(--bg4)",borderRadius:9,padding:"10px 12px",border:"1px solid var(--border)"}}>
                             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:allLecturers.length?8:0}}>
                               <div style={{display:"flex",alignItems:"center",gap:8}}>
+                                {selMode&&(
+                                  <input type="checkbox"
+                                    checked={selCourses.has(`${cls.id}::${course}`)||selClasses.has(cls.id)}
+                                    disabled={selClasses.has(cls.id)}
+                                    onChange={()=>togCourse(`${cls.id}::${course}`)}
+                                    style={{width:15,height:15,cursor:"pointer",accentColor:"var(--danger)",flexShrink:0}}
+                                    title="Select course folder for deletion" />
+                                )}
                                 <span style={{fontSize:16}}>📂</span>
                                 <div>
                                   <div style={{fontWeight:700,fontSize:13}}>{course}</div>
                                   <div style={{fontSize:10,color:"var(--text3)"}}>{allLecturers.length} lecturer{allLecturers.length!==1?"s":" "} · {hCount} file{hCount!==1?"s":""}</div>
                                 </div>
                               </div>
-                              <button className="btn btn-sm btn-danger" onClick={()=>deleteCourseFolder(cls.id,course)} title="Delete course folder">🗑️ Delete</button>
+                              {!selMode&&<button className="btn btn-sm btn-danger" onClick={()=>deleteCourseFolder(cls.id,course)} title="Delete course folder">🗑️ Delete</button>}
                             </div>
                             {allLecturers.length>0&&(
                               <div style={{display:"flex",flexWrap:"wrap",gap:6,paddingLeft:8}}>
@@ -3074,12 +3160,26 @@ function AdminHandouts({ toast }) {
         handouts.length===0?<div style={{textAlign:"center",padding:"40px",color:"var(--text3)",fontFamily:"'DM Mono',monospace",fontSize:13}}>No handouts uploaded yet.</div>:(
         <div className="card" style={{padding:0,overflow:"hidden"}}>
           <table className="tbl">
-            <thead><tr><th>Title</th><th>Class</th><th>Course</th><th>Lecturer</th><th>Date</th><th>Action</th></tr></thead>
+            <thead><tr>
+              {selMode&&<th style={{width:36,padding:"10px 8px"}}>
+                <input type="checkbox" className="cb-all"
+                  checked={handouts.length>0&&handouts.every(h=>selHandouts.has(h.id))}
+                  onChange={()=>{
+                    if(handouts.every(h=>selHandouts.has(h.id))){
+                      setSelHandouts(s=>{const n=new Set(s);handouts.forEach(h=>n.delete(h.id));return n;});
+                    } else {
+                      setSelHandouts(s=>{const n=new Set(s);handouts.forEach(h=>n.add(h.id));return n;});
+                    }
+                  }} title="Select all handouts" />
+              </th>}
+              <th>Title</th><th>Class</th><th>Course</th><th>Lecturer</th><th>Date</th><th>Action</th>
+            </tr></thead>
             <tbody>
               {handouts.map(h=>{
                 const c=classes.find(x=>x.id===h.classId);
                 return (
-                  <tr key={h.id}>
+                  <tr key={h.id} style={{background:selHandouts.has(h.id)?"rgba(239,68,68,.06)":""}}>
+                    {selMode&&<td style={{padding:"8px"}}><input type="checkbox" className="cb-row" checked={selHandouts.has(h.id)} onChange={()=>togHandout(h.id)} /></td>}
                     <td style={{fontWeight:600}}>{h.title}{h.pdfName&&<span style={{marginLeft:5,fontSize:10,color:"var(--danger)"}}>📄</span>}</td>
                     <td><span className="tag tag-accent">{c?.label||"General"}</span></td>
                     <td style={{fontSize:12,color:"var(--text3)"}}>{h.course||"—"}</td>
