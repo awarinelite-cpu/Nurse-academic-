@@ -743,8 +743,37 @@ const loadShared = async (key, fallback) => {
 const uKey = (user, suffix) => `u:${user}:${suffix}`;
 let _currentUser = "";
 const setCurrentUserRef = (u) => { _currentUser = u; };
-const saveMyData = (suffix, lsKey, val) => { lsSet(lsKey, val); };
-const syncUserPrivateData = async (username) => {};
+const saveMyData = (suffix, lsKey, val) => {
+  lsSet(lsKey, val);
+  // Sync notifications to Firestore for cross-device real-time delivery
+  if (suffix === "notifications" && _currentUser) {
+    const key = _notifKey(_currentUser);
+    _loadFirebase().then(ready => {
+      if (!ready) return;
+      _db.collection("nv").doc("user_notifs")
+        .set({ [key]: val }, { merge: true })
+        .catch(e => console.warn("[saveMyData] notif sync failed:", e.message));
+    });
+  }
+};
+const syncUserPrivateData = async (username) => {
+  // Pull latest notifications from Firestore on login
+  const ready = await _loadFirebase(); if (!ready) return;
+  try {
+    const snap = await _db.collection("nv").doc("user_notifs").get();
+    if (!snap.exists) return;
+    const key = _notifKey(username);
+    const remote = snap.data()[key] || [];
+    if (remote.length > 0) {
+      const local = ls("nv-notifications", []);
+      const remoteIds = new Set(remote.map(n => n.id));
+      const localOnly = local.filter(n => !remoteIds.has(n.id));
+      const merged = [...remote, ...localOnly].sort((a,b) => (b.ts||0) - (a.ts||0));
+      lsSet("nv-notifications", merged);
+      dispatchSync();
+    }
+  } catch(e) { console.warn("[syncUserPrivateData] failed:", e.message); }
+};
 
 // ── Essay submissions ─────────────────────────────────────────────────
 const saveEssaySubmissionToBackend = async (studentEmail, bankId, data) => {
@@ -946,6 +975,71 @@ const hydrateFromBackend = async () => {
     dispatchSync();
     console.log("[Sync] Hydrated from Firestore ✅");
   } catch (e) { console.warn("[Sync] Hydration failed:", e.message); }
+};
+
+// ── REAL-TIME SHARED DOC LISTENER ────────────────────────────────────
+// Replaces the 60-second polling interval.
+// onSnapshot fires within ~1s of any write from any device.
+const subscribeSharedDoc = (onUpdate) =>
+  _mkSub(db =>
+    db.collection("nv").doc(_DOC_SHARED).onSnapshot(snap => {
+      if (!snap.exists) return;
+      const doc = snap.data();
+      const defaults = {
+        users:         [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}],
+        classes:       DEFAULT_CLASSES, drugs: DEFAULT_DRUGS, labs: DEFAULT_LABS,
+        pq:            DEFAULT_PQ,      skills: DEFAULT_SKILLS, announcements: DEFAULT_ANNOUNCEMENTS,
+        handouts:      [],  essayBanks: [], nursingExams: {general:[],midwifery:[],publichealth:[]},
+        schoolPQ:      {},  folders:    {}, schoolExams:  [],
+      };
+      Object.entries(SK).forEach(([key, [lsKey, bk]]) => {
+        if (["dailyMock","nursingExams","ncArchive"].includes(key)) return;
+        const remote = doc[bk];
+        if (remote !== undefined && remote !== null) lsSet(lsKey, remote);
+        else if (!ls(lsKey, null)) lsSet(lsKey, defaults[key] || []);
+      });
+      // Update in-memory cache so next _getDoc call is instant
+      _cache[_DOC_SHARED] = doc;
+      _cacheTime[_DOC_SHARED] = Date.now();
+      dispatchSync();
+      if (onUpdate) onUpdate();
+    }, err => console.warn("[RT-Shared] snapshot error:", err.message))
+  );
+
+// ── REAL-TIME PER-USER NOTIFICATIONS LISTENER ─────────────────────
+// Stores user notifications in Firestore: nv/user_notifs (field per user)
+// Written on handout-publish / announcement / any server push.
+// Fires within ~1s on all devices that user is signed in on.
+const _notifKey = (username) => `notifs_${username.replace(/[^a-z0-9]/gi,"_")}`;
+
+const pushUserNotif = async (username, notif) => {
+  const ready = await _loadFirebase(); if (!ready) return;
+  try {
+    const key = _notifKey(username);
+    const snap = await _db.collection("nv").doc("user_notifs").get().catch(() => null);
+    const existing = snap?.exists ? (snap.data()[key] || []) : [];
+    const updated = [notif, ...existing].slice(0, 200); // keep latest 200
+    await _db.collection("nv").doc("user_notifs").set({ [key]: updated }, { merge: true });
+  } catch(e) { console.warn("[pushUserNotif] failed:", e.message); }
+};
+
+const subscribeUserNotifications = (username, onNotifs) => {
+  if (!username) return () => {};
+  return _mkSub(db =>
+    db.collection("nv").doc("user_notifs").onSnapshot(snap => {
+      if (!snap.exists) return;
+      const key = _notifKey(username);
+      const notifs = snap.data()[key] || [];
+      // Merge with any local-only notifs not yet in Firestore
+      const localNotifs = ls("nv-notifications", []);
+      const remoteIds = new Set(notifs.map(n => n.id));
+      const localOnly = localNotifs.filter(n => !remoteIds.has(n.id));
+      const merged = [...notifs, ...localOnly].sort((a,b) => (b.ts||0) - (a.ts||0));
+      lsSet("nv-notifications", merged);
+      dispatchSync();
+      if (onNotifs) onNotifs(merged);
+    }, err => console.warn("[RT-Notifs] snapshot error:", err.message))
+  );
 };
 
 // ─── DEFAULT DATA ───────────────────────────────────────────────────
@@ -2899,58 +2993,6 @@ function AdminHandouts({ toast }) {
   // Rename lecturer modal
   const [renameLec, setRenameLec] = useState(null); // {classId, course, oldName}
   const [renameLecVal, setRenameLecVal] = useState("");
-  // ── Multi-select deletion state ──
-  const [selMode, setSelMode] = useState(false);
-  const [selClasses, setSelClasses] = useState(new Set());     // selected class IDs
-  const [selCourses, setSelCourses] = useState(new Set());     // "classId::course"
-  const [selHandouts, setSelHandouts] = useState(new Set());   // handout IDs (list view)
-
-  const togClass   = (id)  => setSelClasses(s=>{const n=new Set(s);n.has(id)?n.delete(id):n.add(id);return n;});
-  const togCourse  = (key) => setSelCourses(s=>{const n=new Set(s);n.has(key)?n.delete(key):n.add(key);return n;});
-  const togHandout = (id)  => setSelHandouts(s=>{const n=new Set(s);n.has(id)?n.delete(id):n.add(id);return n;});
-
-  const clearSel = () => { setSelClasses(new Set()); setSelCourses(new Set()); setSelHandouts(new Set()); };
-
-  const deleteSelected = () => {
-    const classCount  = selClasses.size;
-    const courseCount = selCourses.size;
-    const hCount      = selHandouts.size;
-    const total = classCount + courseCount + hCount;
-    if (!total) return toast("Nothing selected","error");
-    const parts = [];
-    if (classCount)  parts.push(`${classCount} class folder${classCount>1?"s":""}`);
-    if (courseCount) parts.push(`${courseCount} course folder${courseCount>1?"s":""}`);
-    if (hCount)      parts.push(`${hCount} handout${hCount>1?"s":""}`);
-    if (!confirm(`Delete ${parts.join(", ")} and all their contents? This cannot be undone.`)) return;
-
-    let f = {...folders};
-    let updatedHandouts = [...handouts];
-
-    // Delete selected class folders (removes all courses + handouts inside)
-    selClasses.forEach(classId => {
-      delete f[classId];
-      updatedHandouts = updatedHandouts.filter(h => h.classId !== classId);
-    });
-
-    // Delete selected course folders (only if their class wasn't already deleted)
-    selCourses.forEach(key => {
-      const [classId, ...courseParts] = key.split("::");
-      const course = courseParts.join("::");
-      if (selClasses.has(classId)) return; // already deleted
-      if (f[classId]) delete f[classId][course];
-      updatedHandouts = updatedHandouts.filter(h => !(h.classId===classId && h.course===course));
-    });
-
-    // Delete individually selected handouts
-    updatedHandouts = updatedHandouts.filter(h => !selHandouts.has(h.id));
-
-    saveFolders(f);
-    setHandouts(updatedHandouts); saveShared("handouts", updatedHandouts);
-    toast(`🗑️ Deleted: ${parts.join(", ")}`, "success");
-    clearSel();
-  };
-
-  const totalSelected = selClasses.size + selCourses.size + selHandouts.size;
 
   const del = (id) => { const u=handouts.filter(h=>h.id!==id); setHandouts(u); saveShared("handouts",u); toast("Deleted","success"); };
   const clearAll = () => { if(!confirm("Delete ALL handouts?"))return; setHandouts([]); saveShared("handouts",[]); toast("All handouts cleared","warn"); };
@@ -3034,30 +3076,11 @@ function AdminHandouts({ toast }) {
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
         <div className="sec-title">📄 Handouts Management ({handouts.length})</div>
         <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-          <button className={`btn btn-sm${viewTab==="list"?" btn-accent":""}`} onClick={()=>{setViewTab("list");clearSel();}}>📋 Handouts List</button>
-          <button className={`btn btn-sm${viewTab==="folders"?" btn-accent":""}`} onClick={()=>{setViewTab("folders");clearSel();}}>📁 Folder Structure</button>
-          <button className={`btn btn-sm${selMode?" btn-warn":""}`} onClick={()=>{setSelMode(s=>!s);clearSel();}}>{selMode?"✕ Exit Select":"☑️ Select"}</button>
+          <button className={`btn btn-sm${viewTab==="list"?" btn-accent":""}`} onClick={()=>setViewTab("list")}>📋 Handouts List</button>
+          <button className={`btn btn-sm${viewTab==="folders"?" btn-accent":""}`} onClick={()=>setViewTab("folders")}>📁 Folder Structure</button>
           {handouts.length>0&&<button className="btn btn-danger btn-sm" onClick={clearAll}>🗑️ Clear All</button>}
         </div>
       </div>
-
-      {/* ── Bulk-delete toolbar ── */}
-      {selMode&&totalSelected>0&&(
-        <div className="bulk-bar" style={{marginBottom:12}}>
-          <span className="bulk-bar-count">☑ {totalSelected} selected
-            {selClasses.size>0&&<span style={{marginLeft:8,fontSize:11,opacity:.85}}>({selClasses.size} class{selClasses.size>1?"es":""})</span>}
-            {selCourses.size>0&&<span style={{marginLeft:4,fontSize:11,opacity:.85}}>({selCourses.size} course folder{selCourses.size>1?"s":""})</span>}
-            {selHandouts.size>0&&<span style={{marginLeft:4,fontSize:11,opacity:.85}}>({selHandouts.size} handout{selHandouts.size>1?"s":""})</span>}
-          </span>
-          <button className="btn btn-sm btn-danger" onClick={deleteSelected}>🗑️ Delete Selected</button>
-          <button className="btn btn-sm" onClick={clearSel}>✕ Clear</button>
-        </div>
-      )}
-      {selMode&&totalSelected===0&&(
-        <div style={{marginBottom:12,fontSize:12,color:"var(--text3)",padding:"8px 12px",background:"var(--bg4)",borderRadius:8,border:"1px dashed var(--border2)"}}>
-          ☑️ Select mode active — click checkboxes on classes, course folders, or handouts to select them for deletion.
-        </div>
-      )}
 
       {viewTab==="folders"&&(
         <div>
@@ -3076,16 +3099,9 @@ function AdminHandouts({ toast }) {
               return (
                 <div key={cls.id} className="card" style={{borderLeft:`4px solid ${cls.color||"var(--accent)"}`}}>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:courseList.length?12:0}}>
-                    <div style={{display:"flex",alignItems:"center",gap:10}}>
-                      {selMode&&(
-                        <input type="checkbox" checked={selClasses.has(cls.id)} onChange={()=>togClass(cls.id)}
-                          style={{width:17,height:17,cursor:"pointer",accentColor:"var(--danger)",flexShrink:0}}
-                          title="Select entire class folder for deletion" />
-                      )}
-                      <div>
-                        <div style={{fontWeight:800,fontSize:14}}>{cls.label}</div>
-                        <div style={{fontSize:11,color:"var(--text3)"}}>{cls.desc} · {courseList.length} course folder{courseList.length!==1?"s":""}</div>
-                      </div>
+                    <div>
+                      <div style={{fontWeight:800,fontSize:14}}>{cls.label}</div>
+                      <div style={{fontSize:11,color:"var(--text3)"}}>{cls.desc} · {courseList.length} course folder{courseList.length!==1?"s":""}</div>
                     </div>
                     <button className="btn btn-sm" onClick={()=>{
                       const existing=folders[cls.id]||{};
@@ -3107,21 +3123,13 @@ function AdminHandouts({ toast }) {
                           <div key={course} style={{background:"var(--bg4)",borderRadius:9,padding:"10px 12px",border:"1px solid var(--border)"}}>
                             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:allLecturers.length?8:0}}>
                               <div style={{display:"flex",alignItems:"center",gap:8}}>
-                                {selMode&&(
-                                  <input type="checkbox"
-                                    checked={selCourses.has(`${cls.id}::${course}`)||selClasses.has(cls.id)}
-                                    disabled={selClasses.has(cls.id)}
-                                    onChange={()=>togCourse(`${cls.id}::${course}`)}
-                                    style={{width:15,height:15,cursor:"pointer",accentColor:"var(--danger)",flexShrink:0}}
-                                    title="Select course folder for deletion" />
-                                )}
                                 <span style={{fontSize:16}}>📂</span>
                                 <div>
                                   <div style={{fontWeight:700,fontSize:13}}>{course}</div>
                                   <div style={{fontSize:10,color:"var(--text3)"}}>{allLecturers.length} lecturer{allLecturers.length!==1?"s":" "} · {hCount} file{hCount!==1?"s":""}</div>
                                 </div>
                               </div>
-                              {!selMode&&<button className="btn btn-sm btn-danger" onClick={()=>deleteCourseFolder(cls.id,course)} title="Delete course folder">🗑️ Delete</button>}
+                              <button className="btn btn-sm btn-danger" onClick={()=>deleteCourseFolder(cls.id,course)} title="Delete course folder">🗑️ Delete</button>
                             </div>
                             {allLecturers.length>0&&(
                               <div style={{display:"flex",flexWrap:"wrap",gap:6,paddingLeft:8}}>
@@ -3160,26 +3168,12 @@ function AdminHandouts({ toast }) {
         handouts.length===0?<div style={{textAlign:"center",padding:"40px",color:"var(--text3)",fontFamily:"'DM Mono',monospace",fontSize:13}}>No handouts uploaded yet.</div>:(
         <div className="card" style={{padding:0,overflow:"hidden"}}>
           <table className="tbl">
-            <thead><tr>
-              {selMode&&<th style={{width:36,padding:"10px 8px"}}>
-                <input type="checkbox" className="cb-all"
-                  checked={handouts.length>0&&handouts.every(h=>selHandouts.has(h.id))}
-                  onChange={()=>{
-                    if(handouts.every(h=>selHandouts.has(h.id))){
-                      setSelHandouts(s=>{const n=new Set(s);handouts.forEach(h=>n.delete(h.id));return n;});
-                    } else {
-                      setSelHandouts(s=>{const n=new Set(s);handouts.forEach(h=>n.add(h.id));return n;});
-                    }
-                  }} title="Select all handouts" />
-              </th>}
-              <th>Title</th><th>Class</th><th>Course</th><th>Lecturer</th><th>Date</th><th>Action</th>
-            </tr></thead>
+            <thead><tr><th>Title</th><th>Class</th><th>Course</th><th>Lecturer</th><th>Date</th><th>Action</th></tr></thead>
             <tbody>
               {handouts.map(h=>{
                 const c=classes.find(x=>x.id===h.classId);
                 return (
-                  <tr key={h.id} style={{background:selHandouts.has(h.id)?"rgba(239,68,68,.06)":""}}>
-                    {selMode&&<td style={{padding:"8px"}}><input type="checkbox" className="cb-row" checked={selHandouts.has(h.id)} onChange={()=>togHandout(h.id)} /></td>}
+                  <tr key={h.id}>
                     <td style={{fontWeight:600}}>{h.title}{h.pdfName&&<span style={{marginLeft:5,fontSize:10,color:"var(--danger)"}}>📄</span>}</td>
                     <td><span className="tag tag-accent">{c?.label||"General"}</span></td>
                     <td style={{fontSize:12,color:"var(--text3)"}}>{h.course||"—"}</td>
@@ -3569,7 +3563,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
   const pushNotification = (item) => {
     const notifs = ls("nv-notifications", []);
     const notif = {
-      id: Date.now(), type:"handout",
+      id: Date.now(), ts: Date.now(), type:"handout",
       title:`New handout: ${item.title}`,
       body:`${item.lecturerName||currentUser.split("@")[0]} uploaded ${item.hasDriveLink?"Google Drive files ":item.pdfName?"a PDF ":"notes "}for ${item.course||"your class"}`,
       from: currentUser, date: new Date().toLocaleDateString(),
@@ -15512,6 +15506,15 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
   const [unreadDM, setUnreadDM] = useState(0);
   const [navHistory, setNavHistory] = useState([]);
 
+  // Real-time notification badge for lecturer panel
+  useEffect(() => {
+    if (!currentUser) return;
+    const unsub = subscribeUserNotifications(currentUser, (notifs) => {
+      setUnreadNotifs(notifs.filter(n => !n.read).length);
+    });
+    return () => unsub();
+  }, [currentUser]);
+
   // Load assignments for classes taught
   useEffect(() => {
     const unsub = _mkSub(db => db.collection("assignments").orderBy("dueAt","asc").onSnapshot(snap => setAssignments(snap.docs.map(d=>({id:d.id,...d.data()}))), () => {}));
@@ -16103,12 +16106,13 @@ export default function App() {
 
   useEffect(() => {
     initData(); runSync();
-    // Auto-sync every 60 seconds while app is open
-    const interval = setInterval(() => { hydrateFromBackend(); }, 60000);
-    // Also sync when tab regains focus (user switches back from another device)
+    // ── Real-time shared-data listener (fires within ~1s of any write on any device)
+    // Replaces the old 60-second polling interval.
+    const unsubShared = subscribeSharedDoc();
+    // Fallback: also sync on tab focus in case the listener missed something while hidden
     const onFocus = () => hydrateFromBackend();
     window.addEventListener("focus", onFocus);
-    return () => { clearInterval(interval); window.removeEventListener("focus", onFocus); };
+    return () => { unsubShared(); window.removeEventListener("focus", onFocus); };
   }, []);
 
   useEffect(() => {
@@ -16249,6 +16253,15 @@ self.addEventListener('notificationclick', e => {
     const notifs = ls("nv-notifications", []);
     return notifs.filter(n => !n.read).length;
   });
+
+  // ── Real-time notification listener — updates badge within ~1s across devices
+  useEffect(() => {
+    if (!currentUser) return;
+    const unsub = subscribeUserNotifications(currentUser, (notifs) => {
+      setUnreadNotifs(notifs.filter(n => !n.read).length);
+    });
+    return unsub;
+  }, [currentUser]);
   const [unreadDM, setUnreadDM] = useState(0);
   const [unreadPHNForum, setUnreadPHNForum] = useState(0);  // show setup modal after first login
   const [pinLocked,     setPinLocked]     = useState(false);  // show unlock screen
