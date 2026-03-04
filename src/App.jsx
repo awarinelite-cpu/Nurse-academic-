@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+/* @jsxRuntime classic */
+import React, { useState, useEffect, useCallback, useRef, Fragment } from "react";
 
 // ─── EMAILJS CONFIG ──────────────────────────────────────────────────
 // EmailJS free tier: 200 emails/month — sign up at https://www.emailjs.com
@@ -113,6 +114,10 @@ const FIREBASE_CONFIG = {
   appId:             "1:44425476386:web:396cd7764e92152ceccd7b",
   measurementId:     "G-0NL42MXWRP",
 };
+
+// ── FCM VAPID key — get from Firebase Console → Project Settings → Cloud Messaging → Web Push certificates ──
+// Replace the string below with your actual VAPID key
+const FCM_VAPID_KEY = "YOUR_VAPID_KEY_HERE"; // e.g. "BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3"
 
 // ── Firebase SDK loader (loaded once from CDN) ──────────────────────
 let _db = null;           // Firestore instance
@@ -894,7 +899,7 @@ const hydrateFromBackend = async () => {
       if (["dailyMock","nursingExams","ncArchive"].includes(key)) return; // loaded from chunked docs below
       const remote = doc[bk];
       if (remote !== undefined && remote !== null) lsSet(lsKey, remote);
-      else if (!localStorage.getItem(lsKey)) lsSet(lsKey, defaults[key] || []);
+      else if (!ls(lsKey, null)) lsSet(lsKey, defaults[key] || []);
     });
     // Load large NC datasets from their own chunked documents
     try { const r=await mockChunkLoad();    if(r){ lsSet("nv-daily-mock",r.items); if(r.meta?.mockTitle) lsSet("nv-daily-mock-title",r.meta.mockTitle); } } catch(e){ console.warn("[Sync] mock chunk load:",e.message); }
@@ -953,13 +958,13 @@ const DEFAULT_ANNOUNCEMENTS = [
 
 // ─── INIT STORAGE ───────────────────────────────────────────────────
 const initData = () => {
-  if (!localStorage.getItem("nv-classes"))       lsSet("nv-classes",       DEFAULT_CLASSES);
-  if (!localStorage.getItem("nv-drugs"))         lsSet("nv-drugs",         DEFAULT_DRUGS);
-  if (!localStorage.getItem("nv-labs"))          lsSet("nv-labs",          DEFAULT_LABS);
-  if (!localStorage.getItem("nv-pq"))            lsSet("nv-pq",            DEFAULT_PQ);
-  if (!localStorage.getItem("nv-skillsdb"))      lsSet("nv-skillsdb",      DEFAULT_SKILLS);
-  if (!localStorage.getItem("nv-announcements")) lsSet("nv-announcements", DEFAULT_ANNOUNCEMENTS);
-  if (!localStorage.getItem("nv-users"))         lsSet("nv-users",         [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]);
+  if (!ls("nv-classes", null))       lsSet("nv-classes",       DEFAULT_CLASSES);
+  if (!ls("nv-drugs", null))         lsSet("nv-drugs",         DEFAULT_DRUGS);
+  if (!ls("nv-labs", null))          lsSet("nv-labs",          DEFAULT_LABS);
+  if (!ls("nv-pq", null))            lsSet("nv-pq",            DEFAULT_PQ);
+  if (!ls("nv-skillsdb", null))      lsSet("nv-skillsdb",      DEFAULT_SKILLS);
+  if (!ls("nv-announcements", null)) lsSet("nv-announcements", DEFAULT_ANNOUNCEMENTS);
+  if (!ls("nv-users", null))         lsSet("nv-users",         [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]);
 };
 
 // ─── STYLES ─────────────────────────────────────────────────────────
@@ -1406,7 +1411,7 @@ function AdminPanel({ toast, currentUser }) {
         <div className="admin-header-icon">🛡️</div>
         <div>
           <div className="admin-header-title">Admin Control Panel</div>
-          <div className="admin-header-sub">Logged in as <b style={{color:"var(--purple)"}}>{currentUser}</b> • Full system access</div>
+          <div className="admin-header-sub">Logged in as <b style={{color:"var(--purple)"}}>{currentUser}</b> · Full system access</div>
         </div>
       </div>
       <div className="admin-tabs">
@@ -1499,7 +1504,7 @@ function AdminOverview({ toast }) {
             ⬆️ Import Backup
             <input type="file" accept=".json" style={{display:"none"}} onChange={importAll} />
           </label>
-          <button className="btn btn-danger" onClick={()=>{if(confirm("Reset ALL data to defaults? This cannot be undone!")){["nv-classes","nv-drugs","nv-labs","nv-pq","nv-skillsdb","nv-announcements","nv-handouts"].forEach(k=>localStorage.removeItem(k));initData();toast("Data reset to defaults","warn");}}}>🔄 Reset to Defaults</button>
+          <button className="btn btn-danger" onClick={()=>{if(confirm("Reset ALL data to defaults? This cannot be undone!")){["nv-classes","nv-drugs","nv-labs","nv-pq","nv-skillsdb","nv-announcements","nv-handouts"].forEach(k=>{try{localStorage.removeItem(k);}catch{}});initData();toast("Data reset to defaults","warn");}}}>🔄 Reset to Defaults</button>
         </div>
       </div>
       <div className="card">
@@ -1509,7 +1514,7 @@ function AdminOverview({ toast }) {
             <div className="user-av">{u.username[0].toUpperCase()}</div>
             <div style={{flex:1}}>
               <div style={{fontWeight:600,fontSize:14}}>{u.username}</div>
-              <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{u.class||"No class"} • Joined {u.joined}</div>
+              <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{u.class||"No class"} · Joined {u.joined}</div>
             </div>
             <span className={`tag ${u.role==="admin"?"tag-purple":u.role==="lecturer"?"tag-warn":"tag-accent"}`}>{u.role||"student"}</span>
           </div>
@@ -2135,7 +2140,7 @@ function AdminPQ({ toast }) {
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
               <div>
                 <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15}}>{b.subject}</div>
-                <div style={{fontSize:12,color:"var(--text3)",marginTop:3}}>{b.year} • {b.questions.length} questions</div>
+                <div style={{fontSize:12,color:"var(--text3)",marginTop:3}}>{b.year} · {b.questions.length} questions</div>
               </div>
               <div style={{display:"flex",gap:5}}>
                 <button className="btn btn-sm" onClick={e=>{e.stopPropagation();setEditBank(i);setBankForm({subject:b.subject,year:b.year});setShowBankModal(true);}}>✏️</button>
@@ -2464,7 +2469,7 @@ function AdminExamRetakes({ toast }) {
                       <div style={{flex:1}}>
                         <div style={{fontWeight:600,fontSize:13}}>{bank?.subject||`Exam #${bankId}`}</div>
                         <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>
-                          {data.attempts}/2 attempts • Best: {data.results.length>0?Math.max(...data.results.map(r=>r.pct)):0}%
+                          {data.attempts}/2 attempts · Best: {data.results.length>0?Math.max(...data.results.map(r=>r.pct)):0}%
                           {data.results.some(r=>r.auto)&&<span style={{color:"var(--danger)",marginLeft:6}}>⚠️ Auto-submitted</span>}
                         </div>
                       </div>
@@ -2610,7 +2615,7 @@ function AdminEssayExams({ toast }) {
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
         <div>
           <div className="sec-title">✍️ Essay Exams</div>
-          <div className="sec-sub">Create essay exams • AI or manual grading • 1 attempt per student</div>
+          <div className="sec-sub">Create essay exams · AI or manual grading · 1 attempt per student</div>
         </div>
         {adminTab === "banks" && <button className="btn btn-purple" onClick={()=>{setShowBankModal(true);setEditBank(null);setBankForm({subject:"",description:""});}}>+ New Essay Exam</button>}
         {adminTab === "grade" && <button className="btn btn-accent btn-sm" onClick={loadSubmissions}>🔄 Refresh</button>}
@@ -2642,7 +2647,7 @@ function AdminEssayExams({ toast }) {
                   <button className="modal-close" onClick={()=>setGradingStudent(null)}>✕</button>
                 </div>
                 <div style={{fontSize:12,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginBottom:16}}>
-                  Subject: <b style={{color:"var(--accent)"}}>{gradingStudent.subject}</b> • Submitted {gradingStudent.date}
+                  Subject: <b style={{color:"var(--accent)"}}>{gradingStudent.subject}</b> · Submitted {gradingStudent.date}
                 </div>
                 {(gradingStudent.questions || []).map((q, i) => (
                   <div key={i} className="card" style={{marginBottom:14}}>
@@ -2748,7 +2753,7 @@ function AdminEssayExams({ toast }) {
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
               <div>
                 <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15}}>{b.subject}</div>
-                <div style={{fontSize:12,color:"var(--text3)",marginTop:3}}>{b.questions.length} questions • {b.questions.reduce((s,q)=>s+(q.marks||10),0)} total marks</div>
+                <div style={{fontSize:12,color:"var(--text3)",marginTop:3}}>{b.questions.length} questions · {b.questions.reduce((s,q)=>s+(q.marks||10),0)} total marks</div>
                 {b.description&&<div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>{b.description}</div>}
               </div>
               <div style={{display:"flex",gap:5,flexShrink:0}}>
@@ -2775,8 +2780,8 @@ function AdminEssayExams({ toast }) {
                   <div style={{fontWeight:600,fontSize:13,marginBottom:4}}>{qi+1}. {q.q}</div>
                   <div style={{display:"flex",gap:8,fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace",flexWrap:"wrap"}}>
                     <span style={{color:"var(--accent)"}}>{q.marks||10} marks</span>
-                    <span>• {q.wordGuide||"100-200"} words</span>
-                    {q.modelAnswer&&<span style={{color:"var(--success)"}}>• Model answer set ✓</span>}
+                    <span>· {q.wordGuide||"100-200"} words</span>
+                    {q.modelAnswer&&<span style={{color:"var(--success)"}}>· Model answer set ✓</span>}
                   </div>
                 </div>
                 <div style={{display:"flex",gap:5,flexShrink:0}}>
@@ -2801,7 +2806,7 @@ function AdminEssayExams({ toast }) {
                 <div style={{flex:1}}>
                   <div style={{fontWeight:600,fontSize:13}}>{u.username}</div>
                   <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>
-                    {att ? `Submitted ${att.date} • Score: ${att.score!==null?`${att.score}/${att.total||100} (${att.pct}%)`:"Pending manual grade"}` : "Not attempted"}
+                    {att ? `Submitted ${att.date} · Score: ${att.score!==null?`${att.score}/${att.total||100} (${att.pct}%)`:"Pending manual grade"}` : "Not attempted"}
                   </div>
                 </div>
                 {att&&<button className="btn btn-sm btn-accent" onClick={()=>resetStudentEssay(u.username,selBank)}>🔄 Reset</button>}
@@ -2882,7 +2887,7 @@ function AdminHandouts({ toast }) {
     saveFolders(f);
     const u = handouts.filter(h=>!(h.classId===classId&&h.course===course&&(h.lecturerName===lecName||h.uploadedBy?.split("@")[0]===lecName)));
     setHandouts(u); saveShared("handouts",u);
-    toast(`👨🏫 Lecturer folder "${lecName}" deleted`,"success");
+    toast(`👨‍🏫 Lecturer folder "${lecName}" deleted`,"success");
   };
 
   // Rename lecturer
@@ -2962,7 +2967,7 @@ function AdminHandouts({ toast }) {
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:courseList.length?12:0}}>
                     <div>
                       <div style={{fontWeight:800,fontSize:14}}>{cls.label}</div>
-                      <div style={{fontSize:11,color:"var(--text3)"}}>{cls.desc} • {courseList.length} course folder{courseList.length!==1?"s":""}</div>
+                      <div style={{fontSize:11,color:"var(--text3)"}}>{cls.desc} · {courseList.length} course folder{courseList.length!==1?"s":""}</div>
                     </div>
                     <button className="btn btn-sm" onClick={()=>{
                       const existing=folders[cls.id]||{};
@@ -2987,7 +2992,7 @@ function AdminHandouts({ toast }) {
                                 <span style={{fontSize:16}}>📂</span>
                                 <div>
                                   <div style={{fontWeight:700,fontSize:13}}>{course}</div>
-                                  <div style={{fontSize:10,color:"var(--text3)"}}>{allLecturers.length} lecturer{allLecturers.length!==1?"s":" "} • {hCount} file{hCount!==1?"s":""}</div>
+                                  <div style={{fontSize:10,color:"var(--text3)"}}>{allLecturers.length} lecturer{allLecturers.length!==1?"s":" "} · {hCount} file{hCount!==1?"s":""}</div>
                                 </div>
                               </div>
                               <button className="btn btn-sm btn-danger" onClick={()=>deleteCourseFolder(cls.id,course)} title="Delete course folder">🗑️ Delete</button>
@@ -2998,7 +3003,7 @@ function AdminHandouts({ toast }) {
                                   const lhCount=handouts.filter(h=>h.classId===cls.id&&h.course===course&&(h.lecturerName===lec||h.uploadedBy?.split("@")[0]===lec)).length;
                                   return (
                                     <div key={lec} style={{display:"flex",alignItems:"center",gap:4,fontSize:11,padding:"3px 8px",borderRadius:7,border:"1px solid var(--border2)",background:"rgba(124,58,237,.06)"}}>
-                                      <span>👨🏫</span>
+                                      <span>👨‍🏫</span>
                                       <span style={{color:"var(--purple)",fontWeight:600}}>{lec}</span>
                                       <span style={{color:"var(--text3)"}}>({lhCount})</span>
                                       <button title="Rename" onClick={()=>{setRenameLec({classId:cls.id,course,oldName:lec});setRenameLecVal(lec);}}
@@ -3323,7 +3328,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
     if (existing.includes(newLecturerName.trim())) return toast("Lecturer folder already exists","warn");
     const f = {...folders,[drillClass]:{...(folders[drillClass]||{}),[drillCourse]:[...existing,newLecturerName.trim()]}};
     saveFolders(f);
-    toast(`👨🏫 Lecturer folder "${newLecturerName.trim()}" created!`,"success");
+    toast(`👨‍🏫 Lecturer folder "${newLecturerName.trim()}" created!`,"success");
     setShowLecturerModal(false); setNewLecturerName("");
   };
 
@@ -3447,7 +3452,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
         <span style={{color:drillLecturer?"var(--accent)":"var(--text)",cursor:drillLecturer?"pointer":"default",fontWeight:800}}
           onClick={()=>{if(drillLecturer)setDrillLecturer(null);}}>{drillCourse}</span></>}
       {drillLecturer&&<><span style={{color:"var(--text3)"}}>›</span>
-        <span style={{fontWeight:800,color:"var(--text)"}}>👨🏫 {drillLecturer}</span></>}
+        <span style={{fontWeight:800,color:"var(--text)"}}>👨‍🏫 {drillLecturer}</span></>}
     </div>
   );
 
@@ -3477,7 +3482,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}>
         <div>
           <div className="sec-title">📄 Handouts</div>
-          <div className="sec-sub">{handouts.length} total • organised by class › course › lecturer</div>
+          <div className="sec-sub">{handouts.length} total · organised by class › course › lecturer</div>
         </div>
         {isLecturer && !drillLecturer && <button className="btn btn-accent" onClick={()=>setShowAdd(p=>!p)}>+ Upload Handout</button>}
       </div>
@@ -3578,7 +3583,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
                       {isLecturer&&<button className="btn btn-sm btn-danger" onClick={e=>{e.stopPropagation();del(h.id);}}>✕</button>}
                     </div>
                     <div style={{fontWeight:800,fontSize:14,marginBottom:3}}>{h.title}</div>
-                    <div style={{fontSize:11,color:"var(--purple)",marginBottom:4}}>👨🏫 {h.lecturerName||h.uploadedBy?.split("@")[0]||"Unknown"}</div>
+                    <div style={{fontSize:11,color:"var(--purple)",marginBottom:4}}>👨‍🏫 {h.lecturerName||h.uploadedBy?.split("@")[0]||"Unknown"}</div>
                     <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{h.date}</div>
                   </div>
                 );
@@ -3612,7 +3617,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
                   const cnt = handouts.filter(h=>h.classId===c.id).length;
                   const allCourses = getCoursesForClass(c.id);
                   return (
-                    <FolderCard key={c.id} icon="📁" label={c.label} sublabel={`${c.desc} • ${allCourses.length} course${allCourses.length!==1?"s":""}`}
+                    <FolderCard key={c.id} icon="📁" label={c.label} sublabel={`${c.desc} · ${allCourses.length} course${allCourses.length!==1?"s":""}`}
                       count={cnt} countLabel={`handout${cnt!==1?"s":""}`} color={c.color||"var(--accent)"}
                       onClick={()=>{setDrillClass(c.id);setDrillCourse(null);setDrillLecturer(null);}} />
                   );
@@ -3684,7 +3689,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
               </div>
               {lecturersInCourse.length===0 ? (
                 <div style={{textAlign:"center",padding:40,color:"var(--text3)",border:"1px dashed var(--border)",borderRadius:12}}>
-                  <div style={{fontSize:40,marginBottom:8}}>👨🏫</div>
+                  <div style={{fontSize:40,marginBottom:8}}>👨‍🏫</div>
                   <div>No lecturer folders yet</div>
                   {isLecturer&&<div style={{fontSize:12,marginTop:6}}>Click "+ New Lecturer Folder" to create one</div>}
                 </div>
@@ -3693,7 +3698,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
                   {lecturersInCourse.map(lec=>{
                     const cnt = courseHandouts.filter(h=>(h.lecturerName||h.uploadedBy?.split("@")[0]||"Unknown")===lec).length;
                     return (
-                      <FolderCard key={lec} icon="👨🏫" label={lec}
+                      <FolderCard key={lec} icon="👨‍🏫" label={lec}
                         sublabel="Lecturer"
                         count={cnt} countLabel={`file${cnt!==1?"s":""}`} color="var(--purple)"
                         onClick={()=>setDrillLecturer(lec)} />
@@ -3709,7 +3714,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
             <>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
                 <div style={{fontWeight:800,fontSize:15,color:"var(--purple)"}}>
-                  👨🏫 {drillLecturer} — {drillCourse}
+                  👨‍🏫 {drillLecturer} — {drillCourse}
                 </div>
                 {isLecturer&&(
                   <button className="btn btn-sm btn-accent" onClick={()=>{
@@ -3804,7 +3809,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
         <div className="modal-overlay" onClick={()=>setShowLecturerModal(false)}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
             <div className="modal-head">
-              <div className="modal-title">👨🏫 Create Lecturer Folder</div>
+              <div className="modal-title">👨‍🏫 Create Lecturer Folder</div>
               <button className="modal-close" onClick={()=>setShowLecturerModal(false)}>✕</button>
             </div>
             <div style={{fontSize:12,color:"var(--text3)",marginBottom:12}}>
@@ -3828,14 +3833,14 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
                       style={{fontSize:11,padding:"3px 10px",borderRadius:7,border:"1px solid var(--border2)",cursor:"pointer",
                         background:newLecturerName===name?"rgba(124,58,237,.15)":"transparent",
                         color:newLecturerName===name?"var(--purple)":"var(--text3)"}}>
-                      👨🏫 {name}
+                      👨‍🏫 {name}
                     </span>
                   );
                 })}
               </div>
             </div>
             <div style={{display:"flex",gap:8}}>
-              <button className="btn btn-purple" style={{flex:1}} onClick={createLecturerFolder}>👨🏫 Create Folder</button>
+              <button className="btn btn-purple" style={{flex:1}} onClick={createLecturerFolder}>👨‍🏫 Create Folder</button>
               <button className="btn" onClick={()=>setShowLecturerModal(false)}>Cancel</button>
             </div>
           </div>
@@ -3874,7 +3879,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
 // ═══════════════════════════════════════════════════════════════════════
 // STUDENT PROFILE
 // ═══════════════════════════════════════════════════════════════════════
-const AVATAR_EMOJIS = ["👩⚕️","👨⚕️","🧑‍⚕️","👩🎓","👨🎓","🧑‍🎓","👩💼","👨💼","🌟","🏆","💡","🦋","🌺","🎯","🩺","🧬","💊","🏥"];
+const AVATAR_EMOJIS = ["👩‍⚕️","👨‍⚕️","🧑‍⚕️","👩‍🎓","👨‍🎓","🧑‍🎓","👩‍💼","👨‍💼","🌟","🏆","💡","🦋","🌺","🎯","🩺","🧬","💊","🏥"];
 const YEAR_OPTIONS = ["Year 1","Year 2","Year 3","Year 4","Year 5","Postgraduate","Intern","Other"];
 
 function StudentProfile({ currentUser, toast }) {
@@ -3894,7 +3899,7 @@ function StudentProfile({ currentUser, toast }) {
     bio: me.bio || "",
     class: me.class || "",
     yearOfStudy: me.yearOfStudy || "",
-    avatar: me.avatar || (me.role === "lecturer" ? "👨🏫" : "👩⚕️"),
+    avatar: me.avatar || (me.role === "lecturer" ? "👨‍🏫" : "👩‍⚕️"),
     matricNumber: me.matricNumber || "",
     specialty: me.specialty || "",
   });
@@ -3910,7 +3915,7 @@ function StudentProfile({ currentUser, toast }) {
       bio: u.bio || "",
       class: u.class || "",
       yearOfStudy: u.yearOfStudy || "",
-      avatar: u.avatar || (u.role === "lecturer" ? "👨🏫" : "👩⚕️"),
+      avatar: u.avatar || (u.role === "lecturer" ? "👨‍🏫" : "👩‍⚕️"),
       matricNumber: u.matricNumber || "",
       specialty: u.specialty || "",
     }));
@@ -3950,7 +3955,7 @@ function StudentProfile({ currentUser, toast }) {
   const passed = results.filter(r => (r.pct || 0) >= 50).length;
 
   const initials = (form.displayName || currentUser)[0]?.toUpperCase() || "?";
-  const roleLabel = me.role === "admin" ? "🛡️ Admin" : me.role === "lecturer" ? "👨🏫 Lecturer" : "🎓 Student";
+  const roleLabel = me.role === "admin" ? "🛡️ Admin" : me.role === "lecturer" ? "👨‍🏫 Lecturer" : "🎓 Student";
   const roleColor = me.role === "admin" ? "#7c3aed" : me.role === "lecturer" ? "#d97706" : "var(--accent)";
 
   return (
@@ -4132,7 +4137,7 @@ function StudentProfile({ currentUser, toast }) {
         {!editMode ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             {(isLecturerRole ? [
-              { icon: "👨🏫", label: "Role", val: "👨🏫 Lecturer" },
+              { icon: "👨‍🏫", label: "Role", val: "👨‍🏫 Lecturer" },
               { icon: "🏫", label: "Classes", val: "All classes (lecturers teach across all classes)" },
               { icon: "🩺", label: "Specialty / Department", val: form.specialty || "Not set" },
             ] : [
@@ -4161,7 +4166,7 @@ function StudentProfile({ currentUser, toast }) {
                 </div>
                 <div style={{ padding: "10px 12px", borderRadius: 10, background: "rgba(217,119,6,.08)", border: "1px solid rgba(217,119,6,.2)" }}>
                   <div style={{ fontSize: 12, color: "#d97706", fontWeight: 700 }}>
-                    👨🏫 Lecturers are not assigned to a specific class — you can teach and interact with all classes.
+                    👨‍🏫 Lecturers are not assigned to a specific class — you can teach and interact with all classes.
                   </div>
                 </div>
               </div>
@@ -4289,7 +4294,7 @@ function StudentProfile({ currentUser, toast }) {
               </div>
               <div style={{ flex: 1 }}>
                 <div style={{ fontWeight: 700, fontSize: 13 }}>{r.subject}</div>
-                <div style={{ fontSize: 11, color: "var(--text3)" }}>{r.type || "Exam"} • {r.date}</div>
+                <div style={{ fontSize: 11, color: "var(--text3)" }}>{r.type || "Exam"} · {r.date}</div>
               </div>
               <div style={{
                 fontWeight: 800, fontSize: 15,
@@ -4414,7 +4419,7 @@ function MCQExamView({ toast, currentUser, banks, onBack, backLabel }) {
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:14}}>
           <div>
             <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:15}}>{sel.subject}</div>
-            <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>{answeredCount}/{sel.questions.length} answered • click any number to jump</div>
+            <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>{answeredCount}/{sel.questions.length} answered · click any number to jump</div>
           </div>
           <button className="btn btn-accent btn-sm" onClick={submitExam}>Submit ✓</button>
         </div>
@@ -4476,7 +4481,7 @@ function MCQExamView({ toast, currentUser, banks, onBack, backLabel }) {
         return (
           <div key={b.id} className="card" style={{animation:`fadeUp .4s ease ${i*.08}s both`}}>
             <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15,marginBottom:4}}>{b.subject}</div>
-            <div style={{fontSize:12,color:"var(--text3)",marginBottom:10}}>{b.year} • {b.questions.length} questions</div>
+            <div style={{fontSize:12,color:"var(--text3)",marginBottom:10}}>{b.year} · {b.questions.length} questions</div>
             {att ? (
               <div>
                 <div style={{fontSize:13,marginBottom:4}}>Score: <span style={{fontWeight:700,color:att.pct>=70?"var(--success)":att.pct>=50?"var(--warn)":"var(--danger)"}}>{att.score}/{att.total} ({att.pct}%)</span></div>
@@ -4645,7 +4650,7 @@ Return ONLY valid JSON with no markdown or backticks:
           <div>
             <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16}}>{sel.subject}</div>
             <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>
-              {sel.questions.length} questions • {answeredCount}/{sel.questions.length} answered • {totalWords} words total
+              {sel.questions.length} questions · {answeredCount}/{sel.questions.length} answered · {totalWords} words total
             </div>
           </div>
           <div style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -4776,23 +4781,23 @@ Return ONLY valid JSON with no markdown or backticks:
             return (
               <div key={b.id} className="card" style={{animation:`fadeUp .4s ease ${i*.08}s both`}}>
                 <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15,marginBottom:4}}>{b.subject}</div>
-                <div style={{fontSize:12,color:"var(--text3)",marginBottom:8}}>{b.questions.length} questions • {b.questions.reduce((s,q)=>s+(+q.marks||10),0)} total marks</div>
+                <div style={{fontSize:12,color:"var(--text3)",marginBottom:8}}>{b.questions.length} questions · {b.questions.reduce((s,q)=>s+(+q.marks||10),0)} total marks</div>
                 {b.description&&<div style={{fontSize:11,color:"var(--text3)",marginBottom:8,fontStyle:"italic"}}>{b.description}</div>}
                 {att ? (
                   <div>
                     {att.pendingManualGrade && !att.manualGrade && (
                       <div style={{background:"rgba(251,146,60,.08)",border:"1px solid rgba(251,146,60,.25)",borderRadius:8,padding:"8px 12px",fontSize:12,color:"var(--warn)",marginBottom:6}}>
-                        ⏳ Submitted • Awaiting manual grading from your lecturer
+                        ⏳ Submitted · Awaiting manual grading from your lecturer
                       </div>
                     )}
                     {att.manualGrade && (
                       <div style={{marginBottom:6}}>
-                        <div style={{fontSize:14,fontWeight:700,marginBottom:2}}>Grade: <span style={{color:"var(--accent)"}}>{att.manualGrade.grade}</span> • {att.manualGrade.pct}%</div>
+                        <div style={{fontSize:14,fontWeight:700,marginBottom:2}}>Grade: <span style={{color:"var(--accent)"}}>{att.manualGrade.grade}</span> · {att.manualGrade.pct}%</div>
                         {att.manualGrade.overallComment && <div style={{fontSize:12,color:"var(--text2)"}}>{att.manualGrade.overallComment}</div>}
                         <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:4}}>✏️ Manually graded on {att.gradedDate}</div>
                       </div>
                     )}
-                    {att.grade && !att.manualGrade && <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Grade: <span style={{color:"var(--accent)"}}>{att.grade}</span> • {att.pct}%</div>}
+                    {att.grade && !att.manualGrade && <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Grade: <span style={{color:"var(--accent)"}}>{att.grade}</span> · {att.pct}%</div>}
                     <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>🔒 Submitted {att.date} — contact lecturer to reset</div>
                   </div>
                 ) : (
@@ -4803,6 +4808,494 @@ Return ONLY valid JSON with no markdown or backticks:
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+
+// ══════════════════════════════════════════════════════════════════
+// ── STUDENT ID CARD GENERATOR ────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+function StudentIDCard({ currentUser, toast }) {
+  const allUsers  = ls("nv-users", []);
+  const allClasses = ls("nv-classes", DEFAULT_CLASSES);
+  const me = allUsers.find(u => u.username === currentUser);
+  const myClass = allClasses.find(c => c.id === me?.class);
+  const cardRef = useRef(null);
+  const [downloading, setDownloading] = useState(false);
+  const [photoData, setPhotoData] = useState(() => ls("nv-id-photo-" + currentUser, null));
+  const fileRef = useRef(null);
+
+  const accentColor = myClass?.color || "#0077b6";
+  const displayName = me?.displayName || currentUser.split("@")[0];
+  const matric = me?.matricNumber || "—";
+  const role = me?.role === "lecturer" ? "Lecturer" : "Student";
+  const joined = me?.joined || new Date().getFullYear();
+
+  const handlePhoto = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) { toast("Photo too large — max 2MB", "error"); return; }
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const data = ev.target.result;
+      setPhotoData(data);
+      try { localStorage.setItem("nv-id-photo-" + currentUser, data); } catch(e) {}
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const downloadCard = async () => {
+    setDownloading(true);
+    try {
+      // Use html2canvas-like approach via canvas
+      const card = cardRef.current;
+      const w = 420, h = 260;
+      const canvas = document.createElement("canvas");
+      canvas.width = w * 2; canvas.height = h * 2;
+      const ctx = canvas.getContext("2d");
+      ctx.scale(2, 2);
+
+      // Background
+      const bg = ctx.createLinearGradient(0, 0, w, h);
+      bg.addColorStop(0, accentColor);
+      bg.addColorStop(1, "#0a2540");
+      ctx.fillStyle = bg;
+      ctx.roundRect(0, 0, w, h, 16);
+      ctx.fill();
+
+      // Header strip
+      ctx.fillStyle = "rgba(255,255,255,0.08)";
+      ctx.fillRect(0, 0, w, 52);
+
+      // School name
+      ctx.fillStyle = "rgba(255,255,255,0.9)";
+      ctx.font = "bold 13px Arial";
+      ctx.fillText("🏥 NURSING ACADEMIC HUB", 20, 22);
+      ctx.fillStyle = "rgba(255,255,255,0.5)";
+      ctx.font = "10px Arial";
+      ctx.fillText("STUDENT IDENTIFICATION CARD", 20, 38);
+
+      // Photo circle
+      const photoX = 30, photoY = 70, photoR = 44;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(photoX + photoR, photoY + photoR, photoR, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255,255,255,0.15)";
+      ctx.fill();
+      ctx.clip();
+      if (photoData) {
+        const img = new Image();
+        await new Promise((res) => {
+          img.onload = res; img.onerror = res;
+          img.src = photoData;
+        });
+        ctx.drawImage(img, photoX, photoY, photoR * 2, photoR * 2);
+      } else {
+        ctx.fillStyle = "rgba(255,255,255,0.3)";
+        ctx.fill();
+        ctx.fillStyle = "white";
+        ctx.font = "bold 32px Arial";
+        ctx.textAlign = "center";
+        ctx.fillText(displayName[0]?.toUpperCase() || "?", photoX + photoR, photoY + photoR + 11);
+        ctx.textAlign = "left";
+      }
+      ctx.restore();
+
+      // Name & details
+      ctx.fillStyle = "white";
+      ctx.font = "bold 18px Arial";
+      ctx.fillText(displayName, 96, 92);
+      ctx.fillStyle = "rgba(255,255,255,0.7)";
+      ctx.font = "11px Arial";
+      ctx.fillText(role.toUpperCase(), 97, 108);
+      ctx.fillStyle = "rgba(255,255,255,0.9)";
+      ctx.font = "12px Arial";
+      ctx.fillText("📚 " + (myClass?.label || "No Class"), 97, 128);
+      ctx.fillText("🎓 " + matric, 97, 146);
+      ctx.fillText("📧 " + currentUser, 97, 164);
+
+      // Bottom bar
+      ctx.fillStyle = "rgba(255,255,255,0.06)";
+      ctx.fillRect(0, h - 44, w, 44);
+      ctx.fillStyle = "rgba(255,255,255,0.4)";
+      ctx.font = "9px Arial";
+      ctx.fillText("Enrolled: " + joined + "  |  Valid for current academic session", 20, h - 26);
+      ctx.fillText("This card is property of Nursing Academic Hub. If found, please return.", 20, h - 12);
+
+      // Watermark diagonal
+      ctx.save();
+      ctx.translate(w/2, h/2);
+      ctx.rotate(-Math.PI / 6);
+      ctx.fillStyle = "rgba(255,255,255,0.04)";
+      ctx.font = "bold 48px Arial";
+      ctx.textAlign = "center";
+      ctx.fillText("NURSING HUB", 0, 0);
+      ctx.restore();
+
+      const url = canvas.toDataURL("image/png");
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `ID_${displayName.replace(/\s+/g, "_")}.png`;
+      a.click();
+      toast("✅ ID card downloaded!", "success");
+    } catch(e) {
+      toast("Download failed: " + e.message, "error");
+    }
+    setDownloading(false);
+  };
+
+  return (
+    <div>
+      <div className="sec-title">🪪 Student ID Card</div>
+      <div className="sec-sub" style={{marginBottom:20}}>Your digital nursing student identification card</div>
+
+      {/* The visual card */}
+      <div ref={cardRef} style={{
+        width:"100%", maxWidth:420, borderRadius:16, overflow:"hidden",
+        background:`linear-gradient(135deg, ${accentColor}, #0a2540)`,
+        boxShadow:"0 20px 60px rgba(0,0,0,0.35)", margin:"0 auto 20px", position:"relative",
+        fontFamily:"'DM Sans',Arial,sans-serif", userSelect:"none",
+      }}>
+        {/* Top strip */}
+        <div style={{background:"rgba(255,255,255,0.08)", padding:"12px 20px", display:"flex", alignItems:"center", gap:10}}>
+          <span style={{fontSize:22}}>🏥</span>
+          <div>
+            <div style={{color:"rgba(255,255,255,.9)", fontWeight:800, fontSize:13, letterSpacing:.5}}>NURSING ACADEMIC HUB</div>
+            <div style={{color:"rgba(255,255,255,.5)", fontSize:9, letterSpacing:2}}>STUDENT IDENTIFICATION CARD</div>
+          </div>
+          <div style={{marginLeft:"auto", textAlign:"right"}}>
+            <div style={{background:"rgba(255,255,255,.15)", borderRadius:6, padding:"2px 8px", fontSize:9, color:"rgba(255,255,255,.7)", letterSpacing:1}}>
+              {new Date().getFullYear()}/{new Date().getFullYear()+1}
+            </div>
+          </div>
+        </div>
+
+        {/* Body */}
+        <div style={{padding:"18px 20px 14px", display:"flex", gap:16, alignItems:"flex-start"}}>
+          {/* Photo */}
+          <div
+            onClick={()=>fileRef.current?.click()}
+            title="Click to change photo"
+            style={{
+              width:88, height:88, borderRadius:"50%", flexShrink:0, cursor:"pointer",
+              background:"rgba(255,255,255,0.15)", border:"3px solid rgba(255,255,255,0.3)",
+              display:"flex", alignItems:"center", justifyContent:"center", overflow:"hidden",
+              position:"relative",
+            }}
+          >
+            {photoData
+              ? <img src={photoData} alt="photo" style={{width:"100%",height:"100%",objectFit:"cover"}} />
+              : <span style={{fontSize:36, color:"white", fontWeight:700}}>{displayName[0]?.toUpperCase() || "?"}</span>
+            }
+            <div style={{
+              position:"absolute", bottom:0, left:0, right:0, background:"rgba(0,0,0,0.5)",
+              color:"white", fontSize:8, textAlign:"center", padding:"3px 0", letterSpacing:.5,
+            }}>📷 PHOTO</div>
+          </div>
+          <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={handlePhoto} />
+
+          {/* Info */}
+          <div style={{flex:1, color:"white"}}>
+            <div style={{fontWeight:800, fontSize:18, lineHeight:1.2, marginBottom:2}}>{displayName}</div>
+            <div style={{fontSize:10, color:"rgba(255,255,255,.6)", fontWeight:700, letterSpacing:1, marginBottom:10}}>{role.toUpperCase()}</div>
+            {[
+              ["📚", myClass?.label || "No Class Assigned"],
+              ["🎓", matric],
+              ["📧", currentUser],
+            ].map(([icon, val]) => (
+              <div key={icon} style={{display:"flex", alignItems:"center", gap:6, marginBottom:4}}>
+                <span style={{fontSize:12}}>{icon}</span>
+                <span style={{fontSize:11, color:"rgba(255,255,255,.85)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>{val}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* QR placeholder */}
+          <div style={{flexShrink:0, width:60, height:60, background:"white", borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", padding:4}}>
+            <svg width="52" height="52" viewBox="0 0 52 52">
+              {/* Simple QR-like pattern */}
+              {[0,1,2,3,4,5,6].map(r=>[0,1,2,3,4,5,6].map(c=>{
+                const isCorner = (r<3&&c<3)||(r<3&&c>3)||(r>3&&c<3);
+                const val = ((r*7+c)*13+17)%3===0 || isCorner;
+                return val ? <rect key={`${r}-${c}`} x={c*7+1} y={r*7+1} width={6} height={6} fill="#0a2540" rx={1}/> : null;
+              }))}
+              <rect x={1} y={1} width={20} height={20} fill="none" stroke="#0a2540" strokeWidth={2}/>
+              <rect x={5} y={5} width={12} height={12} fill="#0a2540"/>
+              <rect x={31} y={1} width={20} height={20} fill="none" stroke="#0a2540" strokeWidth={2}/>
+              <rect x={35} y={5} width={12} height={12} fill="#0a2540"/>
+              <rect x={1} y={31} width={20} height={20} fill="none" stroke="#0a2540" strokeWidth={2}/>
+              <rect x={5} y={35} width={12} height={12} fill="#0a2540"/>
+            </svg>
+          </div>
+        </div>
+
+        {/* Bottom bar */}
+        <div style={{background:"rgba(0,0,0,.25)", padding:"8px 20px"}}>
+          <div style={{fontSize:8.5, color:"rgba(255,255,255,.45)", lineHeight:1.7}}>
+            Enrolled: {joined} &nbsp;|&nbsp; Valid for current academic session<br/>
+            This card is property of Nursing Academic Hub. If found, please return.
+          </div>
+        </div>
+
+        {/* Watermark */}
+        <div style={{
+          position:"absolute", top:"50%", left:"50%", transform:"translate(-50%,-50%) rotate(-20deg)",
+          fontSize:40, fontWeight:900, color:"rgba(255,255,255,.04)", whiteSpace:"nowrap", pointerEvents:"none",
+          userSelect:"none", letterSpacing:4,
+        }}>NURSING HUB</div>
+      </div>
+
+      {/* Actions */}
+      <div style={{display:"flex", gap:10, justifyContent:"center", flexWrap:"wrap"}}>
+        <button className="btn btn-accent" onClick={downloadCard} disabled={downloading} style={{minWidth:160}}>
+          {downloading ? "⏳ Generating..." : "⬇️ Download ID Card"}
+        </button>
+        <button className="btn" onClick={()=>fileRef.current?.click()} style={{minWidth:140}}>
+          📷 Upload Photo
+        </button>
+      </div>
+
+      {!me?.matricNumber && (
+        <div style={{marginTop:16, padding:"10px 14px", background:"rgba(251,146,60,.08)", border:"1px solid rgba(251,146,60,.25)", borderRadius:10, fontSize:12, color:"var(--warn)", textAlign:"center"}}>
+          ⚠️ Your matric number is not set. Go to <b>My Profile → Edit</b> to add it.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// ── PIN / BIOMETRIC LOCK ──────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+// Storage keys:
+//   "nv-pin-{email}"         → hashed 4-digit PIN (SHA-256 hex)
+//   "nv-biometric-{email}"   → "enabled" | "" (biometric registered)
+
+const _hashPin = async (pin) => {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("nvpin:" + pin));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+};
+
+const _pinKey = (email) => "nv-pin-" + email.replace(/[^a-z0-9]/gi,"_");
+const _bioKey  = (email) => "nv-bio-" + email.replace(/[^a-z0-9]/gi,"_");
+
+const getSavedPin  = (email) => { try { return localStorage.getItem(_pinKey(email)); } catch { return null; } };
+const hasBiometric = (email) => { try { return localStorage.getItem(_bioKey(email)) === "enabled"; } catch { return false; } };
+
+function PinSetupModal({ email, onDone, onSkip, toast }) {
+  const [step, setStep] = useState("choose"); // "choose" | "pin" | "bio"
+  const [pin, setPin]   = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [bioLoading, setBioLoading] = useState(false);
+
+  const savePin = async () => {
+    if (pin.length !== 4) return toast("Enter a 4-digit PIN", "error");
+    if (pin !== confirm)  return toast("PINs do not match", "error");
+    const hash = await _hashPin(pin);
+    try { localStorage.setItem(_pinKey(email), hash); } catch {}
+    toast("✅ PIN set successfully!", "success");
+    onDone("pin");
+  };
+
+  const setupBiometric = async () => {
+    setBioLoading(true);
+    try {
+      if (!window.PublicKeyCredential) throw new Error("Biometrics not supported on this device");
+      const challenge = crypto.getRandomValues(new Uint8Array(32));
+      const cred = await navigator.credentials.create({
+        publicKey: {
+          challenge,
+          rp: { name: "Nursing Hub", id: window.location.hostname || "localhost" },
+          user: { id: new TextEncoder().encode(email), name: email, displayName: email.split("@")[0] },
+          pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+          authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" },
+          timeout: 60000,
+        },
+      });
+      if (cred) {
+        try { localStorage.setItem(_bioKey(email), "enabled"); } catch {}
+        toast("✅ Biometric login enabled!", "success");
+        onDone("bio");
+      }
+    } catch(e) {
+      toast("Biometric setup failed: " + (e.message || "Unknown error"), "error");
+    }
+    setBioLoading(false);
+  };
+
+  const pinDots = (val, len=4) => Array.from({length:len}, (_,i) => (
+    <div key={i} style={{
+      width:14, height:14, borderRadius:"50%",
+      background: i < val.length ? "var(--accent)" : "var(--border)",
+      transition:"background .15s",
+    }}/>
+  ));
+
+  return (
+    <div style={{
+      position:"fixed", inset:0, background:"rgba(0,0,0,.65)", zIndex:9999,
+      display:"flex", alignItems:"center", justifyContent:"center", padding:20,
+    }}>
+      <div style={{background:"var(--card)", borderRadius:20, padding:32, maxWidth:360, width:"100%", boxShadow:"0 24px 80px rgba(0,0,0,.4)", textAlign:"center"}}>
+        <div style={{fontSize:52, marginBottom:12}}>🔐</div>
+        <div style={{fontWeight:800, fontSize:18, marginBottom:6}}>Secure Your Account</div>
+        <div style={{fontSize:13, color:"var(--text3)", marginBottom:24}}>
+          Set up quick login so you don't need to type your password every time.
+        </div>
+
+        {step === "choose" && (
+          <>
+            <button className="btn btn-accent" style={{width:"100%", marginBottom:10, padding:"12px 0", fontSize:14}}
+              onClick={()=>setStep("pin")}>🔢 Set 4-Digit PIN</button>
+            {window.PublicKeyCredential && (
+              <button className="btn" style={{width:"100%", marginBottom:10, padding:"12px 0", fontSize:14}}
+                onClick={setupBiometric} disabled={bioLoading}>
+                {bioLoading ? "⏳ Setting up..." : "🫆 Use Fingerprint / Face ID"}
+              </button>
+            )}
+            <button style={{background:"none", border:"none", color:"var(--text3)", fontSize:12, cursor:"pointer", marginTop:6}}
+              onClick={onSkip}>Skip for now →</button>
+          </>
+        )}
+
+        {step === "pin" && (
+          <>
+            <div style={{marginBottom:16}}>
+              <div style={{fontSize:12, color:"var(--text3)", marginBottom:8}}>Enter 4-digit PIN</div>
+              <div style={{display:"flex", justifyContent:"center", gap:8, marginBottom:12}}>{pinDots(pin)}</div>
+              <input
+                type="password" inputMode="numeric" maxLength={4}
+                value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,4))}
+                style={{textAlign:"center", fontSize:24, letterSpacing:8, width:140, padding:"10px 0", borderRadius:10, border:"2px solid var(--accent)", outline:"none", background:"var(--bg4)", color:"var(--text)"}}
+                autoFocus
+              />
+            </div>
+            {pin.length === 4 && (
+              <div style={{marginBottom:16}}>
+                <div style={{fontSize:12, color:"var(--text3)", marginBottom:8}}>Confirm PIN</div>
+                <div style={{display:"flex", justifyContent:"center", gap:8, marginBottom:12}}>{pinDots(confirm)}</div>
+                <input
+                  type="password" inputMode="numeric" maxLength={4}
+                  value={confirm} onChange={e=>setConfirm(e.target.value.replace(/\D/g,"").slice(0,4))}
+                  style={{textAlign:"center", fontSize:24, letterSpacing:8, width:140, padding:"10px 0", borderRadius:10, border:"2px solid var(--border)", outline:"none", background:"var(--bg4)", color:"var(--text)"}}
+                />
+              </div>
+            )}
+            <button className="btn btn-accent" style={{width:"100%", marginBottom:8}} onClick={savePin}
+              disabled={pin.length < 4 || confirm.length < 4}>
+              ✅ Confirm PIN
+            </button>
+            <button style={{background:"none", border:"none", color:"var(--text3)", fontSize:12, cursor:"pointer"}}
+              onClick={()=>{setStep("choose"); setPin(""); setConfirm("");}}>← Back</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PinUnlockScreen({ email, onUnlock, onUsePassword, toast }) {
+  const [pin, setPin]   = useState("");
+  const [error, setError] = useState("");
+  const [bioLoading, setBioLoading] = useState(false);
+  const [tries, setTries] = useState(0);
+
+  const tryPin = async (value) => {
+    if (value.length !== 4) return;
+    const hash = await _hashPin(value);
+    const saved = getSavedPin(email);
+    if (hash === saved) {
+      onUnlock();
+    } else {
+      setTries(t => t + 1);
+      setError(tries >= 2 ? "Too many wrong attempts. Use password instead." : "Wrong PIN — try again");
+      setPin("");
+      setTimeout(() => setError(""), 2000);
+    }
+  };
+
+  const tryBiometric = async () => {
+    setBioLoading(true);
+    try {
+      const challenge = crypto.getRandomValues(new Uint8Array(32));
+      const assertion = await navigator.credentials.get({
+        publicKey: {
+          challenge,
+          userVerification: "required",
+          timeout: 60000,
+          rpId: window.location.hostname || "localhost",
+        },
+      });
+      if (assertion) { onUnlock(); return; }
+      setError("Biometric not recognised");
+    } catch(e) {
+      setError("Biometric failed — use PIN or password");
+    }
+    setBioLoading(false);
+  };
+
+  const pinDots = (val) => Array.from({length:4}, (_,i) => (
+    <div key={i} style={{
+      width:18, height:18, borderRadius:"50%",
+      background: i < val.length ? "var(--accent)" : "var(--bg4)",
+      border: "2px solid " + (i < val.length ? "var(--accent)" : "var(--border)"),
+      transition:"all .15s",
+    }}/>
+  ));
+
+  return (
+    <div style={{
+      position:"fixed", inset:0, background:"var(--bg)", zIndex:9990,
+      display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", padding:20,
+    }}>
+      <div style={{background:"var(--card)", borderRadius:24, padding:36, maxWidth:340, width:"100%", boxShadow:"0 24px 80px rgba(0,0,0,.2)", textAlign:"center"}}>
+        <div style={{fontSize:56, marginBottom:8}}>🔒</div>
+        <div style={{fontWeight:800, fontSize:18, marginBottom:4}}>Welcome back!</div>
+        <div style={{fontSize:13, color:"var(--text3)", marginBottom:6}}>
+          {email.split("@")[0]}
+        </div>
+        <div style={{fontSize:12, color:"var(--text3)", marginBottom:24}}>Enter your PIN to continue</div>
+
+        <div style={{display:"flex", justifyContent:"center", gap:10, marginBottom:20}}>
+          {pinDots(pin)}
+        </div>
+
+        {/* PIN numpad */}
+        <div style={{display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10, marginBottom:16, maxWidth:240, margin:"0 auto 16px"}}>
+          {[1,2,3,4,5,6,7,8,9,"",0,"⌫"].map((k, i) => (
+            k === "" ? <div key={i} /> :
+            <button key={i} onClick={() => {
+              if (k === "⌫") { setPin(p=>p.slice(0,-1)); setError(""); }
+              else {
+                const next = (pin + k).slice(0,4);
+                setPin(next);
+                if (next.length === 4) tryPin(next);
+              }
+            }} style={{
+              height:52, borderRadius:14, border:"1.5px solid var(--border)",
+              background: k === "⌫" ? "var(--bg4)" : "var(--card2)",
+              fontSize: k === "⌫" ? 18 : 22, fontWeight:700, cursor:"pointer",
+              color:"var(--text)", transition:"all .1s",
+              boxShadow:"0 2px 8px rgba(0,0,0,.06)",
+            }}>
+              {k}
+            </button>
+          ))}
+        </div>
+
+        {error && <div style={{color:"var(--danger)", fontSize:12, marginBottom:12, fontWeight:600}}>{error}</div>}
+
+        {hasBiometric(email) && (
+          <button className="btn" style={{width:"100%", marginBottom:8, fontSize:13}} onClick={tryBiometric} disabled={bioLoading}>
+            {bioLoading ? "⏳ Verifying..." : "🫆 Use Fingerprint / Face ID"}
+          </button>
+        )}
+        <button style={{background:"none", border:"none", color:"var(--accent)", fontSize:12, cursor:"pointer", textDecoration:"underline"}}
+          onClick={onUsePassword}>
+          Use password instead →
+        </button>
+      </div>
     </div>
   );
 }
@@ -4992,7 +5485,7 @@ function AdminSchoolPQ({ toast }) {
             <span style={{fontWeight:800,color:"var(--accent)"}}>{currentClass?.label}</span>
             <span style={{color:"var(--text3)"}}>›</span>
             <span style={{fontWeight:800,color:"var(--text)"}}>{selCourse}</span>
-            <span style={{marginLeft:"auto",fontSize:11,color:"var(--text3)"}}>{cd.mcq.length} MCQ • {cd.essay.length} Essay</span>
+            <span style={{marginLeft:"auto",fontSize:11,color:"var(--text3)"}}>{cd.mcq.length} MCQ · {cd.essay.length} Essay</span>
           </div>
 
           {/* MCQ / Essay tabs */}
@@ -5435,7 +5928,7 @@ const buildDeviceIdentity = (() => {
   let _cached = null;
   return async () => {
     if (_cached) return _cached;
-    const lsRaw = localStorage.getItem("nv-did-v3");
+    const lsRaw = (() => { try { return localStorage.getItem("nv-did-v3"); } catch { return null; } })();
     const idbUUID = await _getPersistentUUID();
     if (lsRaw) {
       try {
@@ -5645,7 +6138,7 @@ function AdminNcCodes({ toast }) {
           {codes.length>0&&<button className="btn btn-danger btn-sm" onClick={deleteAll}>🗑️ Delete All</button>}
         </div>
         <div style={{fontSize:11,color:"var(--text3)",marginTop:8}}>
-          Format: <code style={{background:"var(--bg4)",padding:"1px 6px",borderRadius:4}}>NC-XXXX-XXXX-XXXX</code> • Share codes with students who have paid.
+          Format: <code style={{background:"var(--bg4)",padding:"1px 6px",borderRadius:4}}>NC-XXXX-XXXX-XXXX</code> · Share codes with students who have paid.
         </div>
       </div>
 
@@ -5680,7 +6173,7 @@ function AdminNcCodes({ toast }) {
                 </span>
               </div>
               {c.used&&<div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>
-                Used by {c.usedBy} • {c.usedAt?new Date(c.usedAt).toLocaleDateString():""}
+                Used by {c.usedBy} · {c.usedAt?new Date(c.usedAt).toLocaleDateString():""}
               </div>}
             </div>
             <div style={{display:"flex",gap:6}}>
@@ -5703,7 +6196,7 @@ function AdminNcCodes({ toast }) {
                   <div style={{width:36,height:36,borderRadius:"50%",background:"rgba(34,197,94,.15)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{u.avatar||"👤"}</div>
                   <div style={{flex:1,minWidth:0}}>
                     <div style={{fontWeight:700,fontSize:13}}>{u.displayName||u.username.split("@")[0]}</div>
-                    <div style={{fontSize:11,color:"var(--text3)",marginTop:1}}>{u.username} • Code: <b>{u.ncCode||"Manual"}</b></div>
+                    <div style={{fontSize:11,color:"var(--text3)",marginTop:1}}>{u.username} · Code: <b>{u.ncCode||"Manual"}</b></div>
                     {dev ? (
                       <div style={{marginTop:6,padding:"6px 10px",borderRadius:8,background:"var(--bg4)",border:"1px solid var(--border)",fontSize:11}}>
                         <div style={{display:"flex",gap:16,flexWrap:"wrap"}}>
@@ -5959,7 +6452,7 @@ function NcPaywall({ currentUser, onUnlocked, toast, preview, isMock }) {
                 onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 4px 16px rgba(11,164,219,.35)";}}
                 onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 2px 8px rgba(11,164,219,.2)";}}>
                 <div style={{width:40,height:40,borderRadius:"50%",background:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:11,color:"#0ba4db",letterSpacing:-1,flexShrink:0}}>PSK</div>
-                <div><div style={{color:"white",fontWeight:800,fontSize:14}}>Pay with Paystack</div><div style={{color:"rgba(255,255,255,.8)",fontSize:11}}>Secure card payment • Code delivered instantly</div></div>
+                <div><div style={{color:"white",fontWeight:800,fontSize:14}}>Pay with Paystack</div><div style={{color:"rgba(255,255,255,.8)",fontSize:11}}>Secure card payment · Code delivered instantly</div></div>
               </div>
             </div>
             <div style={{textAlign:"center",fontSize:12,color:"var(--text3)",lineHeight:1.9,padding:"10px 14px",background:"var(--bg4)",borderRadius:10,border:"1px solid var(--border)"}}>
@@ -6262,7 +6755,7 @@ function AdminNursingExams({ toast }) {
           <div style={{fontWeight:800,fontSize:15,color:meta.color}}>{meta.short} — {selYear} {NC_PAPER_TYPES.find(p=>p.key===selPaper)?.label}</div>
           <div style={{fontSize:11,color:"var(--text3)"}}>
             {isOsce ? `${osceData.checklists?.length||0} checklist(s)` : `${paperData.questions?.length||0} question(s)`}
-            {" • "}
+            {" · "}
             {(isOsce?osceData:paperData).published ? "🟢 Published" : "📋 Draft"}
           </div>
         </div>
@@ -6649,7 +7142,7 @@ function NursingExamsView({ toast, currentUser, initialExam, isAdmin }) {
                 {!visible&&"No content yet"}
                 {visible&&pt.key!=="osce"&&`${pd.questions.length}Q`}
                 {visible&&pt.key==="osce"&&`${pd.checklists.length} skills`}
-                {visible&&archived&&" • 🗃️"}
+                {visible&&archived&&" · 🗃️"}
               </div>
               {att&&pt.key!=="osce"&&<div style={{marginTop:4,fontSize:10,fontWeight:700,color:"var(--success)"}}>✅ {att.pct}%</div>}
             </div>
@@ -6675,7 +7168,7 @@ function NursingExamsView({ toast, currentUser, initialExam, isAdmin }) {
                 <div style={{fontWeight:800,fontSize:16,color:meta.color}}>{meta.short} — {selYear} {pt.label}</div>
                 <div style={{fontSize:11,color:"var(--text3)"}}>
                   {selPaper!=="osce"?`${pd.questions.length} questions`:`${pd.checklists.length} clinical skills`}
-                  {archived&&" • 🗃️ Archived"}
+                  {archived&&" · 🗃️ Archived"}
                 </div>
               </div>
               {archived&&<span className="tag" style={{borderColor:"var(--text3)",color:"var(--text3)"}}>🗃️ Archive</span>}
@@ -6686,7 +7179,7 @@ function NursingExamsView({ toast, currentUser, initialExam, isAdmin }) {
                 {att&&(
                   <div style={{marginBottom:14,padding:"10px 14px",background:`${att.pct>=70?"rgba(34,197,94,.07)":att.pct>=50?"rgba(251,146,60,.07)":"rgba(239,68,68,.07)"}`,borderRadius:10,border:`1px solid ${att.pct>=70?"var(--success)":att.pct>=50?"var(--warn)":"var(--danger)"}`}}>
                     <div style={{fontWeight:800,fontSize:13}}>Your Score: <span style={{color:att.pct>=70?"var(--success)":att.pct>=50?"var(--warn)":"var(--danger)"}}>{att.score}/{att.total} — {att.pct}%</span></div>
-                    <div style={{fontSize:10,color:"var(--text3)",marginTop:2}}>Taken {att.date} • 🔒 1 attempt used</div>
+                    <div style={{fontSize:10,color:"var(--text3)",marginTop:2}}>Taken {att.date} · 🔒 1 attempt used</div>
                     <div className="progress-wrap" style={{marginTop:6}}>
                       <div className="progress-fill" style={{width:`${att.pct}%`,background:att.pct>=70?"var(--success)":att.pct>=50?"var(--warn)":"var(--danger)"}} />
                     </div>
@@ -6770,7 +7263,7 @@ function NursingOsceView({ osce, meta, year, onBack, currentUser, isUnlocked }) 
         <button className="btn btn-sm" onClick={onBack}>← Back</button>
         <div style={{flex:1}}>
           <div style={{fontWeight:800,fontSize:16,color:meta.color}}>{meta.icon} {meta.short} — {year} OSCE</div>
-          <div style={{fontSize:11,color:"var(--text3)"}}>Clinical Skills Checklists • {checklists.length} skill{checklists.length!==1?"s":""}</div>
+          <div style={{fontSize:11,color:"var(--text3)"}}>Clinical Skills Checklists · {checklists.length} skill{checklists.length!==1?"s":""}</div>
         </div>
         <div style={{display:"flex",gap:6}}>
           <button className="btn btn-sm" onClick={()=>{setExpandAll(true);setExpanded({});}}>Expand All</button>
@@ -6944,7 +7437,7 @@ function NursingMCQExam({ toast, currentUser, paper, meta, onBack, isUnlocked })
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:14,flexWrap:"wrap"}}>
         <div>
           <div style={{fontWeight:800,fontSize:15,color:meta.color}}>{meta.icon} {paper.title}</div>
-          <div style={{fontSize:11,color:"var(--text3)"}}>{answeredCount}/{visibleQs.length} answered • click any number to jump</div>
+          <div style={{fontSize:11,color:"var(--text3)"}}>{answeredCount}/{visibleQs.length} answered · click any number to jump</div>
         </div>
         <div style={{display:"flex",gap:8}}>
           <button className="btn btn-sm" onClick={onBack}>✕ Exit</button>
@@ -7200,7 +7693,7 @@ function SchoolPastQuestionsView({ toast, currentUser }) {
               <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:16,flexWrap:"wrap"}}>
                 <button className="btn btn-sm" onClick={()=>setSelCourse(null)}>← {currentClass.label} Courses</button>
                 <div style={{fontWeight:800,fontSize:15,color:"var(--text)"}}>{selCourse}</div>
-                <span className="tag" style={{marginLeft:"auto"}}>{cd.mcq.length} MCQ • {cd.essay.length} Essay</span>
+                <span className="tag" style={{marginLeft:"auto"}}>{cd.mcq.length} MCQ · {cd.essay.length} Essay</span>
               </div>
 
               {/* MCQ / Essay tabs */}
@@ -7232,13 +7725,13 @@ function SchoolPastQuestionsView({ toast, currentUser }) {
                         onClick={()=>{setExamPaper({questions:cd.mcq,title:`${selCourse} — Practice Exam`,courseKey:ck(selClass,selCourse),classLabel:currentClass.label,course:selCourse});setExamMode("exam");}}>
                         <div style={{fontSize:28,marginBottom:6}}>📝</div>
                         <div style={{fontWeight:800,fontSize:13,color:"var(--accent)"}}>Take Practice Exam</div>
-                        <div style={{fontSize:11,color:"var(--text3)",marginTop:3}}>Timed • score tracked • 1 attempt</div>
+                        <div style={{fontSize:11,color:"var(--text3)",marginTop:3}}>Timed · score tracked · 1 attempt</div>
                       </div>
                       <div className="card" style={{flex:1,minWidth:160,textAlign:"center",padding:"16px 12px",cursor:"pointer",borderTop:"3px solid var(--purple)"}}
                         onClick={()=>{setExamPaper({questions:cd.mcq,title:`${selCourse} — Review Mode`,courseKey:ck(selClass,selCourse),classLabel:currentClass.label,course:selCourse});setExamMode("review");}}>
                         <div style={{fontSize:28,marginBottom:6}}>📖</div>
                         <div style={{fontWeight:800,fontSize:13,color:"var(--purple)"}}>Review Mode</div>
-                        <div style={{fontSize:11,color:"var(--text3)",marginTop:3}}>See answers • no attempt limit</div>
+                        <div style={{fontSize:11,color:"var(--text3)",marginTop:3}}>See answers · no attempt limit</div>
                       </div>
                     </div>
 
@@ -7404,7 +7897,7 @@ function SchoolMCQExam({ toast, currentUser, paper, onBack }) {
       <div className="progress-wrap" style={{marginBottom:14}}>
         <div className="progress-fill" style={{width:`${(answeredCount/paper.questions.length)*100}%`,background:"var(--accent)"}} />
       </div>
-      <div style={{fontSize:11,color:"var(--text3)",marginBottom:6}}>Question {qIdx+1} of {paper.questions.length}{q.year?` • ${q.year}`:""}</div>
+      <div style={{fontSize:11,color:"var(--text3)",marginBottom:6}}>Question {qIdx+1} of {paper.questions.length}{q.year?` · ${q.year}`:""}</div>
       <div className="card" style={{marginBottom:12}}>
         <div style={{fontWeight:700,fontSize:16,lineHeight:1.5}}>{q.q}</div>
       </div>
@@ -7498,7 +7991,7 @@ function NursingExamsStandaloneView({ toast, currentUser, initialExam }) {
     <div>
       <div style={{marginBottom:20}}>
         <div className="sec-title">🎓 Nursing Council Exams</div>
-        <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>GNC • Midwifery • Public Health Nursing past papers and live exam sessions.</div>
+        <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>GNC · Midwifery · Public Health Nursing past papers and live exam sessions.</div>
       </div>
       <NursingExamsView toast={toast} currentUser={currentUser} initialExam={initialExam} />
     </div>
@@ -7511,7 +8004,7 @@ function PastQuestionsView({ toast, currentUser }) {
   const [tab, setTab] = useState("school");
   const TABS = [
     {key:"school", icon:"🏫", label:"School Past Questions", sub:"Browse by class & course"},
-    {key:"nursing", icon:"🎓", label:"Nursing Council Exams", sub:"GNC • Midwifery • Public Health"},
+    {key:"nursing", icon:"🎓", label:"Nursing Council Exams", sub:"GNC · Midwifery · Public Health"},
   ];
   return (
     <div>
@@ -8513,7 +9006,7 @@ function Messages({ user, toast, onUnreadChange }) {
   const myClass = allClasses.find(c => c.id === myClassId);
 
   return (
-    <React.Fragment>
+    <Fragment>
     <div style={{ display:"flex", flexDirection:"column", height:"calc(100vh - 110px)", minHeight:500 }}>
 
       {/* ── Header bar ── */}
@@ -8599,7 +9092,7 @@ function Messages({ user, toast, onUnreadChange }) {
                       <div style={{ width:32, height:32, borderRadius:9, background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🏫</div>
                       <div>
                         <div style={{ fontWeight:800, fontSize:14, color:"var(--text)" }}>{allClasses.find(c=>c.id===broadcastClass)?.label}</div>
-                        <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===broadcastClass).length} students • Group chat</div>
+                        <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===broadcastClass).length} students · Group chat</div>
                       </div>
                     </div>
 
@@ -8680,7 +9173,7 @@ function Messages({ user, toast, onUnreadChange }) {
                 <div style={{ width:32, height:32, borderRadius:9, background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🏫</div>
                 <div>
                   <div style={{ fontWeight:800, fontSize:14, color:"var(--text)" }}>{allClasses.find(c=>c.id===myClassId)?.label || "Class Group Chat"}</div>
-                  <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===myClassId).length + 1} members • Group chat</div>
+                  <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===myClassId).length + 1} members · Group chat</div>
                 </div>
               </div>
               {/* Messages */}
@@ -8973,7 +9466,7 @@ function Messages({ user, toast, onUnreadChange }) {
         onEnd={() => setCallModal(null)}
       />
     )}
-    </React.Fragment>
+    </Fragment>
   );
 }
 
@@ -9033,7 +9526,7 @@ function Notifications({ currentUser, onRead }) {
                 <div style={{flex:1}}>
                   <div style={{fontWeight:700,fontSize:14,marginBottom:3}}>{n.title}</div>
                   <div style={{fontSize:13,color:"var(--text2)",marginBottom:6}}>{n.body}</div>
-                  <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{n.date} • {n.time}</div>
+                  <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{n.date} · {n.time}</div>
                 </div>
                 <button className="btn btn-sm" style={{flexShrink:0}} onClick={()=>del(n.id)}>✕</button>
               </div>
@@ -9163,7 +9656,7 @@ function CbtExamManager({ toast, currentUser }) {
     else {
       const withAns  = items.filter(i => i._hasAns).length;
       const noAns    = items.length - withAns;
-      setParseMsg(`✅ ${items.length} question${items.length>1?"s":""} detected${noAns>0?` • ⚠️ ${noAns} missing answer`:""}. Review below then import.`);
+      setParseMsg(`✅ ${items.length} question${items.length>1?"s":""} detected${noAns>0?` · ⚠️ ${noAns} missing answer`:""}. Review below then import.`);
     }
   }, [pasteQ, pasteA]);
 
@@ -9299,7 +9792,7 @@ function CbtExamManager({ toast, currentUser }) {
     @media print{.no-print{display:none}}</style></head>
     <body>
     <h1>📋 ${exam.title}</h1>
-    <p>Class: ${cls?.label||exam.classId} &nbsp;•&nbsp; Subject: ${exam.subject||"—"} &nbsp;•&nbsp; Questions: ${exam.questions.length} &nbsp;•&nbsp; Duration: ${exam.duration} min &nbsp;•&nbsp; Generated: ${new Date().toLocaleString()}</p>
+    <p>Class: ${cls?.label||exam.classId} &nbsp;·&nbsp; Subject: ${exam.subject||"—"} &nbsp;·&nbsp; Questions: ${exam.questions.length} &nbsp;·&nbsp; Duration: ${exam.duration} min &nbsp;·&nbsp; Generated: ${new Date().toLocaleString()}</p>
     <button class="no-print" onclick="window.print()" style="margin-bottom:16px;padding:8px 20px;background:#0077b6;color:white;border:none;border-radius:6px;cursor:pointer;font-size:14px">🖨️ Print</button>
     <table><thead><tr><th>#</th><th>Student</th><th>Score</th><th>%</th><th>Grade</th><th>Submitted</th></tr></thead>
     <tbody>${rows}</tbody></table>
@@ -9412,7 +9905,7 @@ function CbtExamManager({ toast, currentUser }) {
               <div>
                 <div style={{fontSize:11,fontWeight:800,color:"var(--accent)",marginBottom:5}}>
                   📝 Paste Questions
-                  <span style={{fontWeight:400,color:"var(--text3)",marginLeft:8}}>Supports: Q:/1./numbered • A:/B: or A)/B) or 1)/2) options • ANS: inline</span>
+                  <span style={{fontWeight:400,color:"var(--text3)",marginLeft:8}}>Supports: Q:/1./numbered · A:/B: or A)/B) or 1)/2) options · ANS: inline</span>
                 </div>
                 <textarea
                   className="paste-box"
@@ -9568,7 +10061,7 @@ function CbtExamManager({ toast, currentUser }) {
         <button className="btn" onClick={()=>{setView("list");setForm({...blank});setEditQIdx(null);setSingleQ({q:"",options:["","","",""],ans:0});}}>✕ Cancel</button>
       </div>
       <div style={{fontSize:11,color:"var(--text3)",textAlign:"center",paddingBottom:8}}>
-        Drafts are saved but invisible to students • Published exams auto-archive after 24 hours
+        Drafts are saved but invisible to students · Published exams auto-archive after 24 hours
       </div>
     </div>
   );
@@ -9591,7 +10084,7 @@ function CbtExamManager({ toast, currentUser }) {
           <div style={{flex:1}}>
             <div style={{fontWeight:800,fontSize:16}}>{selExam.title}</div>
             <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>
-              {classes.find(c=>c.id===selExam.classId)?.label} • {selExam.questions.length}Q • {selExam.duration}min
+              {classes.find(c=>c.id===selExam.classId)?.label} · {selExam.questions.length}Q · {selExam.duration}min
               {selExam.publishedAt&&<span style={{marginLeft:8}}>Published: {new Date(selExam.publishedAt).toLocaleString()}</span>}
             </div>
           </div>
@@ -9603,7 +10096,7 @@ function CbtExamManager({ toast, currentUser }) {
         {/* Summary stats */}
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))",gap:10,marginBottom:16}}>
           {[
-            {icon:"👨🎓",label:"Enrolled",    val:studentsInClass.length,    color:"var(--accent)"},
+            {icon:"👨‍🎓",label:"Enrolled",    val:studentsInClass.length,    color:"var(--accent)"},
             {icon:"✅",label:"Submitted",    val:examResults.length,         color:"var(--success)"},
             {icon:"⏳",label:"Pending",      val:notYetTaken.length,         color:"var(--warn)"},
             {icon:"📊",label:"Avg Score",    val:avgPct!==null?avgPct+"%":"—", color:"var(--purple)"},
@@ -9729,7 +10222,7 @@ function CbtExamManager({ toast, currentUser }) {
                       <div>
                         <div style={{fontWeight:700,fontSize:13,marginBottom:3}}>{student}</div>
                         {devInfo&&<div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>
-                          🌐 {devInfo.ip||"unknown IP"} • {devInfo.ua?.slice(0,60)||"unknown UA"}
+                          🌐 {devInfo.ip||"unknown IP"} · {devInfo.ua?.slice(0,60)||"unknown UA"}
                         </div>}
                       </div>
                       <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
@@ -9750,7 +10243,7 @@ function CbtExamManager({ toast, currentUser }) {
                             <img src={v.snapshot} alt="snapshot"
                               style={{width:90,height:68,objectFit:"cover",borderRadius:6,border:"2px solid rgba(168,85,247,.3)",cursor:"pointer"}}
                               onClick={()=>window.open(v.snapshot,"_blank")}
-                              title={`${v.type} • ${new Date(v.ts).toLocaleTimeString()}`}
+                              title={`${v.type} · ${new Date(v.ts).toLocaleTimeString()}`}
                             />
                             <div style={{position:"absolute",bottom:2,left:2,right:2,fontSize:9,
                               background:"rgba(0,0,0,.65)",color:"white",borderRadius:3,padding:"1px 3px",textAlign:"center"}}>
@@ -10498,7 +10991,7 @@ function CbtStudentView({ toast, currentUser }) {
           <button className="btn btn-sm" onClick={()=>{setMode("list");setActiveExam(null);}}>← Back</button>
           <div style={{flex:1}}>
             <div style={{fontWeight:800,fontSize:15,color:"var(--warn)"}}>🗄️ {activeExam.title}</div>
-            <div style={{fontSize:11,color:"var(--text3)"}}>Archived • Read-Only Review Mode</div>
+            <div style={{fontSize:11,color:"var(--text3)"}}>Archived · Read-Only Review Mode</div>
           </div>
           <button className="btn btn-sm" onClick={()=>setShowAns(activeExam.questions.reduce((o,_,i)=>({...o,[i]:true}),{}))}>Show All ✓</button>
           <button className="btn btn-sm" onClick={()=>setShowAns({})}>Hide All</button>
@@ -10506,7 +10999,7 @@ function CbtStudentView({ toast, currentUser }) {
         {myR&&(
           <div className="card" style={{marginBottom:14,textAlign:"center",borderTop:`3px solid ${myR.percent>=70?"var(--success)":myR.percent>=50?"var(--warn)":"var(--danger)"}`}}>
             <div style={{fontSize:12,color:"var(--text3)",marginBottom:4}}>Your score on this exam</div>
-            <div style={{fontWeight:800,fontSize:20,color:"var(--accent)"}}>{myR.score}/{myR.total} • {myR.percent}% • Grade {myR.percent>=70?"A":myR.percent>=60?"B":myR.percent>=50?"C":myR.percent>=40?"D":"F"}</div>
+            <div style={{fontWeight:800,fontSize:20,color:"var(--accent)"}}>{myR.score}/{myR.total} · {myR.percent}% · Grade {myR.percent>=70?"A":myR.percent>=60?"B":myR.percent>=50?"C":myR.percent>=40?"D":"F"}</div>
           </div>
         )}
         {activeExam.questions.map((q,i)=>(
@@ -11000,7 +11493,7 @@ function PoolList({ pool, editIdx, setForm, setEditIdx, setMode, deleteOne }) {
         {pages>1&&(
           <div style={{display:"flex",gap:6,alignItems:"center"}}>
             <button className="btn btn-sm" disabled={page===0} onClick={()=>setPage(p=>p-1)}>← Prev</button>
-            <span style={{fontSize:11,color:"var(--text3)"}}>Page {page+1}/{pages} • Q{page*PER_PAGE+1}–{Math.min((page+1)*PER_PAGE,pool.length)}</span>
+            <span style={{fontSize:11,color:"var(--text3)"}}>Page {page+1}/{pages} · Q{page*PER_PAGE+1}–{Math.min((page+1)*PER_PAGE,pool.length)}</span>
             <button className="btn btn-sm" disabled={page>=pages-1} onClick={()=>setPage(p=>p+1)}>Next →</button>
           </div>
         )}
@@ -11081,7 +11574,7 @@ function AdminNcArchiveManager({ toast }) {
         <div>
           <div style={{fontWeight:800,fontSize:15,color:"var(--accent)"}}>🗄️ NC Exam Archive</div>
           <div style={{fontSize:12,color:"var(--text3)",marginTop:2}}>
-            {archive.length} item{archive.length!==1?"s":""} saved • Students can retake or review anytime
+            {archive.length} item{archive.length!==1?"s":""} saved · Students can retake or review anytime
           </div>
         </div>
         {archive.length>0&&<button className="btn btn-sm btn-danger" onClick={deleteAll}>🗑️ Delete All</button>}
@@ -11106,7 +11599,7 @@ function AdminNcArchiveManager({ toast }) {
                 <div style={{fontWeight:700,fontSize:13}}>{e.title}</div>
                 <div style={{fontSize:11,color:"var(--text3)"}}>
                   {e.type==="osce"?`${e.checklists?.length||0} skills`:e.type==="dailymock"?`${e.questions?.length||0} questions`:`${e.questions?.length||0} questions`}
-                  {" • "}Saved {new Date(e.savedAt).toLocaleDateString()}
+                  {" · "}Saved {new Date(e.savedAt).toLocaleDateString()}
                 </div>
               </div>
               <button className="btn btn-sm btn-danger" onClick={()=>deleteEntry(e.id)}>🗑️</button>
@@ -11168,7 +11661,7 @@ function NcArchiveView({ toast, currentUser }) {
     <div>
       <div style={{fontWeight:800,fontSize:15,marginBottom:4,color:"var(--accent)"}}>🗄️ Exam Archive</div>
       <div style={{fontSize:12,color:"var(--text3)",marginBottom:20}}>
-        {archive.length} item{archive.length!==1?"s":" "} • Retake anytime • No attempt limit
+        {archive.length} item{archive.length!==1?"s":" "} · Retake anytime · No attempt limit
       </div>
 
       {mcqEntries.length>0&&(
@@ -11183,8 +11676,8 @@ function NcArchiveView({ toast, currentUser }) {
                     <div style={{flex:1}}>
                       <div style={{fontWeight:800,fontSize:14,marginBottom:3}}>{e.title}</div>
                       <div style={{fontSize:11,color:"var(--text3)"}}>
-                        {e.type==="dailymock"?"📅 Daily Mock":"📄 Past Paper"} • {e.questions?.length||0} questions
-                        {" • "}🗄️ {new Date(e.savedAt).toLocaleDateString()}
+                        {e.type==="dailymock"?"📅 Daily Mock":"📄 Past Paper"} · {e.questions?.length||0} questions
+                        {" · "}🗄️ {new Date(e.savedAt).toLocaleDateString()}
                       </div>
                     </div>
                     <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
@@ -11213,7 +11706,7 @@ function NcArchiveView({ toast, currentUser }) {
                   <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
                     <div style={{flex:1}}>
                       <div style={{fontWeight:800,fontSize:14,marginBottom:3}}>{e.title}</div>
-                      <div style={{fontSize:11,color:"var(--text3)"}}>🩺 {e.checklists?.length||0} clinical skills • 🗄️ {new Date(e.savedAt).toLocaleDateString()}</div>
+                      <div style={{fontSize:11,color:"var(--text3)"}}>🩺 {e.checklists?.length||0} clinical skills · 🗄️ {new Date(e.savedAt).toLocaleDateString()}</div>
                     </div>
                     <button className="btn btn-sm btn-accent"
                       style={{background:`linear-gradient(135deg,${meta.color},${meta.color}bb)`,border:"none"}}
@@ -11320,7 +11813,7 @@ function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
       <div className="nc-card" style={{textAlign:"center",padding:"32px 28px"}}>
         <div style={{fontSize:52,marginBottom:10}}>📅</div>
         <div style={{fontWeight:800,fontSize:22,color:"#2d4a1e",marginBottom:4}}>{mockTitle || "Daily Mock Exam"}</div>
-        <div style={{fontSize:13,color:"#6b8a52",marginBottom:20}}>{today} • {questions.length} Questions • Mixed Specialties</div>
+        <div style={{fontSize:13,color:"#6b8a52",marginBottom:20}}>{today} · {questions.length} Questions · Mixed Specialties</div>
         {!isUnlockedFull && (
           <div style={{padding:"8px 14px",borderRadius:9,marginBottom:16,background:"rgba(251,146,60,.1)",border:"1px solid rgba(251,146,60,.3)",fontSize:12,color:"#c05621",fontWeight:700,textAlign:"center"}}>
             ⚠️ Free preview: first {NC_MOCK_FREE_LIMIT} questions — enter a production code to unlock all {questions.length}
@@ -11431,7 +11924,7 @@ function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
       <div className="nc-progress-wrap" style={{marginBottom:14}}>
         <div className="nc-progress-fill" style={{width:`${(answeredCount/questions.length)*100}%`}} />
       </div>
-      <div style={{fontSize:10,color:"#6b8a52",marginBottom:4}}>Question {qIdx+1} of {questions.length} • <span style={{background:"rgba(74,122,46,.1)",borderRadius:4,padding:"1px 5px",color:"#2d4a1e",fontWeight:700}}>{q.cat}</span></div>
+      <div style={{fontSize:10,color:"#6b8a52",marginBottom:4}}>Question {qIdx+1} of {questions.length} · <span style={{background:"rgba(74,122,46,.1)",borderRadius:4,padding:"1px 5px",color:"#2d4a1e",fontWeight:700}}>{q.cat}</span></div>
       <div className="nc-card" style={{marginBottom:12}}>
         <div style={{fontWeight:700,fontSize:16,lineHeight:1.6,color:"#1a2e0a"}}>{q.q}</div>
       </div>
@@ -11460,7 +11953,7 @@ function NcSpecialtyExams({ toast, currentUser, isAdmin }) {
   return (
     <div>
       <div className="nc-sec-title">🎓 Specialty Exam Papers</div>
-      <div className="nc-sec-sub">Select specialty • choose year • pick Paper 1, Paper 2 or OSCE</div>
+      <div className="nc-sec-sub">Select specialty · choose year · pick Paper 1, Paper 2 or OSCE</div>
       <NursingExamsView toast={toast} currentUser={currentUser} isAdmin={isAdmin} />
     </div>
   );
@@ -11509,7 +12002,7 @@ function NcDashboard({ currentUser, onNavigate }) {
           <div style={{width:52,height:52,borderRadius:12,background:"linear-gradient(135deg,#4a7a2e,#7bc950)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:26}}>📅</div>
           <div style={{flex:1}}>
             <div style={{fontWeight:800,fontSize:16,color:"#2d4a1e",marginBottom:2}}>{mockTitle || "Daily Mock Exam"}</div>
-            <div style={{fontSize:12,color:"#6b8a52"}}>{mockQCount>0?`${mockQCount} questions`:"No questions yet"} • Updates daily • {mockDone?"Completed ✅":"Not taken yet"}</div>
+            <div style={{fontSize:12,color:"#6b8a52"}}>{mockQCount>0?`${mockQCount} questions`:"No questions yet"} · Updates daily · {mockDone?"Completed ✅":"Not taken yet"}</div>
           </div>
           {!mockDone&&mockQCount>0&&<button className="nc-btn nc-btn-primary" style={{fontSize:13}} onClick={()=>onNavigate("daily")}>Start Now →</button>}
           {mockDone&&<span style={{fontSize:12,fontWeight:700,color:"#4a7a2e"}}>✅ Done for today!</span>}
@@ -12118,7 +12611,7 @@ function StudyGroups({ currentUser, toast }) {
     <div style={{maxWidth:700,margin:"0 auto"}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
         <div><div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:22}}>👥 Study Groups</div>
-          <div style={{color:"var(--text3)",fontSize:13}}>{myClass?.label||"Your class"} • Group chats</div></div>
+          <div style={{color:"var(--text3)",fontSize:13}}>{myClass?.label||"Your class"} · Group chats</div></div>
         <button onClick={()=>setShowCreate(true)} style={{padding:"9px 18px",borderRadius:10,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700,fontSize:13}}>+ New Group</button>
       </div>
       {showCreate && (
@@ -12211,7 +12704,7 @@ function Timetable({ currentUser, toast, isLecturer }) {
       {editing && (
         <div style={{position:"fixed",inset:0,zIndex:9000,display:"flex",alignItems:"center",justifyContent:"center",background:"rgba(0,0,0,.5)",backdropFilter:"blur(4px)"}}>
           <div style={{background:"var(--card)",borderRadius:18,padding:28,width:"90vw",maxWidth:400,border:"1.5px solid var(--border)"}}>
-            <div style={{fontWeight:800,fontSize:16,marginBottom:16}}>📅 {editing.day} • {editing.hour}</div>
+            <div style={{fontWeight:800,fontSize:16,marginBottom:16}}>📅 {editing.day} · {editing.hour}</div>
             <label className="lbl">Subject</label>
             <input className="inp" value={form.subject} onChange={e=>setForm({...form,subject:e.target.value})} placeholder="e.g. Pharmacology" />
             <label className="lbl">Lecturer</label>
@@ -12352,7 +12845,7 @@ function Assignments({ currentUser, toast, isLecturer }) {
             <span className="asgn-status" style={{background:st.bg,color:st.color}}>{st.label}</span>
           </div>
           <div style={{color:"var(--text2)",fontSize:13,marginBottom:12,lineHeight:1.6}}>{selAsgn.desc}</div>
-          <div style={{fontSize:12,color:"var(--text3)"}}>📅 Due: <b>{new Date(selAsgn.dueAt).toLocaleString()}</b> • Max score: <b>{selAsgn.maxScore}</b></div>
+          <div style={{fontSize:12,color:"var(--text3)"}}>📅 Due: <b>{new Date(selAsgn.dueAt).toLocaleString()}</b> · Max score: <b>{selAsgn.maxScore}</b></div>
         </div>
 
         {isLecturer ? (
@@ -12369,7 +12862,7 @@ function Assignments({ currentUser, toast, isLecturer }) {
                 {sub.fileData && <a href={sub.fileData} download={sub.fileName} style={{fontSize:12,color:"var(--accent)",textDecoration:"none",display:"inline-block",marginBottom:8}}>⬇ Download</a>}
                 {sub.grade!=null ? (
                   <div style={{background:"rgba(34,197,94,.1)",borderRadius:8,padding:"8px 12px",fontSize:13}}>
-                    ✅ Graded: <b>{sub.grade}/{selAsgn.maxScore}</b>{sub.feedback&&<span> • {sub.feedback}</span>}
+                    ✅ Graded: <b>{sub.grade}/{selAsgn.maxScore}</b>{sub.feedback&&<span> · {sub.feedback}</span>}
                   </div>
                 ) : gradingId===sub.student ? (
                   <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:8}}>
@@ -12392,7 +12885,7 @@ function Assignments({ currentUser, toast, isLecturer }) {
                 <div style={{fontWeight:800,fontSize:16,marginBottom:4}}>Submitted!</div>
                 <div style={{fontSize:13,color:"var(--text3)",marginBottom:8}}>📎 {mySubmission.fileName}</div>
                 {mySubmission.grade!=null && <div style={{background:"rgba(0,119,182,.1)",borderRadius:10,padding:"10px 16px",fontSize:14,fontWeight:700}}>
-                  Score: {mySubmission.grade}/{selAsgn.maxScore} {mySubmission.feedback&&`• ${mySubmission.feedback}`}
+                  Score: {mySubmission.grade}/{selAsgn.maxScore} {mySubmission.feedback&&`· ${mySubmission.feedback}`}
                 </div>}
                 {mySubmission.grade==null && <div style={{fontSize:12,color:"var(--text3)"}}>Waiting for lecturer to grade…</div>}
               </div>
@@ -12400,7 +12893,7 @@ function Assignments({ currentUser, toast, isLecturer }) {
               <div style={{textAlign:"center",padding:30}}>
                 <div style={{fontSize:40,marginBottom:12}}>📤</div>
                 <div style={{fontWeight:700,marginBottom:8}}>Upload your work</div>
-                <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>PDF, Word, image or text file • Max 2MB</div>
+                <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>PDF, Word, image or text file · Max 2MB</div>
                 <button onClick={()=>submitWork(selAsgn)} disabled={uploading} style={{padding:"12px 28px",borderRadius:12,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700}}>{uploading?"Uploading…":"Choose File & Submit"}</button>
               </div>
             )}
@@ -12451,7 +12944,7 @@ function Assignments({ currentUser, toast, isLecturer }) {
               <span className="asgn-status" style={{background:st.bg,color:st.color,flexShrink:0}}>{st.label}</span>
             </div>
             {a.desc && <div style={{fontSize:12,color:"var(--text3)",marginTop:6,lineHeight:1.5}}>{a.desc.slice(0,120)}{a.desc.length>120?"…":""}</div>}
-            <div style={{fontSize:11,color:"var(--text3)",marginTop:8}}>📅 Due: {new Date(a.dueAt).toLocaleString()} • Max: {a.maxScore} pts</div>
+            <div style={{fontSize:11,color:"var(--text3)",marginTop:8}}>📅 Due: {new Date(a.dueAt).toLocaleString()} · Max: {a.maxScore} pts</div>
           </div>
         );
       })}
@@ -12529,7 +13022,7 @@ function AttendanceView({ currentUser, toast, isLecturer }) {
         {attPct!==null && (
           <div style={{background:"var(--card)",border:"1.5px solid var(--border)",borderRadius:16,padding:24,textAlign:"center",marginBottom:20}}>
             <div style={{fontSize:52,fontWeight:800,color:attPct>=75?"var(--success)":attPct>=50?"var(--warn)":"var(--danger)"}}>{attPct}%</div>
-            <div style={{fontSize:14,color:"var(--text2)",marginTop:4}}>Attendance Rate • {attended}/{totalMarked} classes</div>
+            <div style={{fontSize:14,color:"var(--text2)",marginTop:4}}>Attendance Rate · {attended}/{totalMarked} classes</div>
             <div style={{marginTop:12,background:"var(--bg3)",borderRadius:10,height:8,overflow:"hidden"}}>
               <div style={{height:"100%",borderRadius:10,background:attPct>=75?"var(--success)":attPct>=50?"var(--warn)":"var(--danger)",width:`${attPct}%`,transition:"width .5s"}} />
             </div>
@@ -12688,7 +13181,7 @@ function LeaderboardStreaks({ currentUser }) {
                   {entry.avatar}
                 </div>
                 <div style={{flex:1,minWidth:0}}>
-                  <div style={{fontWeight:700,fontSize:14}}>{entry.name}{isMe&&<span style={{fontSize:10,color:"var(--accent)",marginLeft:6}}>• You</span>}</div>
+                  <div style={{fontWeight:700,fontSize:14}}>{entry.name}{isMe&&<span style={{fontSize:10,color:"var(--accent)",marginLeft:6}}>· You</span>}</div>
                   <div style={{fontSize:11,color:"var(--text3)"}}>{entry.count} exam{entry.count!==1?"s":""} taken</div>
                 </div>
                 <div style={{textAlign:"right",flexShrink:0}}>
@@ -12862,7 +13355,7 @@ function ProgressDashboard({ currentUser }) {
             <div key={r.id||i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid var(--border)"}}>
               <div>
                 <div style={{fontWeight:700,fontSize:13}}>{r.subject}</div>
-                <div style={{fontSize:11,color:"var(--text3)"}}>{r.type||"Test"} {r.date?`• ${r.date}`:""}</div>
+                <div style={{fontSize:11,color:"var(--text3)"}}>{r.type||"Test"} {r.date?`· ${r.date}`:""}</div>
               </div>
               <div style={{fontWeight:800,fontSize:16,color:r.pct>=70?"var(--success)":r.pct>=50?"var(--warn)":"var(--danger)"}}>{r.score}/{r.total||100}</div>
             </div>
@@ -13001,7 +13494,44 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
   return (
     <>
       <style>{CSS}</style>
-      <div className="app-shell">
+
+      {/* ── Offline Banner ── */}
+      {isOffline && (
+        <div style={{
+          position:"fixed", top:0, left:0, right:0, zIndex:99999,
+          background:"linear-gradient(90deg,#f59e0b,#ef4444)",
+          color:"white", padding:"8px 16px", textAlign:"center",
+          fontSize:13, fontWeight:700, letterSpacing:.3,
+          boxShadow:"0 2px 12px rgba(0,0,0,.3)",
+        }}>
+          📡 You're offline — showing cached content. Some features may be unavailable.
+        </div>
+      )}
+
+      {/* ── PIN Unlock Screen ── */}
+      {pinLocked && !bypassPin && (getSavedPin(currentUser) || hasBiometric(currentUser)) && (
+        <PinUnlockScreen
+          email={currentUser}
+          onUnlock={() => setPinLocked(false)}
+          onUsePassword={() => { setPinLocked(false); setBypassPin(true); }}
+          toast={toast}
+        />
+      )}
+
+      {/* ── PIN Setup Modal ── */}
+      {showPinSetup && !pinLocked && (
+        <PinSetupModal
+          email={currentUser}
+          toast={toast}
+          onDone={(method) => { setShowPinSetup(false); }}
+          onSkip={() => {
+            setShowPinSetup(false);
+            try { localStorage.setItem("nv-pin-skipped-" + currentUser.replace(/[^a-z0-9]/gi,"_"), "1"); } catch {}
+          }}
+        />
+      )}
+
+      <div className="app-shell" style={isOffline ? {marginTop:36} : {}}>
         {/* Overlay for mobile */}
         <div className={`sidebar-overlay${sidebarOpen?" open":""}`} onClick={()=>setSidebarOpen(false)} />
 
@@ -13009,13 +13539,13 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
         <div className={`lp-sidebar${sidebarOpen?" open":""}`}>
           <div className="lp-head">
             <div className="lp-logo">
-              <div className="lp-logo-icon">👨🏫</div>
+              <div className="lp-logo-icon">👨‍🏫</div>
               <div>
                 <div className="lp-logo-name">Lecturer Panel</div>
                 <div className="lp-logo-name" style={{fontSize:11,opacity:.6}}>Nursing Academic Hub</div>
               </div>
             </div>
-            <div className="lp-badge">👨🏫 Lecturer</div>
+            <div className="lp-badge">👨‍🏫 Lecturer</div>
           </div>
 
           <div style={{flex:1,overflowY:"auto",paddingBottom:8}}>
@@ -13116,10 +13646,10 @@ function LecturerDashboard({ currentUser, toast, me, myHandouts, myAssignments, 
     <div style={{maxWidth:900,margin:"0 auto"}}>
       {/* Welcome */}
       <div style={{background:"linear-gradient(135deg,#d97706,#b45309)",borderRadius:18,padding:"24px 28px",marginBottom:24,color:"#fff",position:"relative",overflow:"hidden"}}>
-        <div style={{position:"absolute",top:-20,right:-20,fontSize:100,opacity:.08}}>👨🏫</div>
+        <div style={{position:"absolute",top:-20,right:-20,fontSize:100,opacity:.08}}>👨‍🏫</div>
         <div style={{fontSize:13,opacity:.8,marginBottom:4}}>{greeting()}</div>
         <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:24,marginBottom:6}}>{me.displayName||currentUser.split("@")[0]}</div>
-        <div style={{fontSize:13,opacity:.8}}>You have {activeAssignments.length} active assignment{activeAssignments.length!==1?"s":""} • {myHandouts.length} handouts uploaded</div>
+        <div style={{fontSize:13,opacity:.8}}>You have {activeAssignments.length} active assignment{activeAssignments.length!==1?"s":""} · {myHandouts.length} handouts uploaded</div>
       </div>
 
       {/* Stats */}
@@ -13176,7 +13706,7 @@ function LecturerDashboard({ currentUser, toast, me, myHandouts, myAssignments, 
                 <span style={{fontSize:20}}>📄</span>
                 <div style={{flex:1,minWidth:0}}>
                   <div style={{fontWeight:700,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{h.title}</div>
-                  <div style={{fontSize:11,color:"var(--text3)"}}>{h.course} • {h.classId}</div>
+                  <div style={{fontSize:11,color:"var(--text3)"}}>{h.course} · {h.classId}</div>
                 </div>
               </div>
             ))
@@ -13250,7 +13780,7 @@ function LecturerAnnouncements({ toast, currentUser }) {
             <div style={{flex:1}}>
               <div style={{fontWeight:800,fontSize:14,marginBottom:4}}>{a.pinned?"📌 ":""}{a.title}</div>
               <div style={{fontSize:13,color:"var(--text2)",lineHeight:1.6,marginBottom:8}}>{a.body}</div>
-              <div style={{fontSize:11,color:"var(--text3)"}}>{a.date}{a.from&&` • by ${a.from.split("@")[0]}`}</div>
+              <div style={{fontSize:11,color:"var(--text3)"}}>{a.date}{a.from&&` · by ${a.from.split("@")[0]}`}</div>
             </div>
             {a.from===currentUser&&<button onClick={()=>del(a.id)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--danger)",marginLeft:12,fontSize:16,flexShrink:0}}>🗑️</button>}
           </div>
@@ -13348,7 +13878,7 @@ function LecturerGradebook({ currentUser, toast }) {
       <button onClick={()=>{setSelAsgn(null);setSubmissions([]);}} style={{background:"none",border:"none",cursor:"pointer",color:"var(--text3)",marginBottom:16,fontSize:13}}>← Back</button>
       <div className="lp-card">
         <div style={{fontWeight:800,fontSize:16,marginBottom:4}}>{selAsgn.title}</div>
-        <div style={{fontSize:12,color:"var(--text3)"}}>Due: {new Date(selAsgn.dueAt).toLocaleString()} • Max: {selAsgn.maxScore} pts • {submissions.length} submission{submissions.length!==1?"s":""}</div>
+        <div style={{fontSize:12,color:"var(--text3)"}}>Due: {new Date(selAsgn.dueAt).toLocaleString()} · Max: {selAsgn.maxScore} pts · {submissions.length} submission{submissions.length!==1?"s":""}</div>
       </div>
       {submissions.length===0&&<div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>No submissions yet</div>}
       {submissions.map(sub=>{
@@ -13362,7 +13892,7 @@ function LecturerGradebook({ currentUser, toast }) {
             <div style={{fontSize:12,color:"var(--text3)",marginBottom:8}}>📎 {sub.fileName}</div>
             {sub.fileData&&<a href={sub.fileData} download={sub.fileName} style={{fontSize:12,color:"var(--accent)",textDecoration:"none",marginBottom:8,display:"inline-block"}}>⬇ Download</a>}
             {sub.grade!=null
-              ? <div style={{background:"rgba(34,197,94,.1)",borderRadius:8,padding:"8px 12px",fontSize:13,fontWeight:700}}>✅ Graded: {sub.grade}/{selAsgn.maxScore}{sub.feedback&&` • ${sub.feedback}`}</div>
+              ? <div style={{background:"rgba(34,197,94,.1)",borderRadius:8,padding:"8px 12px",fontSize:13,fontWeight:700}}>✅ Graded: {sub.grade}/{selAsgn.maxScore}{sub.feedback&&` · ${sub.feedback}`}</div>
               : grading===sub.student
                 ? <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:8}}>
                     <input type="number" className="inp" style={{width:80,marginBottom:0}} placeholder="Score" value={gradeForm.grade} onChange={e=>setGradeForm({...gradeForm,grade:e.target.value})} />
@@ -13391,7 +13921,7 @@ function LecturerGradebook({ currentUser, toast }) {
               <div style={{fontWeight:800,fontSize:14,flex:1}}>{a.title}</div>
               <span style={{fontSize:11,fontWeight:700,padding:"3px 8px",borderRadius:12,background:overdue?"rgba(239,68,68,.1)":"rgba(34,197,94,.1)",color:overdue?"var(--danger)":"var(--success)",flexShrink:0,marginLeft:10}}>{overdue?"Closed":"Open"}</span>
             </div>
-            <div style={{fontSize:12,color:"var(--text3)",marginTop:4}}>Due: {new Date(a.dueAt).toLocaleString()} • Max: {a.maxScore} pts</div>
+            <div style={{fontSize:12,color:"var(--text3)",marginTop:4}}>Due: {new Date(a.dueAt).toLocaleString()} · Max: {a.maxScore} pts</div>
           </div>
         );
       })}
@@ -13487,31 +14017,78 @@ export default function App() {
     // ── PWA: register service worker (with push notification support) ──
     if ("serviceWorker" in navigator) {
       const swCode = `
-const CACHE='nursing-hub-v3';
-const URLS=['/','/?offline=1'];
-self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(URLS).catch(()=>{}))));
-self.addEventListener('fetch',e=>{
-  if(e.request.method!=='GET')return;
-  e.respondWith(fetch(e.request).then(r=>{
-    const rc=r.clone();caches.open(CACHE).then(c=>c.put(e.request,rc));return r;
-  }).catch(()=>caches.match(e.request)));
+const CACHE_NAME = 'nursing-hub-v5';
+const STATIC_ASSETS = ['/', '/?offline=1'];
+
+// Install: cache static assets
+self.addEventListener('install', e => {
+  e.waitUntil(
+    caches.open(CACHE_NAME).then(c => c.addAll(STATIC_ASSETS).catch(() => {}))
+  );
+  self.skipWaiting();
 });
-self.addEventListener('activate',e=>e.waitUntil(
-  caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k))))
-));
-self.addEventListener('push',e=>{
-  const d=e.data?e.data.json():{title:'New Message',body:'You have a new message'};
-  e.waitUntil(self.registration.showNotification(d.title||'Nursing Hub',{
-    body:d.body||'',icon:'/favicon.ico',badge:'/favicon.ico',
-    tag:d.tag||'dm',renotify:true,vibrate:[200,100,200],data:{url:'/'}
-  }));
+
+// Activate: clean old caches
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
+    ).then(() => self.clients.claim())
+  );
 });
-self.addEventListener('notificationclick',e=>{
+
+// Fetch: Network-first for API/Firestore, Cache-first for assets
+self.addEventListener('fetch', e => {
+  const url = new URL(e.request.url);
+  // Skip non-GET and cross-origin Firebase/API calls
+  if (e.request.method !== 'GET') return;
+  if (url.hostname.includes('firestore') || url.hostname.includes('googleapis')) {
+    // For Firebase — network only, no caching
+    return;
+  }
+  // For same-origin HTML/JS/CSS — stale-while-revalidate
+  e.respondWith(
+    caches.open(CACHE_NAME).then(async cache => {
+      const cached = await cache.match(e.request);
+      const networkFetch = fetch(e.request).then(res => {
+        if (res.ok && res.type !== 'opaque') cache.put(e.request, res.clone());
+        return res;
+      }).catch(() => null);
+      return cached || await networkFetch || new Response('Offline — content not cached', {status: 503});
+    })
+  );
+});
+
+// Push notifications
+self.addEventListener('push', e => {
+  const d = e.data ? e.data.json() : { title: 'Nursing Hub', body: 'You have a new notification' };
+  e.waitUntil(
+    self.registration.showNotification(d.title || 'Nursing Hub', {
+      body: d.body || '',
+      icon: '/favicon.ico',
+      badge: '/favicon.ico',
+      tag: d.tag || 'notif',
+      renotify: true,
+      vibrate: [200, 100, 200],
+      data: { url: d.url || '/', type: d.type || 'general' },
+      actions: d.actions || [],
+    })
+  );
+});
+
+// Notification click → open or focus app
+self.addEventListener('notificationclick', e => {
   e.notification.close();
-  e.waitUntil(clients.matchAll({type:'window',includeUncontrolled:true}).then(cs=>{
-    for(const c of cs){if('focus' in c){c.postMessage({type:'OPEN_MESSAGES'});return c.focus();}}
-    if(clients.openWindow)return clients.openWindow('/');
-  }));
+  const type = e.notification.data?.type || 'general';
+  e.waitUntil(
+    clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
+      const msg = type === 'dm' ? 'OPEN_MESSAGES' : type === 'assignment' ? 'OPEN_ASSIGNMENTS' : 'OPEN_APP';
+      for (const c of cs) {
+        if ('focus' in c) { c.postMessage({ type: msg }); return c.focus(); }
+      }
+      if (clients.openWindow) return clients.openWindow('/');
+    })
+  );
 });
       `;
       const swBlob=new Blob([swCode],{type:"application/javascript"});
@@ -13559,6 +14136,12 @@ self.addEventListener('notificationclick',e=>{
     return notifs.filter(n => !n.read).length;
   });
   const [unreadDM, setUnreadDM] = useState(0);
+  // PIN / Biometric lock state
+  const [showPinSetup,  setShowPinSetup]  = useState(false);  // show setup modal after first login
+  const [pinLocked,     setPinLocked]     = useState(false);  // show unlock screen
+  const [bypassPin,     setBypassPin]     = useState(false);  // user chose "use password"
+  // Offline indicator
+  const [isOffline, setIsOffline] = useState(!navigator.onLine);
   // Forgot password states
   const [forgotMode, setForgotMode] = useState(false); // false | "email" | "code"
   const [forgotEmail, setForgotEmail] = useState("");
@@ -13584,6 +14167,59 @@ self.addEventListener('notificationclick',e=>{
   }, []);
 
   useEffect(() => { document.body.className = themeMode; }, [themeMode]);
+
+  // ── Offline / online detection ────────────────────────────────
+  useEffect(() => {
+    const goOffline = () => setIsOffline(true);
+    const goOnline  = () => setIsOffline(false);
+    window.addEventListener("offline", goOffline);
+    window.addEventListener("online",  goOnline);
+    return () => { window.removeEventListener("offline", goOffline); window.removeEventListener("online", goOnline); };
+  }, []);
+
+  // ── PIN lock when app comes back from background ──────────────
+  useEffect(() => {
+    if (!currentUser || page !== "app") return;
+    let hiddenAt = 0;
+    const onVisibility = () => {
+      if (document.hidden) {
+        hiddenAt = Date.now();
+      } else {
+        // Lock if away for more than 3 minutes and PIN is set
+        const away = Date.now() - hiddenAt;
+        if (away > 3 * 60 * 1000 && (getSavedPin(currentUser) || hasBiometric(currentUser)) && !bypassPin) {
+          setPinLocked(true);
+        }
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [currentUser, page, bypassPin]);
+
+  // ── Subscribe to push notifications via FCM ──────────────────
+  useEffect(() => {
+    if (!currentUser || page !== "app" || FCM_VAPID_KEY === "YOUR_VAPID_KEY_HERE") return;
+    const setupFCM = async () => {
+      try {
+        const reg = window._swReg;
+        if (!reg || !window.PushManager) return;
+        const perm = await Notification.requestPermission();
+        if (perm !== "granted") return;
+        const sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: FCM_VAPID_KEY,
+        });
+        // Store subscription in Firestore so backend can send pushes
+        const ready = await _loadFirebase();
+        if (ready && _db) {
+          await _db.collection("push_subs").doc(currentUser.replace(/[^a-z0-9]/gi,"_")).set({
+            user: currentUser, sub: JSON.stringify(sub), updatedAt: Date.now(),
+          }, { merge: true });
+        }
+      } catch(e) { /* FCM optional — silent fail */ }
+    };
+    setTimeout(setupFCM, 3000);
+  }, [currentUser, page]);
 
   // Open Messages tab when user clicks a DM notification (from service worker)
   useEffect(() => {
@@ -13640,10 +14276,10 @@ self.addEventListener('notificationclick',e=>{
       const raw = localStorage.getItem("nv-saved-cred");
       const existing = raw ? JSON.parse(raw) : null;
       if (!existing || existing.email === email) {
-        localStorage.setItem("nv-saved-cred", JSON.stringify({ email, password: pw, savedAt: Date.now() }));
+        try { localStorage.setItem("nv-saved-cred", JSON.stringify({ email, password: pw, savedAt: Date.now() })); } catch {}
       } else {
         // New user on same device — save email but not their password
-        localStorage.setItem("nv-saved-cred", JSON.stringify({ email, password: "", savedAt: Date.now() }));
+        try { localStorage.setItem("nv-saved-cred", JSON.stringify({ email, password: "", savedAt: Date.now() })); } catch {}
       }
       setCredSaved(true);
     } catch(e) {}
@@ -13728,6 +14364,10 @@ self.addEventListener('notificationclick',e=>{
       setPage("app");
       toast(`Welcome back! 👋`, "success");
       saveCredential(username, password);
+      // Show PIN setup if not yet configured and not skipped
+      if (!getSavedPin(username) && !hasBiometric(username) && !ls("nv-pin-skipped-" + username.replace(/[^a-z0-9]/gi,"_"))) {
+        setTimeout(() => setShowPinSetup(true), 1200);
+      }
       // Sync everything in background (non-blocking)
       syncUserPrivateData(username).then(()=>{
         const notifs = ls("nv-notifications", []);
@@ -13750,6 +14390,9 @@ self.addEventListener('notificationclick',e=>{
       setPage("app");
       toast(`Welcome back! 👋`, "success");
       saveCredential(username, password);
+      if (!getSavedPin(username) && !hasBiometric(username) && !ls("nv-pin-skipped-" + username.replace(/[^a-z0-9]/gi,"_"))) {
+        setTimeout(() => setShowPinSetup(true), 1200);
+      }
       syncUserPrivateData(username).then(()=>{
         const notifs = ls("nv-notifications", []);
         setUnreadNotifs(notifs.filter(n => !n.read).length);
@@ -13774,6 +14417,7 @@ self.addEventListener('notificationclick',e=>{
     setPage("app");
     toast(`Welcome, ${regName.trim().split(" ")[0]}! 🎉`, "success");
     saveCredential(regUser, regPw);
+    setTimeout(() => setShowPinSetup(true), 1500);
   };
 
   const [selectedExamType, setSelectedExamType] = useState(null);
@@ -13818,6 +14462,7 @@ self.addEventListener('notificationclick',e=>{
       case "messages": return <Messages user={currentUser} toast={toast} onUnreadChange={setUnreadDM} />;
       case "notifications": return <Notifications currentUser={currentUser} onRead={()=>setUnreadNotifs(0)} />;
       case "profile": return <StudentProfile currentUser={currentUser} toast={toast} />;
+      case "student-id": return <StudentIDCard currentUser={currentUser} toast={toast} />;
       case "payment-history": return <PaymentHistory currentUser={currentUser} />;
       case "study-timer": return <StudyTimer />;
       case "analytics": return <PerformanceAnalytics currentUser={currentUser} />;
@@ -13845,6 +14490,7 @@ self.addEventListener('notificationclick',e=>{
     { icon:"📝", label:"Assignments", key:"assignments" },
     { icon:"📋", label:"Attendance", key:"attendance" },
     { icon:"👤", label:"My Profile", key:"profile" },
+    { icon:"🪪", label:"My ID Card", key:"student-id" },
   ];
   const STUDY_TOOLS = [
     { icon:"⏱️", label:"Study Timer", key:"study-timer" },
@@ -14017,7 +14663,7 @@ self.addEventListener('notificationclick',e=>{
             <div className="sidebar-logo-icon">🏥</div>
             <div className="sidebar-logo-name">Nursing Academic Hub</div>
             {isAdmin&&<span className="admin-badge-side">🛡️ Admin</span>}
-          {isLecturer&&!isAdmin&&<span className="admin-badge-side" style={{background:"rgba(217,119,6,.25)",border:"1px solid rgba(217,119,6,.5)",color:"#fbbf24"}}>👨🏫 Lecturer</span>}
+          {isLecturer&&!isAdmin&&<span className="admin-badge-side" style={{background:"rgba(217,119,6,.25)",border:"1px solid rgba(217,119,6,.5)",color:"#fbbf24"}}>👨‍🏫 Lecturer</span>}
           </div>
 
           {isAdmin&&(
@@ -14136,7 +14782,7 @@ self.addEventListener('notificationclick',e=>{
                     {currentUser}
                   </div>
                   <div style={{fontSize:10,marginTop:2,color:"var(--accent)",fontWeight:700}}>
-                    {(()=>{const me=ls("nv-users",[]).find(u=>u.username===currentUser);const cls=ls("nv-classes",DEFAULT_CLASSES).find(c=>c.id===me?.class);return isAdmin?"🛡️ Admin":isLecturer?"👨🏫 Lecturer — All Classes":cls?`🏫 ${cls.label}`:"🎓 Student";})()}
+                    {(()=>{const me=ls("nv-users",[]).find(u=>u.username===currentUser);const cls=ls("nv-classes",DEFAULT_CLASSES).find(c=>c.id===me?.class);return isAdmin?"🛡️ Admin":isLecturer?"👨‍🏫 Lecturer — All Classes":cls?`🏫 ${cls.label}`:"🎓 Student";})()}
                   </div>
                 </div>
                 <div style={{fontSize:14,color:"var(--text3)",flexShrink:0}}>›</div>
@@ -14158,7 +14804,7 @@ self.addEventListener('notificationclick',e=>{
                 {activeNav!=="admin"&&" 👋"}
               </div>
               {isAdmin&&activeNav!=="admin"&&<span className="tag tag-purple" style={{fontSize:10}}>🛡️ Admin</span>}
-              {isLecturer&&!isAdmin&&<span className="tag" style={{fontSize:10,borderColor:"var(--accent2)",color:"var(--accent2)"}}>👨🏫 Lecturer</span>}
+              {isLecturer&&!isAdmin&&<span className="tag" style={{fontSize:10,borderColor:"var(--accent2)",color:"var(--accent2)"}}>👨‍🏫 Lecturer</span>}
             </div>
             <div className="topbar-right">
               <button className="nc-toggle-btn" onClick={switchToNursing} title="Switch to Nursing Council Exam Site">
@@ -14188,4 +14834,3 @@ self.addEventListener('notificationclick',e=>{
     </>
   );
 }
-
