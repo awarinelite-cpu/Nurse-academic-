@@ -362,24 +362,35 @@ const gcSend = async (classId, fromUser, payload) => {
   } catch(e) { console.error("[GC] send failed:", e.message); throw e; }
 };
 
-const gcSubscribe = (classId, onMsgs) => {
-  if (!_db) return () => {};
-  return _db.collection("class_chats").doc(classId).collection("msgs")
-    .orderBy("sentAt","asc")
-    .onSnapshot(snap => onMsgs(snap.docs.map(d => d.data())), ()=>{});
+// _mkSub: waits for Firebase then attaches a real-time listener.
+// Fixes the race condition where _db is null at component mount time.
+const _mkSub = (attachFn) => {
+  let unsub = () => {};
+  let cancelled = false;
+  _loadFirebase().then(ready => {
+    if (!ready || cancelled || !_db) return;
+    unsub = attachFn(_db) || (() => {});
+  });
+  return () => { cancelled = true; unsub(); };
 };
 
+const gcSubscribe = (classId, onMsgs) =>
+  _mkSub(db => db.collection("class_chats").doc(classId).collection("msgs")
+    .orderBy("sentAt", "asc")
+    .onSnapshot(snap => onMsgs(snap.docs.map(d => d.data())), () => {}));
+
 const gcSubscribeRooms = (classIds, onRooms) => {
-  if (!_db || !classIds.length) { onRooms([]); return () => {}; }
-  // Listen to each room meta doc
-  const results = {};
-  const unsubs = classIds.map(cid => {
-    return _db.collection("class_chats").doc(cid).onSnapshot(snap => {
-      results[cid] = snap.exists ? { id: snap.id, ...snap.data() } : { id: cid, classId: cid, lastAt: 0 };
-      onRooms(Object.values(results));
-    }, () => {});
+  if (!classIds.length) { onRooms([]); return () => {}; }
+  return _mkSub(db => {
+    const results = {};
+    const unsubs = classIds.map(cid =>
+      db.collection("class_chats").doc(cid).onSnapshot(snap => {
+        results[cid] = snap.exists ? { id: snap.id, ...snap.data() } : { id: cid, classId: cid, lastAt: 0 };
+        onRooms(Object.values(results));
+      }, () => {})
+    );
+    return () => unsubs.forEach(u => u());
   });
-  return () => unsubs.forEach(u => u());
 };
 
 // ── DIRECT-MESSAGE HELPERS (Firestore real-time) ──────────────────────
@@ -453,21 +464,11 @@ const dmMarkRead = async (me, other) => {
   } catch(e) {}
 };
 
-const dmSubscribeConv = (me, other, onMsgs) => {
-  if (!_db) return () => {};
-  const cid = _convId(me, other);
-  return _db.collection("dm_convs").doc(cid).collection("msgs")
-    .orderBy("sentAt","asc")
-    .onSnapshot(snap => onMsgs(snap.docs.map(d => d.data())), ()=>{});
-};
+const dmSubscribeConv = (me, other, onMsgs) =>
+  _mkSub(db => { const cid = _convId(me, other); return db.collection("dm_convs").doc(cid).collection("msgs").orderBy("sentAt","asc").onSnapshot(snap => onMsgs(snap.docs.map(d => d.data())), () => {}); });
 
-const dmSubscribeInbox = (me, onConvs) => {
-  if (!_db) return () => {};
-  return _db.collection("dm_convs")
-    .where("participants","array-contains",me)
-    .orderBy("lastAt","desc")
-    .onSnapshot(snap => onConvs(snap.docs.map(d => ({id:d.id,...d.data()}))), ()=>{});
-};
+const dmSubscribeInbox = (me, onConvs) =>
+  _mkSub(db => db.collection("dm_convs").where("participants","array-contains",me).orderBy("lastAt","desc").onSnapshot(snap => onConvs(snap.docs.map(d => ({id:d.id,...d.data()}))), () => {}));
 
 // ── VOICE CALL SIGNALING (WebRTC via Firestore) ───────────────────────
 //  call doc: "voice_calls/{callId}"
@@ -477,7 +478,7 @@ const dmSubscribeInbox = (me, onConvs) => {
 const _callId = (a, b) => [a, b].map(_safeKey).sort().join("__");
 
 const callSignal = async (caller, callee, data) => {
-  if (!_db) return false;
+  const ready = await _loadFirebase(); if (!ready) return false;
   try {
     const cid = _callId(caller, callee);
     // Always preserve original caller/callee — only update the data fields
@@ -490,7 +491,7 @@ const callSignal = async (caller, callee, data) => {
 };
 
 const callAddCandidate = async (caller, callee, role, candidate) => {
-  if (!_db) return;
+  const ready = await _loadFirebase(); if (!ready) return;
   try {
     const cid = _callId(caller, callee);
     const field = role === "caller" ? "callerCandidates" : "calleeCandidates";
@@ -500,16 +501,11 @@ const callAddCandidate = async (caller, callee, role, candidate) => {
   } catch(e) { console.warn("[Call] addCandidate failed:", e.message); }
 };
 
-const callSubscribe = (caller, callee, onChange) => {
-  if (!_db) return () => {};
-  const cid = _callId(caller, callee);
-  return _db.collection("voice_calls").doc(cid).onSnapshot(snap => {
-    if (snap.exists) onChange({ id: snap.id, ...snap.data() });
-  }, () => {});
-};
+const callSubscribe = (caller, callee, onChange) =>
+  _mkSub(db => { const cid = _callId(caller, callee); return db.collection("voice_calls").doc(cid).onSnapshot(snap => { if (snap.exists) onChange({ id: snap.id, ...snap.data() }); }, () => {}); });
 
 const callEnd = async (caller, callee) => {
-  if (!_db) return;
+  const ready = await _loadFirebase(); if (!ready) return;
   try {
     const cid = _callId(caller, callee);
     await _db.collection("voice_calls").doc(cid).set(
@@ -531,24 +527,15 @@ const sgSend = async (groupId, from, text, type="text", extra={}) => {
     return true;
   } catch(e) { return false; }
 };
-const sgSubscribe = (groupId, onMsgs) => {
-  if (!_db) return ()=>{};
-  return _db.collection("study_groups").doc(groupId).collection("msgs")
-    .orderBy("sentAt","asc")
-    .onSnapshot(snap => onMsgs(snap.docs.map(d=>d.data())), ()=>{});
-};
+const sgSubscribe = (groupId, onMsgs) =>
+  _mkSub(db => db.collection("study_groups").doc(groupId).collection("msgs").orderBy("sentAt","asc").onSnapshot(snap => onMsgs(snap.docs.map(d=>d.data())), () => {}));
 const sgCreateGroup = async (group) => {
   const ready = await _loadFirebase(); if (!ready) return false;
   try { await _db.collection("study_groups").doc(group.id).set(group, { merge:true }); return true; }
   catch(e) { return false; }
 };
-const sgSubscribeGroups = (classId, onGroups) => {
-  if (!_db) return ()=>{};
-  return _db.collection("study_groups")
-    .where("classId","==",classId)
-    .orderBy("lastAt","desc")
-    .onSnapshot(snap => onGroups(snap.docs.map(d=>({id:d.id,...d.data()}))), ()=>{});
-};
+const sgSubscribeGroups = (classId, onGroups) =>
+  _mkSub(db => db.collection("study_groups").where("classId","==",classId).orderBy("lastAt","desc").onSnapshot(snap => onGroups(snap.docs.map(d=>({id:d.id,...d.data()}))), () => {}));
 
 // ── RESEARCH CLUB HELPERS ─────────────────────────────────────────────
 // Members stored in Firestore: nv/shared researchMembers: [username,...]
@@ -563,12 +550,8 @@ const rcSend = async (from, payload) => {
     return true;
   } catch(e) { return false; }
 };
-const rcSubscribe = (onMsgs) => {
-  if (!_db) return ()=>{};
-  return _db.collection("research_club").doc("main").collection("msgs")
-    .orderBy("sentAt","asc")
-    .onSnapshot(snap => onMsgs(snap.docs.map(d=>d.data())), ()=>{});
-};
+const rcSubscribe = (onMsgs) =>
+  _mkSub(db => db.collection("research_club").doc("main").collection("msgs").orderBy("sentAt","asc").onSnapshot(snap => onMsgs(snap.docs.map(d=>d.data())), () => {}));
 const rcGetMembers = async () => {
   const doc = await _getDoc(_DOC_SHARED);
   return doc ? (doc.researchMembers || []) : [];
@@ -598,24 +581,16 @@ const rrGetMine = async (username) => {
     return snap.docs.map(d => d.data());
   } catch(e) { return []; }
 };
-const rrSubscribeAll = (onData) => {
-  if (!_db) return ()=>{};
-  // Sort client-side to avoid needing a Firestore index
-  return _db.collection("research_requests")
-    .onSnapshot(
-      snap => onData(snap.docs.map(d=>d.data()).sort((a,b)=>b.createdAt-a.createdAt)),
-      err => { console.warn("[RR]",err.message); rrGetAll().then(onData); }
-    );
-};
-const rrSubscribeMine = (username, onData) => {
-  if (!_db) return ()=>{};
-  // No orderBy to avoid composite index requirement — sort client-side
-  return _db.collection("research_requests").where("student","==",username)
-    .onSnapshot(
-      snap => onData(snap.docs.map(d=>d.data()).sort((a,b)=>b.createdAt-a.createdAt)),
-      err => { console.warn("[RR]",err.message); rrGetMine(username).then(onData); }
-    );
-};
+const rrSubscribeAll = (onData) =>
+  _mkSub(db => db.collection("research_requests").onSnapshot(
+    snap => onData(snap.docs.map(d=>d.data()).sort((a,b)=>b.createdAt-a.createdAt)),
+    err => { console.warn("[RR]",err.message); rrGetAll().then(onData); }
+  ));
+const rrSubscribeMine = (username, onData) =>
+  _mkSub(db => db.collection("research_requests").where("student","==",username).onSnapshot(
+    snap => onData(snap.docs.map(d=>d.data()).sort((a,b)=>b.createdAt-a.createdAt)),
+    err => { console.warn("[RR]",err.message); rrGetMine(username).then(onData); }
+  ));
 
 // ── TIMETABLE HELPERS ──────────────────────────────────────────────────
 const ttSave = async (classId, slots) => {
@@ -635,12 +610,8 @@ const asgSave = async (asgn) => {
   try { await _db.collection("assignments").doc(asgn.id).set(asgn, { merge:true }); return true; }
   catch(e) { return false; }
 };
-const asgSubscribe = (classId, onData) => {
-  if (!_db) return ()=>{};
-  return _db.collection("assignments").where("classId","==",classId)
-    .orderBy("dueAt","asc")
-    .onSnapshot(snap => onData(snap.docs.map(d=>({id:d.id,...d.data()}))), ()=>{});
-};
+const asgSubscribe = (classId, onData) =>
+  _mkSub(db => db.collection("assignments").where("classId","==",classId).orderBy("dueAt","asc").onSnapshot(snap => onData(snap.docs.map(d=>({id:d.id,...d.data()}))), () => {}));
 const asgSubmit = async (asgnId, student, fileData, fileName) => {
   const ready = await _loadFirebase(); if (!ready) return false;
   try {
@@ -7158,12 +7129,8 @@ const phnFolderDelete = async (id) => {
   try { await _db.collection("phn_folder").doc(id).delete(); return true; }
   catch(e) { return false; }
 };
-const phnFolderSubscribe = (onFiles) => {
-  if (!_db) return () => {};
-  return _db.collection("phn_folder")
-    .orderBy("uploadedAt", "desc")
-    .onSnapshot(snap => onFiles(snap.docs.map(d => ({ id: d.id, ...d.data() }))), () => {});
-};
+const phnFolderSubscribe = (onFiles) =>
+  _mkSub(db => db.collection("phn_folder").orderBy("uploadedAt","desc").onSnapshot(snap => onFiles(snap.docs.map(d => ({ id: d.id, ...d.data() }))), () => {}));
 
 // ── PHN Folder Modal ──────────────────────────────────────────────────
 function PHNFolderModal({ currentUser, isAdmin, onClose }) {
@@ -7433,11 +7400,6 @@ function PHNClassForum({ currentUser, onClose, onUnreadChange }) {
   const inputRef     = useRef(null);
   const prevMsgCountRef = useRef(0);
 
-  // Access control: PHN students + approved lecturers
-  const isPHNStudent = me.class && (me.class.toLowerCase().includes("phn") || me.class.toLowerCase().includes("public"));
-  const isApprovedLecturer = approvedLecturers.includes(currentUser);
-  const canAccess = isPHNStudent || isApprovedLecturer || myRole === "admin";
-
   // Request notification permission on mount
   useEffect(() => {
     if (typeof Notification !== "undefined" && Notification.permission === "default") {
@@ -7450,52 +7412,43 @@ function PHNClassForum({ currentUser, onClose, onUnreadChange }) {
     phnGetLecturers().then(list => setApprovedLecturers(list || []));
   }, []);
 
-  // Subscribe to messages — fires notifications for new incoming messages
+  // Subscribe to messages — unconditional, no canAccess gate needed.
+  // The forum button is only shown to students on the publichealth tab.
   useEffect(() => {
-    if (!canAccess) return;
     let initialized = false;
     const unsub = gcSubscribe(PHN_FORUM_ID, incoming => {
       setMsgs(incoming);
-      // Only process notifications after first snapshot (skip old messages)
       if (!initialized) {
         prevMsgCountRef.current = incoming.length;
         initialized = true;
         return;
       }
-      // New messages arrived
       if (incoming.length > prevMsgCountRef.current) {
         const newMsgs = incoming.slice(prevMsgCountRef.current);
         newMsgs.forEach(msg => {
-          if (msg.from === currentUser) return; // skip own messages
+          if (msg.from === currentUser) return;
           const senderUser = ls("nv-users", []).find(u => u.username === msg.from);
           const senderName = senderUser?.displayName || (msg.from || "Someone").split("@")[0];
           const bodyText = msg.type === "voice" ? "🎤 Sent a voice note"
                          : msg.type === "file"  ? `📎 Shared: ${msg.fileName || "a file"}`
                          : (msg.text || "").slice(0, 80);
-          // Browser push notification (works when tab is in background)
           if (typeof Notification !== "undefined" && Notification.permission === "granted") {
             try {
-              const n = new Notification(`🌍 PHN Forum — ${senderName}`, {
-                body: bodyText,
-                icon: "/favicon.ico",
-                tag: "phn_forum_" + msg.id,
-                renotify: true,
-              });
+              const n = new Notification(`🌍 PHN Forum — ${senderName}`, { body: bodyText, icon: "/favicon.ico", tag: "phn_forum_" + msg.id, renotify: true });
               n.onclick = () => { window.focus(); };
             } catch(e) {}
           }
         });
-        // Raise unread badge count (caller decides whether forum is open)
         if (onUnreadChange) onUnreadChange(newMsgs.filter(m => m.from !== currentUser).length);
       }
       prevMsgCountRef.current = incoming.length;
     });
     return () => unsub();
-  }, [canAccess, currentUser]);
+  }, [currentUser]);
 
-  // Reset unread count when forum is open (user is reading)
+  // Reset unread count when forum is opened
   useEffect(() => {
-    if (onUnreadChange) onUnreadChange(-999); // signal "reset"
+    if (onUnreadChange) onUnreadChange(-999);
   }, []);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
@@ -7651,20 +7604,6 @@ function PHNClassForum({ currentUser, onClose, onUnreadChange }) {
   const [showFolder, setShowFolder] = useState(false);
   const allLecturers = allUsers.filter(u => u.role === "lecturer" || u.role === "admin");
 
-  // Access gate
-  if (!canAccess) {
-    return (
-      <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-        <div style={{ background: "var(--bg)", borderRadius: 20, padding: "32px 28px", maxWidth: 400, width: "100%", textAlign: "center", border: "2px solid #2e7d32" }}>
-          <div style={{ fontSize: 48, marginBottom: 12 }}>🔒</div>
-          <div style={{ fontWeight: 800, fontSize: 18, color: "#2e7d32", marginBottom: 8 }}>PHN Students Only</div>
-          <div style={{ fontSize: 13, color: "var(--text3)", marginBottom: 20 }}>This Class Forum is exclusively for Public Health Nursing students and their invited lecturers.</div>
-          <button className="btn" onClick={onClose} style={{ width: "100%" }}>← Go Back</button>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.55)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 12 }}>
       <div style={{ background: "var(--bg)", borderRadius: 20, width: "100%", maxWidth: 680, height: "min(90vh, 700px)", display: "flex", flexDirection: "column", border: "2px solid #2e7d32", overflow: "hidden", boxShadow: "0 20px 60px rgba(0,0,0,.35)" }}>
@@ -7677,7 +7616,7 @@ function PHNClassForum({ currentUser, onClose, onUnreadChange }) {
             <div style={{ fontSize: 11, color: "rgba(255,255,255,.8)" }}>Public Health Nursing · {msgs.length} messages</div>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            {isPHNStudent && (
+            {(
               <button onClick={() => setShowLecPanel(p => !p)} title="Manage Lecturers" style={{ background: "rgba(255,255,255,.18)", border: "1.5px solid rgba(255,255,255,.35)", borderRadius: 10, padding: "6px 12px", color: "white", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
                 👨‍🏫 Lecturers
               </button>
@@ -7691,7 +7630,7 @@ function PHNClassForum({ currentUser, onClose, onUnreadChange }) {
         </div>
 
         {/* Lecturer management panel */}
-        {showLecPanel && isPHNStudent && (
+        {showLecPanel && (
           <div style={{ padding: "14px 18px", background: "var(--bg4)", borderBottom: "1.5px solid var(--border)", flexShrink: 0 }}>
             <div style={{ fontWeight: 800, fontSize: 13, color: "#2e7d32", marginBottom: 10 }}>👨‍🏫 Manage Lecturers in this Forum</div>
             <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 10 }}>Add or remove lecturers who can join the PHN class forum.</div>
@@ -7814,8 +7753,7 @@ function NursingExamsView({ toast, currentUser, initialExam, isAdmin, onPHNForum
     const allUsers = ls("nv-users", []);
     const me = allUsers.find(u => u.username === currentUser) || {};
     const myRole = me.role || "student";
-    const isPHNStudent = me.class && (me.class.toLowerCase().includes("phn") || me.class.toLowerCase().includes("public"));
-    if (!isPHNStudent && myRole !== "admin") return;
+    // All users accessing PHN section can subscribe (button only shown on publichealth tab)
     let initialized = false;
     let prevCount = 0;
     const unsub = gcSubscribe(PHN_FORUM_ID, incoming => {
@@ -15437,11 +15375,7 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
 
   // Load assignments for classes taught
   useEffect(() => {
-    if (!_db) return;
-    // subscribe to all assignments
-    const unsub = _db.collection("assignments")
-      .orderBy("dueAt","asc")
-      .onSnapshot(snap => setAssignments(snap.docs.map(d=>({id:d.id,...d.data()}))), ()=>{});
+    const unsub = _mkSub(db => db.collection("assignments").orderBy("dueAt","asc").onSnapshot(snap => setAssignments(snap.docs.map(d=>({id:d.id,...d.data()}))), () => {}));
     return () => unsub();
   }, []);
 
