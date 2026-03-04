@@ -6493,7 +6493,7 @@ function NcPaywall({ currentUser, onUnlocked, toast, preview, isMock }) {
               className="btn btn-accent"
               style={{width:"100%",padding:"14px",fontSize:16,fontWeight:800,
                 background:"linear-gradient(135deg,var(--accent),var(--accent2))",border:"none",
-                opacity:loading?.7:1}}
+                opacity:loading?0.7:1}}
               onClick={redeem}
               disabled={loading}
             >
@@ -12887,7 +12887,7 @@ function ResearchRequestPage({ currentUser, toast }) {
           <button
             onClick={submit}
             disabled={submitting}
-            style={{width:"100%",padding:"14px",borderRadius:10,background:"linear-gradient(135deg,#1e3a5f,#0f2847)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:15,opacity:submitting?.7:1}}
+            style={{width:"100%",padding:"14px",borderRadius:10,background:"linear-gradient(135deg,#1e3a5f,#0f2847)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:15,opacity:submitting?0.7:1}}
           >{submitting?"⏳ Submitting…":"📤 Submit Request"}</button>
         </div>
       )}
@@ -13060,7 +13060,7 @@ function AdminResearchRequests({ toast }) {
                 placeholder="e.g. Your project will cost ₦15,000 and will be ready in 5 working days."
                 style={{minHeight:70,resize:"vertical"}} />
               <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
-                <button onClick={sendQuote} disabled={saving} style={{flex:1,padding:"11px",borderRadius:10,background:"linear-gradient(135deg,#f59e0b,#d97706)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14,opacity:saving?.7:1}}>
+                <button onClick={sendQuote} disabled={saving} style={{flex:1,padding:"11px",borderRadius:10,background:"linear-gradient(135deg,#f59e0b,#d97706)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14,opacity:saving?0.7:1}}>
                   {saving?"⏳ Sending…":"💰 Send Quote"}
                 </button>
                 {live.status!=="declined"&&<button onClick={declineRequest} style={{padding:"11px 18px",borderRadius:10,background:"rgba(239,68,68,.1)",color:"var(--danger)",border:"1px solid rgba(239,68,68,.3)",cursor:"pointer",fontWeight:700}}>❌ Decline</button>}
@@ -13087,7 +13087,7 @@ function AdminResearchRequests({ toast }) {
               <button
                 onClick={()=>fileRef.current?.click()}
                 disabled={uploadingFile}
-                style={{width:"100%",padding:"12px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14,opacity:uploadingFile?.7:1}}
+                style={{width:"100%",padding:"12px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14,opacity:uploadingFile?0.7:1}}
               >{uploadingFile?"⏳ Uploading…":"📤 Upload & Mark Complete"}</button>
             </div>
           )}
@@ -13395,7 +13395,7 @@ function ResearchClub({ currentUser, toast, isLecturer, isAdmin }) {
             color:"white", border:"none", cursor:"pointer",
             fontWeight:900, fontSize:16, letterSpacing:.5,
             boxShadow:"0 8px 24px rgba(124,58,237,.4)",
-            opacity:registering?.7:1, transition:"all .2s"
+            opacity:registering?0.7:1, transition:"all .2s"
           }}
         >
           {registering ? "⏳ Registering..." : "🔬 Register as Research Club Member"}
@@ -14473,6 +14473,19 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
   const name = me.displayName || currentUser.split("@")[0];
   const avatarChar = (me.avatar || name[0] || "?").toUpperCase();
 
+  // Local state for PIN/offline (mirrored inside this panel)
+  const [isOffline, setIsOffline] = useState(!navigator.onLine);
+  const [pinLocked, setPinLocked] = useState(false);
+  const [bypassPin, setBypassPin] = useState(false);
+  const [showPinSetup, setShowPinSetup] = useState(false);
+  useEffect(() => {
+    const go  = () => setIsOffline(false);
+    const off = () => setIsOffline(true);
+    window.addEventListener("online",  go);
+    window.addEventListener("offline", off);
+    return () => { window.removeEventListener("online", go); window.removeEventListener("offline", off); };
+  }, []);
+
   const NAV_SECTIONS = [
     {
       label: "Main",
@@ -14551,29 +14564,6 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
         }}>
           📡 You're offline — showing cached content. Some features may be unavailable.
         </div>
-      )}
-
-      {/* ── PIN Unlock Screen ── */}
-      {pinLocked && !bypassPin && (getSavedPin(currentUser) || hasBiometric(currentUser)) && (
-        <PinUnlockScreen
-          email={currentUser}
-          onUnlock={() => setPinLocked(false)}
-          onUsePassword={() => { setPinLocked(false); setBypassPin(true); }}
-          toast={toast}
-        />
-      )}
-
-      {/* ── PIN Setup Modal ── */}
-      {showPinSetup && !pinLocked && (
-        <PinSetupModal
-          email={currentUser}
-          toast={toast}
-          onDone={(method) => { setShowPinSetup(false); }}
-          onSkip={() => {
-            setShowPinSetup(false);
-            try { localStorage.setItem("nv-pin-skipped-" + currentUser.replace(/[^a-z0-9]/gi,"_"), "1"); } catch {}
-          }}
-        />
       )}
 
       <div className="app-shell" style={isOffline ? {marginTop:36} : {}}>
