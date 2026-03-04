@@ -326,6 +326,57 @@ const examBsGet = async (key) => {
 };
 const examBsSet = async (key, val) => _setDocField(_DOC_EXAMS, key, val);
 
+// ── CLASS GROUP CHAT HELPERS (Firestore real-time) ────────────────────
+// Structure:
+//   Firestore collection "class_chats/{classId}"           – room metadata
+//   Firestore collection "class_chats/{classId}/msgs/{id}" – messages
+// Msg doc fields: { id, from, text, sentAt, type, fileData?, fileName?, fileType?, fileSize?, duration? }
+
+const gcSend = async (classId, fromUser, payload) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    const msgId = "gc_" + Date.now() + "_" + Math.random().toString(36).slice(2,7);
+    const msg = {
+      id: msgId, from: fromUser, sentAt: Date.now(),
+      type: payload.type || "text",
+      text: payload.text || "",
+      ...(payload.fileData && { fileData: payload.fileData }),
+      ...(payload.fileName && { fileName: payload.fileName }),
+      ...(payload.fileType && { fileType: payload.fileType }),
+      ...(payload.fileSize && { fileSize: payload.fileSize }),
+      ...(payload.duration && { duration: payload.duration }),
+    };
+    await _db.collection("class_chats").doc(classId).collection("msgs").doc(msgId).set(msg);
+    const preview = payload.type === "file" ? ("📎 " + (payload.fileName||"File"))
+                  : payload.type === "voice" ? "🎤 Voice note"
+                  : (payload.text||"").slice(0,100);
+    await _db.collection("class_chats").doc(classId).set({
+      classId, lastMsg: preview, lastFrom: fromUser, lastAt: Date.now(),
+    }, { merge: true });
+    return true;
+  } catch(e) { console.error("[GC] send failed:", e.message); throw e; }
+};
+
+const gcSubscribe = (classId, onMsgs) => {
+  if (!_db) return () => {};
+  return _db.collection("class_chats").doc(classId).collection("msgs")
+    .orderBy("sentAt","asc")
+    .onSnapshot(snap => onMsgs(snap.docs.map(d => d.data())), ()=>{});
+};
+
+const gcSubscribeRooms = (classIds, onRooms) => {
+  if (!_db || !classIds.length) { onRooms([]); return () => {}; }
+  // Listen to each room meta doc
+  const results = {};
+  const unsubs = classIds.map(cid => {
+    return _db.collection("class_chats").doc(cid).onSnapshot(snap => {
+      results[cid] = snap.exists ? { id: snap.id, ...snap.data() } : { id: cid, classId: cid, lastAt: 0 };
+      onRooms(Object.values(results));
+    }, () => {});
+  });
+  return () => unsubs.forEach(u => u());
+};
+
 // ── DIRECT-MESSAGE HELPERS (Firestore real-time) ──────────────────────
 // Structure:
 //   Firestore collection "dm_convs/{convId}"           – conversation metadata
@@ -366,6 +417,18 @@ const dmSend = async (fromUser, toUser, payload) => {
     }, { merge: true });
     return true;
   } catch(e) { console.error("[DM] send failed:", e.message); return false; }
+};
+
+const gcTestWrite = async (classId) => {
+  const ready = await _loadFirebase(); if (!ready) return "Firebase not connected";
+  try {
+    const testRef = _db.collection("class_chats").doc(classId).collection("msgs").doc("_test_ping_");
+    await testRef.set({ _test: true, ts: Date.now() });
+    await testRef.delete();
+    return null; // success
+  } catch(e) {
+    return e.message; // return the error message
+  }
 };
 
 const dmMarkRead = async (me, other) => {
@@ -449,6 +512,120 @@ const callEnd = async (caller, callee) => {
       { merge: true }
     );
   } catch(e) {}
+};
+
+
+// ── STUDY GROUP HELPERS ────────────────────────────────────────────────
+const sgSend = async (groupId, from, text, type="text", extra={}) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    const msgId = "sg_" + Date.now() + "_" + Math.random().toString(36).slice(2,6);
+    const msg = { id:msgId, from, text, type, sentAt:Date.now(), ...extra };
+    await _db.collection("study_groups").doc(groupId).collection("msgs").doc(msgId).set(msg);
+    await _db.collection("study_groups").doc(groupId).set({ lastMsg:text.slice(0,80), lastFrom:from, lastAt:Date.now() }, { merge:true });
+    return true;
+  } catch(e) { return false; }
+};
+const sgSubscribe = (groupId, onMsgs) => {
+  if (!_db) return ()=>{};
+  return _db.collection("study_groups").doc(groupId).collection("msgs")
+    .orderBy("sentAt","asc")
+    .onSnapshot(snap => onMsgs(snap.docs.map(d=>d.data())), ()=>{});
+};
+const sgCreateGroup = async (group) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try { await _db.collection("study_groups").doc(group.id).set(group, { merge:true }); return true; }
+  catch(e) { return false; }
+};
+const sgSubscribeGroups = (classId, onGroups) => {
+  if (!_db) return ()=>{};
+  return _db.collection("study_groups")
+    .where("classId","==",classId)
+    .orderBy("lastAt","desc")
+    .onSnapshot(snap => onGroups(snap.docs.map(d=>({id:d.id,...d.data()}))), ()=>{});
+};
+
+// ── TIMETABLE HELPERS ──────────────────────────────────────────────────
+const ttSave = async (classId, slots) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try { await _db.collection("timetables").doc(classId).set({ slots, updatedAt:Date.now() }); return true; }
+  catch(e) { return false; }
+};
+const ttLoad = async (classId) => {
+  const ready = await _loadFirebase(); if (!ready) return [];
+  try { const s = await _db.collection("timetables").doc(classId).get(); return s.exists ? (s.data().slots||[]) : []; }
+  catch(e) { return []; }
+};
+
+// ── ASSIGNMENT HELPERS ─────────────────────────────────────────────────
+const asgSave = async (asgn) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try { await _db.collection("assignments").doc(asgn.id).set(asgn, { merge:true }); return true; }
+  catch(e) { return false; }
+};
+const asgSubscribe = (classId, onData) => {
+  if (!_db) return ()=>{};
+  return _db.collection("assignments").where("classId","==",classId)
+    .orderBy("dueAt","asc")
+    .onSnapshot(snap => onData(snap.docs.map(d=>({id:d.id,...d.data()}))), ()=>{});
+};
+const asgSubmit = async (asgnId, student, fileData, fileName) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    await _db.collection("assignments").doc(asgnId).collection("submissions").doc(_safeKey(student)).set({
+      student, fileData, fileName, submittedAt:Date.now(), grade:null, feedback:""
+    }, { merge:true });
+    return true;
+  } catch(e) { return false; }
+};
+const asgLoadSubmissions = async (asgnId) => {
+  const ready = await _loadFirebase(); if (!ready) return [];
+  try {
+    const snap = await _db.collection("assignments").doc(asgnId).collection("submissions").get();
+    return snap.docs.map(d=>d.data());
+  } catch(e) { return []; }
+};
+const asgGrade = async (asgnId, student, grade, feedback) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    await _db.collection("assignments").doc(asgnId).collection("submissions").doc(_safeKey(student)).set({ grade, feedback, gradedAt:Date.now() }, { merge:true });
+    return true;
+  } catch(e) { return false; }
+};
+const asgLoadMySubmission = async (asgnId, student) => {
+  const ready = await _loadFirebase(); if (!ready) return null;
+  try {
+    const d = await _db.collection("assignments").doc(asgnId).collection("submissions").doc(_safeKey(student)).get();
+    return d.exists ? d.data() : null;
+  } catch(e) { return null; }
+};
+
+// ── ATTENDANCE HELPERS ─────────────────────────────────────────────────
+const attMark = async (classId, date, student, status) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    const docId = classId + "_" + date;
+    await _db.collection("attendance").doc(docId).set({ [_safeKey(student)]: status }, { merge:true });
+    return true;
+  } catch(e) { return false; }
+};
+const attLoad = async (classId, date) => {
+  const ready = await _loadFirebase(); if (!ready) return {};
+  try {
+    const d = await _db.collection("attendance").doc(classId + "_" + date).get();
+    return d.exists ? d.data() : {};
+  } catch(e) { return {}; }
+};
+const attLoadRange = async (classId, dates) => {
+  const ready = await _loadFirebase(); if (!ready) return {};
+  try {
+    const results = {};
+    await Promise.all(dates.map(async date => {
+      const d = await _db.collection("attendance").doc(classId + "_" + date).get();
+      results[date] = d.exists ? d.data() : {};
+    }));
+    return results;
+  } catch(e) { return {}; }
 };
 
 // ── REACTIVE SYNC ─────────────────────────────────────────────────────
@@ -1139,6 +1316,58 @@ body.light .nav-item.active{background:rgba(255,255,255,.22);color:#ffffff;}
   .nc-sidebar{position:fixed;top:0;left:0;height:100vh;transform:translateX(-100%);}
   .nc-sidebar.open{transform:translateX(0);}
 }
+
+/* ── LECTURER PANEL ── */
+.lp-sidebar{width:230px;flex-shrink:0;background:var(--sidebar-bg);backdrop-filter:blur(16px);height:100vh;position:sticky;top:0;overflow-y:auto;border-right:1px solid var(--border);display:flex;flex-direction:column;}
+.lp-head{padding:20px 16px 14px;border-bottom:1px solid var(--border2);}
+.lp-logo{display:flex;align-items:center;gap:10px;margin-bottom:6px;}
+.lp-logo-icon{width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,#d97706,#f59e0b);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;}
+.lp-logo-name{font-family:'Syne',sans-serif;font-weight:800;font-size:14px;color:#fff;line-height:1.2;}
+.lp-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;background:rgba(217,119,6,.25);border:1px solid rgba(217,119,6,.5);font-size:10px;font-weight:800;color:#fbbf24;margin-top:4px;}
+.lp-nav-sec{font-size:10px;font-weight:800;color:rgba(255,255,255,.35);letter-spacing:.1em;text-transform:uppercase;padding:12px 16px 4px;}
+.lp-nav-item{display:flex;align-items:center;gap:10px;padding:9px 16px;cursor:pointer;border-radius:8px;margin:1px 8px;font-size:13px;color:rgba(255,255,255,.75);font-weight:700;transition:all .18s;position:relative;}
+.lp-nav-item:hover{background:rgba(255,255,255,.08);color:#fff;}
+.lp-nav-item.active{background:rgba(217,119,6,.2);color:#fbbf24;border-left:3px solid #d97706;}
+.lp-nav-icon{font-size:16px;flex-shrink:0;width:20px;text-align:center;}
+.lp-main{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden;}
+.lp-topbar{height:54px;display:flex;align-items:center;gap:10px;padding:0 20px;background:var(--topbar-bg);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);flex-shrink:0;}
+.lp-topbar-title{font-family:'Syne',sans-serif;font-weight:800;font-size:15px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.lp-content{flex:1;overflow-y:auto;padding:24px 20px;}
+.lp-card{background:var(--card);border:1.5px solid var(--border);border-radius:16px;padding:20px;margin-bottom:16px;transition:border-color .2s;}
+.lp-card:hover{border-color:var(--accent2);}
+.lp-stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;text-align:center;}
+.lp-quick-btn{display:flex;align-items:center;gap:10px;padding:12px 16px;background:var(--card);border:1.5px solid var(--border);border-radius:12px;cursor:pointer;font-weight:700;font-size:13px;transition:all .18s;width:100%;text-align:left;color:var(--text);}
+.lp-quick-btn:hover{border-color:var(--accent);background:rgba(0,119,182,.05);}
+.lp-profile-card{padding:12px 16px;margin:8px;border-radius:12px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);cursor:pointer;transition:all .2s;}
+.lp-profile-card:hover{background:rgba(255,255,255,.1);}
+@media(max-width:768px){.lp-sidebar{position:fixed;top:0;left:0;height:100vh;z-index:200;transform:translateX(-100%);transition:transform .25s;}.lp-sidebar.open{transform:translateX(0);}}
+
+
+/* ── STUDY GROUPS ── */
+.sg-room{background:var(--card);border:1.5px solid var(--border);border-radius:14px;padding:16px 18px;cursor:pointer;transition:all .2s;margin-bottom:10px;}
+.sg-room:hover,.sg-room.active{border-color:var(--accent);background:rgba(0,119,182,0.05);}
+.sg-bubble{max-width:72%;padding:10px 14px;border-radius:14px;font-size:14px;line-height:1.5;word-break:break-word;}
+.sg-bubble.mine{background:var(--accent);color:#fff;border-bottom-right-radius:4px;margin-left:auto;}
+.sg-bubble.theirs{background:var(--bg4);border:1px solid var(--border);border-bottom-left-radius:4px;}
+/* ── TIMETABLE ── */
+.tt-cell{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 12px;font-size:12px;min-height:60px;}
+.tt-cell.has-class{border-color:var(--accent);background:rgba(0,119,182,0.07);cursor:pointer;}
+.tt-day-hdr{font-weight:800;font-size:12px;color:var(--text3);text-align:center;padding:8px 4px;text-transform:uppercase;letter-spacing:.06em;}
+/* ── ASSIGNMENTS ── */
+.asgn-card{background:var(--card);border:1.5px solid var(--border);border-radius:14px;padding:18px;margin-bottom:12px;transition:border-color .2s;}
+.asgn-card:hover{border-color:var(--accent);}
+.asgn-status{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;}
+/* ── ATTENDANCE ── */
+.att-row{display:grid;grid-template-columns:1fr auto auto;align-items:center;gap:12px;padding:12px 16px;background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;}
+/* ── LEADERBOARD ── */
+.lb-row{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:8px;transition:border-color .2s;}
+.lb-row:hover{border-color:var(--accent);}
+.lb-rank{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;flex-shrink:0;}
+/* ── STREAKS ── */
+.streak-flame{font-size:48px;filter:drop-shadow(0 0 12px #f97316);}
+/* ── PROGRESS DASHBOARD ── */
+.prog-ring-wrap{position:relative;display:inline-flex;align-items:center;justify-content:center;}
+
 `;
 
 // ─── TOAST ──────────────────────────────────────────────────────────
@@ -1177,7 +1406,7 @@ function AdminPanel({ toast, currentUser }) {
         <div className="admin-header-icon">🛡️</div>
         <div>
           <div className="admin-header-title">Admin Control Panel</div>
-          <div className="admin-header-sub">Logged in as <b style={{color:"var(--purple)"}}>{currentUser}</b> · Full system access</div>
+          <div className="admin-header-sub">Logged in as <b style={{color:"var(--purple)"}}>{currentUser}</b> • Full system access</div>
         </div>
       </div>
       <div className="admin-tabs">
@@ -1280,7 +1509,7 @@ function AdminOverview({ toast }) {
             <div className="user-av">{u.username[0].toUpperCase()}</div>
             <div style={{flex:1}}>
               <div style={{fontWeight:600,fontSize:14}}>{u.username}</div>
-              <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{u.class||"No class"} · Joined {u.joined}</div>
+              <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{u.class||"No class"} • Joined {u.joined}</div>
             </div>
             <span className={`tag ${u.role==="admin"?"tag-purple":u.role==="lecturer"?"tag-warn":"tag-accent"}`}>{u.role||"student"}</span>
           </div>
@@ -1295,7 +1524,7 @@ function AdminUsers({ toast }) {
   const [users, setUsers] = useSharedData("nv-users", []);
   const [edit, setEdit] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({username:"",password:"",role:"student",class:"",displayName:""});
+  const [form, setForm] = useState({username:"",password:"",role:"student",class:"",displayName:"",matricNumber:""});
   const classes = ls("nv-classes", DEFAULT_CLASSES);
   const [search, setSearch] = useState("");
   const [showPw, setShowPw] = useState({});
@@ -1309,7 +1538,7 @@ function AdminUsers({ toast }) {
     if (edit) { u = users.map(x=>x.username===edit?{...x,...entry}:x); toast("User profile updated ✅","success"); }
     else { u = [...users,{...entry,joined:new Date().toLocaleDateString()}]; toast("User added ✅","success"); }
     setUsers(u); saveShared("users",u); setEdit(null); setShowAdd(false);
-    setForm({username:"",password:"",role:"student",class:"",displayName:""});
+    setForm({username:"",password:"",role:"student",class:"",displayName:"",matricNumber:""});
   };
 
   const del = (username) => {
@@ -1333,7 +1562,7 @@ function AdminUsers({ toast }) {
           <div className="sec-title">👥 Users ({users.length})</div>
           <div style={{fontSize:12,color:"var(--text3)"}}>Manage all registered accounts</div>
         </div>
-        <button className="btn btn-purple" onClick={()=>{setShowAdd(true);setEdit(null);setForm({username:"",password:"",role:"student",class:"",displayName:""});}}>+ Add User</button>
+        <button className="btn btn-purple" onClick={()=>{setShowAdd(true);setEdit(null);setForm({username:"",password:"",role:"student",class:"",displayName:"",matricNumber:""});}}>+ Add User</button>
       </div>
 
       <div className="search-wrap" style={{marginBottom:14}}>
@@ -1360,7 +1589,7 @@ function AdminUsers({ toast }) {
                 <button className="btn btn-sm btn-accent" onClick={()=>setViewUser(u)}>👁 View</button>
                 <button className="btn btn-sm" onClick={()=>{
                   setEdit(u.username);
-                  setForm({username:u.username,password:u.password,role:u.role||"student",class:u.class||"",displayName:u.displayName||""});
+                  setForm({username:u.username,password:u.password,role:u.role||"student",class:u.class||"",displayName:u.displayName||"",matricNumber:u.matricNumber||""});
                   setShowAdd(true);
                 }}>✏️ Edit</button>
                 <button className="btn btn-sm btn-danger" onClick={()=>del(u.username)}>🗑️</button>
@@ -1389,6 +1618,7 @@ function AdminUsers({ toast }) {
                 {lbl:"📧 Email / Username", val: viewUser.username},
                 {lbl:"🔑 Password", val: showPw[viewUser.username] ? viewUser.password : "••••••••", action: ()=>setShowPw(p=>({...p,[viewUser.username]:!p[viewUser.username]})), actionLabel: showPw[viewUser.username]?"🙈 Hide":"👁 Show"},
                 {lbl:"👤 Display Name", val: viewUser.displayName||viewUser.username.split("@")[0]},
+                {lbl:"🎓 Matric No.", val: viewUser.matricNumber||"—"},
                 {lbl:"🏫 Class", val: classes.find(c=>c.id===viewUser.class)?.label||"No class assigned"},
                 {lbl:"📅 Joined", val: viewUser.joined||"Unknown"},
               ].map(row=>(
@@ -1404,7 +1634,7 @@ function AdminUsers({ toast }) {
             <div style={{display:"flex",gap:8,marginTop:14}}>
               <button className="btn btn-accent" style={{flex:1}} onClick={()=>{
                 setEdit(viewUser.username);
-                setForm({username:viewUser.username,password:viewUser.password,role:viewUser.role||"student",class:viewUser.class||"",displayName:viewUser.displayName||""});
+                setForm({username:viewUser.username,password:viewUser.password,role:viewUser.role||"student",class:viewUser.class||"",displayName:viewUser.displayName||"",matricNumber:viewUser.matricNumber||""});
                 setShowAdd(true); setViewUser(null);
               }}>✏️ Edit Profile</button>
               <button className="btn btn-danger" onClick={()=>del(viewUser.username)}>🗑️ Delete</button>
@@ -1431,6 +1661,8 @@ function AdminUsers({ toast }) {
             </div>
             <label className="lbl">👤 Display Name</label>
             <input className="inp" value={form.displayName} onChange={e=>setForm({...form,displayName:e.target.value})} placeholder="e.g. Dr. Adeyemi or John Doe" />
+            <label className="lbl">🎓 Matric Number</label>
+            <input className="inp" value={form.matricNumber||""} onChange={e=>setForm({...form,matricNumber:e.target.value.toUpperCase()})} placeholder="e.g. NRS/2021/001 (students only)" />
             <label className="lbl">🎭 Role</label>
             <select className="inp" value={form.role} onChange={e=>setForm({...form,role:e.target.value})}>
               <option value="student">Student</option>
@@ -1903,7 +2135,7 @@ function AdminPQ({ toast }) {
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
               <div>
                 <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15}}>{b.subject}</div>
-                <div style={{fontSize:12,color:"var(--text3)",marginTop:3}}>{b.year} · {b.questions.length} questions</div>
+                <div style={{fontSize:12,color:"var(--text3)",marginTop:3}}>{b.year} • {b.questions.length} questions</div>
               </div>
               <div style={{display:"flex",gap:5}}>
                 <button className="btn btn-sm" onClick={e=>{e.stopPropagation();setEditBank(i);setBankForm({subject:b.subject,year:b.year});setShowBankModal(true);}}>✏️</button>
@@ -2232,7 +2464,7 @@ function AdminExamRetakes({ toast }) {
                       <div style={{flex:1}}>
                         <div style={{fontWeight:600,fontSize:13}}>{bank?.subject||`Exam #${bankId}`}</div>
                         <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>
-                          {data.attempts}/2 attempts · Best: {data.results.length>0?Math.max(...data.results.map(r=>r.pct)):0}%
+                          {data.attempts}/2 attempts • Best: {data.results.length>0?Math.max(...data.results.map(r=>r.pct)):0}%
                           {data.results.some(r=>r.auto)&&<span style={{color:"var(--danger)",marginLeft:6}}>⚠️ Auto-submitted</span>}
                         </div>
                       </div>
@@ -2378,7 +2610,7 @@ function AdminEssayExams({ toast }) {
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
         <div>
           <div className="sec-title">✍️ Essay Exams</div>
-          <div className="sec-sub">Create essay exams · AI or manual grading · 1 attempt per student</div>
+          <div className="sec-sub">Create essay exams • AI or manual grading • 1 attempt per student</div>
         </div>
         {adminTab === "banks" && <button className="btn btn-purple" onClick={()=>{setShowBankModal(true);setEditBank(null);setBankForm({subject:"",description:""});}}>+ New Essay Exam</button>}
         {adminTab === "grade" && <button className="btn btn-accent btn-sm" onClick={loadSubmissions}>🔄 Refresh</button>}
@@ -2410,7 +2642,7 @@ function AdminEssayExams({ toast }) {
                   <button className="modal-close" onClick={()=>setGradingStudent(null)}>✕</button>
                 </div>
                 <div style={{fontSize:12,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginBottom:16}}>
-                  Subject: <b style={{color:"var(--accent)"}}>{gradingStudent.subject}</b> · Submitted {gradingStudent.date}
+                  Subject: <b style={{color:"var(--accent)"}}>{gradingStudent.subject}</b> • Submitted {gradingStudent.date}
                 </div>
                 {(gradingStudent.questions || []).map((q, i) => (
                   <div key={i} className="card" style={{marginBottom:14}}>
@@ -2516,7 +2748,7 @@ function AdminEssayExams({ toast }) {
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
               <div>
                 <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15}}>{b.subject}</div>
-                <div style={{fontSize:12,color:"var(--text3)",marginTop:3}}>{b.questions.length} questions · {b.questions.reduce((s,q)=>s+(q.marks||10),0)} total marks</div>
+                <div style={{fontSize:12,color:"var(--text3)",marginTop:3}}>{b.questions.length} questions • {b.questions.reduce((s,q)=>s+(q.marks||10),0)} total marks</div>
                 {b.description&&<div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>{b.description}</div>}
               </div>
               <div style={{display:"flex",gap:5,flexShrink:0}}>
@@ -2543,8 +2775,8 @@ function AdminEssayExams({ toast }) {
                   <div style={{fontWeight:600,fontSize:13,marginBottom:4}}>{qi+1}. {q.q}</div>
                   <div style={{display:"flex",gap:8,fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace",flexWrap:"wrap"}}>
                     <span style={{color:"var(--accent)"}}>{q.marks||10} marks</span>
-                    <span>· {q.wordGuide||"100-200"} words</span>
-                    {q.modelAnswer&&<span style={{color:"var(--success)"}}>· Model answer set ✓</span>}
+                    <span>• {q.wordGuide||"100-200"} words</span>
+                    {q.modelAnswer&&<span style={{color:"var(--success)"}}>• Model answer set ✓</span>}
                   </div>
                 </div>
                 <div style={{display:"flex",gap:5,flexShrink:0}}>
@@ -2569,7 +2801,7 @@ function AdminEssayExams({ toast }) {
                 <div style={{flex:1}}>
                   <div style={{fontWeight:600,fontSize:13}}>{u.username}</div>
                   <div style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>
-                    {att ? `Submitted ${att.date} · Score: ${att.score!==null?`${att.score}/${att.total||100} (${att.pct}%)`:"Pending manual grade"}` : "Not attempted"}
+                    {att ? `Submitted ${att.date} • Score: ${att.score!==null?`${att.score}/${att.total||100} (${att.pct}%)`:"Pending manual grade"}` : "Not attempted"}
                   </div>
                 </div>
                 {att&&<button className="btn btn-sm btn-accent" onClick={()=>resetStudentEssay(u.username,selBank)}>🔄 Reset</button>}
@@ -2650,7 +2882,7 @@ function AdminHandouts({ toast }) {
     saveFolders(f);
     const u = handouts.filter(h=>!(h.classId===classId&&h.course===course&&(h.lecturerName===lecName||h.uploadedBy?.split("@")[0]===lecName)));
     setHandouts(u); saveShared("handouts",u);
-    toast(`👨‍🏫 Lecturer folder "${lecName}" deleted`,"success");
+    toast(`👨🏫 Lecturer folder "${lecName}" deleted`,"success");
   };
 
   // Rename lecturer
@@ -2730,7 +2962,7 @@ function AdminHandouts({ toast }) {
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:courseList.length?12:0}}>
                     <div>
                       <div style={{fontWeight:800,fontSize:14}}>{cls.label}</div>
-                      <div style={{fontSize:11,color:"var(--text3)"}}>{cls.desc} · {courseList.length} course folder{courseList.length!==1?"s":""}</div>
+                      <div style={{fontSize:11,color:"var(--text3)"}}>{cls.desc} • {courseList.length} course folder{courseList.length!==1?"s":""}</div>
                     </div>
                     <button className="btn btn-sm" onClick={()=>{
                       const existing=folders[cls.id]||{};
@@ -2755,7 +2987,7 @@ function AdminHandouts({ toast }) {
                                 <span style={{fontSize:16}}>📂</span>
                                 <div>
                                   <div style={{fontWeight:700,fontSize:13}}>{course}</div>
-                                  <div style={{fontSize:10,color:"var(--text3)"}}>{allLecturers.length} lecturer{allLecturers.length!==1?"s":" "} · {hCount} file{hCount!==1?"s":""}</div>
+                                  <div style={{fontSize:10,color:"var(--text3)"}}>{allLecturers.length} lecturer{allLecturers.length!==1?"s":" "} • {hCount} file{hCount!==1?"s":""}</div>
                                 </div>
                               </div>
                               <button className="btn btn-sm btn-danger" onClick={()=>deleteCourseFolder(cls.id,course)} title="Delete course folder">🗑️ Delete</button>
@@ -2766,7 +2998,7 @@ function AdminHandouts({ toast }) {
                                   const lhCount=handouts.filter(h=>h.classId===cls.id&&h.course===course&&(h.lecturerName===lec||h.uploadedBy?.split("@")[0]===lec)).length;
                                   return (
                                     <div key={lec} style={{display:"flex",alignItems:"center",gap:4,fontSize:11,padding:"3px 8px",borderRadius:7,border:"1px solid var(--border2)",background:"rgba(124,58,237,.06)"}}>
-                                      <span>👨‍🏫</span>
+                                      <span>👨🏫</span>
                                       <span style={{color:"var(--purple)",fontWeight:600}}>{lec}</span>
                                       <span style={{color:"var(--text3)"}}>({lhCount})</span>
                                       <button title="Rename" onClick={()=>{setRenameLec({classId:cls.id,course,oldName:lec});setRenameLecVal(lec);}}
@@ -3091,7 +3323,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
     if (existing.includes(newLecturerName.trim())) return toast("Lecturer folder already exists","warn");
     const f = {...folders,[drillClass]:{...(folders[drillClass]||{}),[drillCourse]:[...existing,newLecturerName.trim()]}};
     saveFolders(f);
-    toast(`👨‍🏫 Lecturer folder "${newLecturerName.trim()}" created!`,"success");
+    toast(`👨🏫 Lecturer folder "${newLecturerName.trim()}" created!`,"success");
     setShowLecturerModal(false); setNewLecturerName("");
   };
 
@@ -3215,7 +3447,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
         <span style={{color:drillLecturer?"var(--accent)":"var(--text)",cursor:drillLecturer?"pointer":"default",fontWeight:800}}
           onClick={()=>{if(drillLecturer)setDrillLecturer(null);}}>{drillCourse}</span></>}
       {drillLecturer&&<><span style={{color:"var(--text3)"}}>›</span>
-        <span style={{fontWeight:800,color:"var(--text)"}}>👨‍🏫 {drillLecturer}</span></>}
+        <span style={{fontWeight:800,color:"var(--text)"}}>👨🏫 {drillLecturer}</span></>}
     </div>
   );
 
@@ -3245,7 +3477,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}>
         <div>
           <div className="sec-title">📄 Handouts</div>
-          <div className="sec-sub">{handouts.length} total · organised by class › course › lecturer</div>
+          <div className="sec-sub">{handouts.length} total • organised by class › course › lecturer</div>
         </div>
         {isLecturer && !drillLecturer && <button className="btn btn-accent" onClick={()=>setShowAdd(p=>!p)}>+ Upload Handout</button>}
       </div>
@@ -3346,7 +3578,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
                       {isLecturer&&<button className="btn btn-sm btn-danger" onClick={e=>{e.stopPropagation();del(h.id);}}>✕</button>}
                     </div>
                     <div style={{fontWeight:800,fontSize:14,marginBottom:3}}>{h.title}</div>
-                    <div style={{fontSize:11,color:"var(--purple)",marginBottom:4}}>👨‍🏫 {h.lecturerName||h.uploadedBy?.split("@")[0]||"Unknown"}</div>
+                    <div style={{fontSize:11,color:"var(--purple)",marginBottom:4}}>👨🏫 {h.lecturerName||h.uploadedBy?.split("@")[0]||"Unknown"}</div>
                     <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{h.date}</div>
                   </div>
                 );
@@ -3380,7 +3612,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
                   const cnt = handouts.filter(h=>h.classId===c.id).length;
                   const allCourses = getCoursesForClass(c.id);
                   return (
-                    <FolderCard key={c.id} icon="📁" label={c.label} sublabel={`${c.desc} · ${allCourses.length} course${allCourses.length!==1?"s":""}`}
+                    <FolderCard key={c.id} icon="📁" label={c.label} sublabel={`${c.desc} • ${allCourses.length} course${allCourses.length!==1?"s":""}`}
                       count={cnt} countLabel={`handout${cnt!==1?"s":""}`} color={c.color||"var(--accent)"}
                       onClick={()=>{setDrillClass(c.id);setDrillCourse(null);setDrillLecturer(null);}} />
                   );
@@ -3452,7 +3684,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
               </div>
               {lecturersInCourse.length===0 ? (
                 <div style={{textAlign:"center",padding:40,color:"var(--text3)",border:"1px dashed var(--border)",borderRadius:12}}>
-                  <div style={{fontSize:40,marginBottom:8}}>👨‍🏫</div>
+                  <div style={{fontSize:40,marginBottom:8}}>👨🏫</div>
                   <div>No lecturer folders yet</div>
                   {isLecturer&&<div style={{fontSize:12,marginTop:6}}>Click "+ New Lecturer Folder" to create one</div>}
                 </div>
@@ -3461,7 +3693,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
                   {lecturersInCourse.map(lec=>{
                     const cnt = courseHandouts.filter(h=>(h.lecturerName||h.uploadedBy?.split("@")[0]||"Unknown")===lec).length;
                     return (
-                      <FolderCard key={lec} icon="👨‍🏫" label={lec}
+                      <FolderCard key={lec} icon="👨🏫" label={lec}
                         sublabel="Lecturer"
                         count={cnt} countLabel={`file${cnt!==1?"s":""}`} color="var(--purple)"
                         onClick={()=>setDrillLecturer(lec)} />
@@ -3477,7 +3709,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
             <>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
                 <div style={{fontWeight:800,fontSize:15,color:"var(--purple)"}}>
-                  👨‍🏫 {drillLecturer} — {drillCourse}
+                  👨🏫 {drillLecturer} — {drillCourse}
                 </div>
                 {isLecturer&&(
                   <button className="btn btn-sm btn-accent" onClick={()=>{
@@ -3572,7 +3804,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
         <div className="modal-overlay" onClick={()=>setShowLecturerModal(false)}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
             <div className="modal-head">
-              <div className="modal-title">👨‍🏫 Create Lecturer Folder</div>
+              <div className="modal-title">👨🏫 Create Lecturer Folder</div>
               <button className="modal-close" onClick={()=>setShowLecturerModal(false)}>✕</button>
             </div>
             <div style={{fontSize:12,color:"var(--text3)",marginBottom:12}}>
@@ -3596,14 +3828,14 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
                       style={{fontSize:11,padding:"3px 10px",borderRadius:7,border:"1px solid var(--border2)",cursor:"pointer",
                         background:newLecturerName===name?"rgba(124,58,237,.15)":"transparent",
                         color:newLecturerName===name?"var(--purple)":"var(--text3)"}}>
-                      👨‍🏫 {name}
+                      👨🏫 {name}
                     </span>
                   );
                 })}
               </div>
             </div>
             <div style={{display:"flex",gap:8}}>
-              <button className="btn btn-purple" style={{flex:1}} onClick={createLecturerFolder}>👨‍🏫 Create Folder</button>
+              <button className="btn btn-purple" style={{flex:1}} onClick={createLecturerFolder}>👨🏫 Create Folder</button>
               <button className="btn" onClick={()=>setShowLecturerModal(false)}>Cancel</button>
             </div>
           </div>
@@ -3642,7 +3874,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
 // ═══════════════════════════════════════════════════════════════════════
 // STUDENT PROFILE
 // ═══════════════════════════════════════════════════════════════════════
-const AVATAR_EMOJIS = ["👩‍⚕️","👨‍⚕️","🧑‍⚕️","👩‍🎓","👨‍🎓","🧑‍🎓","👩‍💼","👨‍💼","🌟","🏆","💡","🦋","🌺","🎯","🩺","🧬","💊","🏥"];
+const AVATAR_EMOJIS = ["👩⚕️","👨⚕️","🧑‍⚕️","👩🎓","👨🎓","🧑‍🎓","👩💼","👨💼","🌟","🏆","💡","🦋","🌺","🎯","🩺","🧬","💊","🏥"];
 const YEAR_OPTIONS = ["Year 1","Year 2","Year 3","Year 4","Year 5","Postgraduate","Intern","Other"];
 
 function StudentProfile({ currentUser, toast }) {
@@ -3655,14 +3887,16 @@ function StudentProfile({ currentUser, toast }) {
   const [editMode, setEditMode] = useState(false);
   const [showPwSection, setShowPwSection] = useState(false);
   const [showAvatarPicker, setShowAvatarPicker] = useState(false);
+  const isLecturerRole = me.role === "lecturer";
   const [form, setForm] = useState({
     displayName: me.displayName || currentUser.split("@")[0],
     phone: me.phone || "",
     bio: me.bio || "",
     class: me.class || "",
     yearOfStudy: me.yearOfStudy || "",
-    avatar: me.avatar || "👩‍⚕️",
+    avatar: me.avatar || (me.role === "lecturer" ? "👨🏫" : "👩⚕️"),
     matricNumber: me.matricNumber || "",
+    specialty: me.specialty || "",
   });
   const [pwForm, setPwForm] = useState({ current: "", newPw: "", confirm: "" });
   const [showPw, setShowPw] = useState({ current: false, newPw: false, confirm: false });
@@ -3676,8 +3910,9 @@ function StudentProfile({ currentUser, toast }) {
       bio: u.bio || "",
       class: u.class || "",
       yearOfStudy: u.yearOfStudy || "",
-      avatar: u.avatar || "👩‍⚕️",
+      avatar: u.avatar || (u.role === "lecturer" ? "👨🏫" : "👩⚕️"),
       matricNumber: u.matricNumber || "",
+      specialty: u.specialty || "",
     }));
   }, [users, currentUser]);
 
@@ -3715,7 +3950,7 @@ function StudentProfile({ currentUser, toast }) {
   const passed = results.filter(r => (r.pct || 0) >= 50).length;
 
   const initials = (form.displayName || currentUser)[0]?.toUpperCase() || "?";
-  const roleLabel = me.role === "admin" ? "🛡️ Admin" : me.role === "lecturer" ? "👨‍🏫 Lecturer" : "🎓 Student";
+  const roleLabel = me.role === "admin" ? "🛡️ Admin" : me.role === "lecturer" ? "👨🏫 Lecturer" : "🎓 Student";
   const roleColor = me.role === "admin" ? "#7c3aed" : me.role === "lecturer" ? "#d97706" : "var(--accent)";
 
   return (
@@ -3891,16 +4126,20 @@ function StudentProfile({ currentUser, toast }) {
       <div className="card" style={{ marginBottom: 14 }}>
         <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 16, color: "var(--text)", display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ width: 28, height: 28, borderRadius: 8, background: "var(--accent)" + "20", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>🏫</span>
-          Academic Information
+          {isLecturerRole ? "Lecturer Information" : "Academic Information"}
         </div>
 
         {!editMode ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            {[
+            {(isLecturerRole ? [
+              { icon: "👨🏫", label: "Role", val: "👨🏫 Lecturer" },
+              { icon: "🏫", label: "Classes", val: "All classes (lecturers teach across all classes)" },
+              { icon: "🩺", label: "Specialty / Department", val: form.specialty || "Not set" },
+            ] : [
               { icon: "🏫", label: "Class", val: myClass ? `${myClass.label} — ${myClass.desc}` : "No class assigned" },
               { icon: "📅", label: "Year of Study", val: form.yearOfStudy || "Not set" },
               { icon: "🎓", label: "Role", val: roleLabel },
-            ].map((row, i) => (
+            ]).map((row, i) => (
               <div key={i} style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "10px 12px", borderRadius: 10, background: "var(--bg4)" }}>
                 <span style={{ fontSize: 16, flexShrink: 0, marginTop: 1 }}>{row.icon}</span>
                 <div style={{ flex: 1 }}>
@@ -3912,31 +4151,49 @@ function StudentProfile({ currentUser, toast }) {
           </div>
         ) : (
           <div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            {isLecturerRole ? (
               <div>
-                <label className="lbl">🏫 Class</label>
-                <select className="inp" style={{ marginBottom: 0 }} value={form.class}
-                  onChange={e => setForm(f => ({ ...f, class: e.target.value }))}>
-                  <option value="">— Select your class —</option>
-                  {classes.map(c => (
-                    <option key={c.id} value={c.id}>{c.label} — {c.desc}</option>
-                  ))}
-                </select>
+                <div style={{ marginBottom: 12 }}>
+                  <label className="lbl">🩺 Specialty / Department</label>
+                  <input className="inp" style={{ marginBottom: 0 }} value={form.specialty}
+                    onChange={e => setForm(f => ({ ...f, specialty: e.target.value }))}
+                    placeholder="e.g. Maternal Health, Pharmacology..." />
+                </div>
+                <div style={{ padding: "10px 12px", borderRadius: 10, background: "rgba(217,119,6,.08)", border: "1px solid rgba(217,119,6,.2)" }}>
+                  <div style={{ fontSize: 12, color: "#d97706", fontWeight: 700 }}>
+                    👨🏫 Lecturers are not assigned to a specific class — you can teach and interact with all classes.
+                  </div>
+                </div>
               </div>
+            ) : (
               <div>
-                <label className="lbl">📅 Year of Study</label>
-                <select className="inp" style={{ marginBottom: 0 }} value={form.yearOfStudy}
-                  onChange={e => setForm(f => ({ ...f, yearOfStudy: e.target.value }))}>
-                  <option value="">— Select year —</option>
-                  {YEAR_OPTIONS.map(y => <option key={y}>{y}</option>)}
-                </select>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                  <div>
+                    <label className="lbl">🏫 Class</label>
+                    <select className="inp" style={{ marginBottom: 0 }} value={form.class}
+                      onChange={e => setForm(f => ({ ...f, class: e.target.value }))}>
+                      <option value="">— Select your class —</option>
+                      {classes.map(c => (
+                        <option key={c.id} value={c.id}>{c.label} — {c.desc}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="lbl">📅 Year of Study</label>
+                    <select className="inp" style={{ marginBottom: 0 }} value={form.yearOfStudy}
+                      onChange={e => setForm(f => ({ ...f, yearOfStudy: e.target.value }))}>
+                      <option value="">— Select year —</option>
+                      {YEAR_OPTIONS.map(y => <option key={y}>{y}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div style={{ marginTop: 10, padding: "10px 12px", borderRadius: 10, background: "var(--bg4)" }}>
+                  <div style={{ fontSize: 12, color: "var(--text3)" }}>
+                    ℹ️ Contact your admin if your class assignment appears incorrect after saving.
+                  </div>
+                </div>
               </div>
-            </div>
-            <div style={{ marginTop: 10, padding: "10px 12px", borderRadius: 10, background: "var(--bg4)" }}>
-              <div style={{ fontSize: 12, color: "var(--text3)" }}>
-                ℹ️ Contact your admin if your class assignment appears incorrect after saving.
-              </div>
-            </div>
+            )}
           </div>
         )}
       </div>
@@ -4032,7 +4289,7 @@ function StudentProfile({ currentUser, toast }) {
               </div>
               <div style={{ flex: 1 }}>
                 <div style={{ fontWeight: 700, fontSize: 13 }}>{r.subject}</div>
-                <div style={{ fontSize: 11, color: "var(--text3)" }}>{r.type || "Exam"} · {r.date}</div>
+                <div style={{ fontSize: 11, color: "var(--text3)" }}>{r.type || "Exam"} • {r.date}</div>
               </div>
               <div style={{
                 fontWeight: 800, fontSize: 15,
@@ -4157,7 +4414,7 @@ function MCQExamView({ toast, currentUser, banks, onBack, backLabel }) {
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:14}}>
           <div>
             <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:15}}>{sel.subject}</div>
-            <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>{answeredCount}/{sel.questions.length} answered · click any number to jump</div>
+            <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>{answeredCount}/{sel.questions.length} answered • click any number to jump</div>
           </div>
           <button className="btn btn-accent btn-sm" onClick={submitExam}>Submit ✓</button>
         </div>
@@ -4219,7 +4476,7 @@ function MCQExamView({ toast, currentUser, banks, onBack, backLabel }) {
         return (
           <div key={b.id} className="card" style={{animation:`fadeUp .4s ease ${i*.08}s both`}}>
             <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15,marginBottom:4}}>{b.subject}</div>
-            <div style={{fontSize:12,color:"var(--text3)",marginBottom:10}}>{b.year} · {b.questions.length} questions</div>
+            <div style={{fontSize:12,color:"var(--text3)",marginBottom:10}}>{b.year} • {b.questions.length} questions</div>
             {att ? (
               <div>
                 <div style={{fontSize:13,marginBottom:4}}>Score: <span style={{fontWeight:700,color:att.pct>=70?"var(--success)":att.pct>=50?"var(--warn)":"var(--danger)"}}>{att.score}/{att.total} ({att.pct}%)</span></div>
@@ -4388,7 +4645,7 @@ Return ONLY valid JSON with no markdown or backticks:
           <div>
             <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16}}>{sel.subject}</div>
             <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>
-              {sel.questions.length} questions · {answeredCount}/{sel.questions.length} answered · {totalWords} words total
+              {sel.questions.length} questions • {answeredCount}/{sel.questions.length} answered • {totalWords} words total
             </div>
           </div>
           <div style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -4519,23 +4776,23 @@ Return ONLY valid JSON with no markdown or backticks:
             return (
               <div key={b.id} className="card" style={{animation:`fadeUp .4s ease ${i*.08}s both`}}>
                 <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15,marginBottom:4}}>{b.subject}</div>
-                <div style={{fontSize:12,color:"var(--text3)",marginBottom:8}}>{b.questions.length} questions · {b.questions.reduce((s,q)=>s+(+q.marks||10),0)} total marks</div>
+                <div style={{fontSize:12,color:"var(--text3)",marginBottom:8}}>{b.questions.length} questions • {b.questions.reduce((s,q)=>s+(+q.marks||10),0)} total marks</div>
                 {b.description&&<div style={{fontSize:11,color:"var(--text3)",marginBottom:8,fontStyle:"italic"}}>{b.description}</div>}
                 {att ? (
                   <div>
                     {att.pendingManualGrade && !att.manualGrade && (
                       <div style={{background:"rgba(251,146,60,.08)",border:"1px solid rgba(251,146,60,.25)",borderRadius:8,padding:"8px 12px",fontSize:12,color:"var(--warn)",marginBottom:6}}>
-                        ⏳ Submitted · Awaiting manual grading from your lecturer
+                        ⏳ Submitted • Awaiting manual grading from your lecturer
                       </div>
                     )}
                     {att.manualGrade && (
                       <div style={{marginBottom:6}}>
-                        <div style={{fontSize:14,fontWeight:700,marginBottom:2}}>Grade: <span style={{color:"var(--accent)"}}>{att.manualGrade.grade}</span> · {att.manualGrade.pct}%</div>
+                        <div style={{fontSize:14,fontWeight:700,marginBottom:2}}>Grade: <span style={{color:"var(--accent)"}}>{att.manualGrade.grade}</span> • {att.manualGrade.pct}%</div>
                         {att.manualGrade.overallComment && <div style={{fontSize:12,color:"var(--text2)"}}>{att.manualGrade.overallComment}</div>}
                         <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:4}}>✏️ Manually graded on {att.gradedDate}</div>
                       </div>
                     )}
-                    {att.grade && !att.manualGrade && <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Grade: <span style={{color:"var(--accent)"}}>{att.grade}</span> · {att.pct}%</div>}
+                    {att.grade && !att.manualGrade && <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Grade: <span style={{color:"var(--accent)"}}>{att.grade}</span> • {att.pct}%</div>}
                     <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>🔒 Submitted {att.date} — contact lecturer to reset</div>
                   </div>
                 ) : (
@@ -4735,7 +4992,7 @@ function AdminSchoolPQ({ toast }) {
             <span style={{fontWeight:800,color:"var(--accent)"}}>{currentClass?.label}</span>
             <span style={{color:"var(--text3)"}}>›</span>
             <span style={{fontWeight:800,color:"var(--text)"}}>{selCourse}</span>
-            <span style={{marginLeft:"auto",fontSize:11,color:"var(--text3)"}}>{cd.mcq.length} MCQ · {cd.essay.length} Essay</span>
+            <span style={{marginLeft:"auto",fontSize:11,color:"var(--text3)"}}>{cd.mcq.length} MCQ • {cd.essay.length} Essay</span>
           </div>
 
           {/* MCQ / Essay tabs */}
@@ -5388,7 +5645,7 @@ function AdminNcCodes({ toast }) {
           {codes.length>0&&<button className="btn btn-danger btn-sm" onClick={deleteAll}>🗑️ Delete All</button>}
         </div>
         <div style={{fontSize:11,color:"var(--text3)",marginTop:8}}>
-          Format: <code style={{background:"var(--bg4)",padding:"1px 6px",borderRadius:4}}>NC-XXXX-XXXX-XXXX</code> · Share codes with students who have paid.
+          Format: <code style={{background:"var(--bg4)",padding:"1px 6px",borderRadius:4}}>NC-XXXX-XXXX-XXXX</code> • Share codes with students who have paid.
         </div>
       </div>
 
@@ -5423,7 +5680,7 @@ function AdminNcCodes({ toast }) {
                 </span>
               </div>
               {c.used&&<div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>
-                Used by {c.usedBy} · {c.usedAt?new Date(c.usedAt).toLocaleDateString():""}
+                Used by {c.usedBy} • {c.usedAt?new Date(c.usedAt).toLocaleDateString():""}
               </div>}
             </div>
             <div style={{display:"flex",gap:6}}>
@@ -5446,7 +5703,7 @@ function AdminNcCodes({ toast }) {
                   <div style={{width:36,height:36,borderRadius:"50%",background:"rgba(34,197,94,.15)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{u.avatar||"👤"}</div>
                   <div style={{flex:1,minWidth:0}}>
                     <div style={{fontWeight:700,fontSize:13}}>{u.displayName||u.username.split("@")[0]}</div>
-                    <div style={{fontSize:11,color:"var(--text3)",marginTop:1}}>{u.username} · Code: <b>{u.ncCode||"Manual"}</b></div>
+                    <div style={{fontSize:11,color:"var(--text3)",marginTop:1}}>{u.username} • Code: <b>{u.ncCode||"Manual"}</b></div>
                     {dev ? (
                       <div style={{marginTop:6,padding:"6px 10px",borderRadius:8,background:"var(--bg4)",border:"1px solid var(--border)",fontSize:11}}>
                         <div style={{display:"flex",gap:16,flexWrap:"wrap"}}>
@@ -5702,7 +5959,7 @@ function NcPaywall({ currentUser, onUnlocked, toast, preview, isMock }) {
                 onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 4px 16px rgba(11,164,219,.35)";}}
                 onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 2px 8px rgba(11,164,219,.2)";}}>
                 <div style={{width:40,height:40,borderRadius:"50%",background:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:11,color:"#0ba4db",letterSpacing:-1,flexShrink:0}}>PSK</div>
-                <div><div style={{color:"white",fontWeight:800,fontSize:14}}>Pay with Paystack</div><div style={{color:"rgba(255,255,255,.8)",fontSize:11}}>Secure card payment · Code delivered instantly</div></div>
+                <div><div style={{color:"white",fontWeight:800,fontSize:14}}>Pay with Paystack</div><div style={{color:"rgba(255,255,255,.8)",fontSize:11}}>Secure card payment • Code delivered instantly</div></div>
               </div>
             </div>
             <div style={{textAlign:"center",fontSize:12,color:"var(--text3)",lineHeight:1.9,padding:"10px 14px",background:"var(--bg4)",borderRadius:10,border:"1px solid var(--border)"}}>
@@ -6005,7 +6262,7 @@ function AdminNursingExams({ toast }) {
           <div style={{fontWeight:800,fontSize:15,color:meta.color}}>{meta.short} — {selYear} {NC_PAPER_TYPES.find(p=>p.key===selPaper)?.label}</div>
           <div style={{fontSize:11,color:"var(--text3)"}}>
             {isOsce ? `${osceData.checklists?.length||0} checklist(s)` : `${paperData.questions?.length||0} question(s)`}
-            {" · "}
+            {" • "}
             {(isOsce?osceData:paperData).published ? "🟢 Published" : "📋 Draft"}
           </div>
         </div>
@@ -6392,7 +6649,7 @@ function NursingExamsView({ toast, currentUser, initialExam, isAdmin }) {
                 {!visible&&"No content yet"}
                 {visible&&pt.key!=="osce"&&`${pd.questions.length}Q`}
                 {visible&&pt.key==="osce"&&`${pd.checklists.length} skills`}
-                {visible&&archived&&" · 🗃️"}
+                {visible&&archived&&" • 🗃️"}
               </div>
               {att&&pt.key!=="osce"&&<div style={{marginTop:4,fontSize:10,fontWeight:700,color:"var(--success)"}}>✅ {att.pct}%</div>}
             </div>
@@ -6418,7 +6675,7 @@ function NursingExamsView({ toast, currentUser, initialExam, isAdmin }) {
                 <div style={{fontWeight:800,fontSize:16,color:meta.color}}>{meta.short} — {selYear} {pt.label}</div>
                 <div style={{fontSize:11,color:"var(--text3)"}}>
                   {selPaper!=="osce"?`${pd.questions.length} questions`:`${pd.checklists.length} clinical skills`}
-                  {archived&&" · 🗃️ Archived"}
+                  {archived&&" • 🗃️ Archived"}
                 </div>
               </div>
               {archived&&<span className="tag" style={{borderColor:"var(--text3)",color:"var(--text3)"}}>🗃️ Archive</span>}
@@ -6429,7 +6686,7 @@ function NursingExamsView({ toast, currentUser, initialExam, isAdmin }) {
                 {att&&(
                   <div style={{marginBottom:14,padding:"10px 14px",background:`${att.pct>=70?"rgba(34,197,94,.07)":att.pct>=50?"rgba(251,146,60,.07)":"rgba(239,68,68,.07)"}`,borderRadius:10,border:`1px solid ${att.pct>=70?"var(--success)":att.pct>=50?"var(--warn)":"var(--danger)"}`}}>
                     <div style={{fontWeight:800,fontSize:13}}>Your Score: <span style={{color:att.pct>=70?"var(--success)":att.pct>=50?"var(--warn)":"var(--danger)"}}>{att.score}/{att.total} — {att.pct}%</span></div>
-                    <div style={{fontSize:10,color:"var(--text3)",marginTop:2}}>Taken {att.date} · 🔒 1 attempt used</div>
+                    <div style={{fontSize:10,color:"var(--text3)",marginTop:2}}>Taken {att.date} • 🔒 1 attempt used</div>
                     <div className="progress-wrap" style={{marginTop:6}}>
                       <div className="progress-fill" style={{width:`${att.pct}%`,background:att.pct>=70?"var(--success)":att.pct>=50?"var(--warn)":"var(--danger)"}} />
                     </div>
@@ -6513,7 +6770,7 @@ function NursingOsceView({ osce, meta, year, onBack, currentUser, isUnlocked }) 
         <button className="btn btn-sm" onClick={onBack}>← Back</button>
         <div style={{flex:1}}>
           <div style={{fontWeight:800,fontSize:16,color:meta.color}}>{meta.icon} {meta.short} — {year} OSCE</div>
-          <div style={{fontSize:11,color:"var(--text3)"}}>Clinical Skills Checklists · {checklists.length} skill{checklists.length!==1?"s":""}</div>
+          <div style={{fontSize:11,color:"var(--text3)"}}>Clinical Skills Checklists • {checklists.length} skill{checklists.length!==1?"s":""}</div>
         </div>
         <div style={{display:"flex",gap:6}}>
           <button className="btn btn-sm" onClick={()=>{setExpandAll(true);setExpanded({});}}>Expand All</button>
@@ -6687,7 +6944,7 @@ function NursingMCQExam({ toast, currentUser, paper, meta, onBack, isUnlocked })
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:14,flexWrap:"wrap"}}>
         <div>
           <div style={{fontWeight:800,fontSize:15,color:meta.color}}>{meta.icon} {paper.title}</div>
-          <div style={{fontSize:11,color:"var(--text3)"}}>{answeredCount}/{visibleQs.length} answered · click any number to jump</div>
+          <div style={{fontSize:11,color:"var(--text3)"}}>{answeredCount}/{visibleQs.length} answered • click any number to jump</div>
         </div>
         <div style={{display:"flex",gap:8}}>
           <button className="btn btn-sm" onClick={onBack}>✕ Exit</button>
@@ -6943,7 +7200,7 @@ function SchoolPastQuestionsView({ toast, currentUser }) {
               <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:16,flexWrap:"wrap"}}>
                 <button className="btn btn-sm" onClick={()=>setSelCourse(null)}>← {currentClass.label} Courses</button>
                 <div style={{fontWeight:800,fontSize:15,color:"var(--text)"}}>{selCourse}</div>
-                <span className="tag" style={{marginLeft:"auto"}}>{cd.mcq.length} MCQ · {cd.essay.length} Essay</span>
+                <span className="tag" style={{marginLeft:"auto"}}>{cd.mcq.length} MCQ • {cd.essay.length} Essay</span>
               </div>
 
               {/* MCQ / Essay tabs */}
@@ -6975,13 +7232,13 @@ function SchoolPastQuestionsView({ toast, currentUser }) {
                         onClick={()=>{setExamPaper({questions:cd.mcq,title:`${selCourse} — Practice Exam`,courseKey:ck(selClass,selCourse),classLabel:currentClass.label,course:selCourse});setExamMode("exam");}}>
                         <div style={{fontSize:28,marginBottom:6}}>📝</div>
                         <div style={{fontWeight:800,fontSize:13,color:"var(--accent)"}}>Take Practice Exam</div>
-                        <div style={{fontSize:11,color:"var(--text3)",marginTop:3}}>Timed · score tracked · 1 attempt</div>
+                        <div style={{fontSize:11,color:"var(--text3)",marginTop:3}}>Timed • score tracked • 1 attempt</div>
                       </div>
                       <div className="card" style={{flex:1,minWidth:160,textAlign:"center",padding:"16px 12px",cursor:"pointer",borderTop:"3px solid var(--purple)"}}
                         onClick={()=>{setExamPaper({questions:cd.mcq,title:`${selCourse} — Review Mode`,courseKey:ck(selClass,selCourse),classLabel:currentClass.label,course:selCourse});setExamMode("review");}}>
                         <div style={{fontSize:28,marginBottom:6}}>📖</div>
                         <div style={{fontWeight:800,fontSize:13,color:"var(--purple)"}}>Review Mode</div>
-                        <div style={{fontSize:11,color:"var(--text3)",marginTop:3}}>See answers · no attempt limit</div>
+                        <div style={{fontSize:11,color:"var(--text3)",marginTop:3}}>See answers • no attempt limit</div>
                       </div>
                     </div>
 
@@ -7147,7 +7404,7 @@ function SchoolMCQExam({ toast, currentUser, paper, onBack }) {
       <div className="progress-wrap" style={{marginBottom:14}}>
         <div className="progress-fill" style={{width:`${(answeredCount/paper.questions.length)*100}%`,background:"var(--accent)"}} />
       </div>
-      <div style={{fontSize:11,color:"var(--text3)",marginBottom:6}}>Question {qIdx+1} of {paper.questions.length}{q.year?` · ${q.year}`:""}</div>
+      <div style={{fontSize:11,color:"var(--text3)",marginBottom:6}}>Question {qIdx+1} of {paper.questions.length}{q.year?` • ${q.year}`:""}</div>
       <div className="card" style={{marginBottom:12}}>
         <div style={{fontWeight:700,fontSize:16,lineHeight:1.5}}>{q.q}</div>
       </div>
@@ -7241,7 +7498,7 @@ function NursingExamsStandaloneView({ toast, currentUser, initialExam }) {
     <div>
       <div style={{marginBottom:20}}>
         <div className="sec-title">🎓 Nursing Council Exams</div>
-        <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>GNC · Midwifery · Public Health Nursing past papers and live exam sessions.</div>
+        <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>GNC • Midwifery • Public Health Nursing past papers and live exam sessions.</div>
       </div>
       <NursingExamsView toast={toast} currentUser={currentUser} initialExam={initialExam} />
     </div>
@@ -7254,7 +7511,7 @@ function PastQuestionsView({ toast, currentUser }) {
   const [tab, setTab] = useState("school");
   const TABS = [
     {key:"school", icon:"🏫", label:"School Past Questions", sub:"Browse by class & course"},
-    {key:"nursing", icon:"🎓", label:"Nursing Council Exams", sub:"GNC · Midwifery · Public Health"},
+    {key:"nursing", icon:"🎓", label:"Nursing Council Exams", sub:"GNC • Midwifery • Public Health"},
   ];
   return (
     <div>
@@ -7797,11 +8054,13 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
 
 function Messages({ user, toast, onUnreadChange }) {
   const allUsers  = ls("nv-users", []);
-  const allClasses = ls("nv-classes", []);
+  const allClasses = ls("nv-classes", DEFAULT_CLASSES);
   const me = allUsers.find(u => u.username === user);
   const myClassId = me?.class || "";
+  const isLecturerUser = me?.role === "lecturer" || me?.role === "admin";
 
-  // Class-restricted: only show students in the same class
+  // Class-restricted: only show students in the same class (for students)
+  // Lecturers: can message any student, filtered by selected class
   const classmates = allUsers.filter(u =>
     u.username !== user &&
     u.role !== "admin" &&
@@ -7809,6 +8068,9 @@ function Messages({ user, toast, onUnreadChange }) {
     u.class === myClassId &&
     myClassId !== ""
   );
+
+  // For lecturers: all non-admin, non-lecturer users, grouped by class
+  const allStudents = allUsers.filter(u => u.username !== user && u.role !== "admin" && u.role !== "lecturer");
 
   // State
   const [convs,       setConvs]       = useState([]);
@@ -7821,6 +8083,23 @@ function Messages({ user, toast, onUnreadChange }) {
   const [notifPerm,   setNotifPerm]   = useState(() =>
     typeof Notification !== "undefined" ? Notification.permission : "default"
   );
+  // Tab + class selection state
+  const [broadcastTab,   setBroadcastTab]   = useState("direct"); // "direct" | "group"
+  const [broadcastClass, setBroadcastClass] = useState("");
+  const [lecturerFilter, setLecturerFilter] = useState(""); // filter students by class for direct msg
+  // Group chat state
+  const [gcRooms,        setGcRooms]        = useState([]); // room metadata list for sidebar
+  const [gcMsgs,         setGcMsgs]         = useState([]);
+  const [gcInput,        setGcInput]        = useState("");
+  const [gcSending,      setGcSending]      = useState(false);
+  const [gcRecording,    setGcRecording]    = useState(false);
+  const [gcRecSeconds,   setGcRecSeconds]   = useState(0);
+  const gcMediaRecRef    = useRef(null);
+  const gcRecTimerRef    = useRef(null);
+  const gcRecChunksRef   = useRef([]);
+  const gcFileInputRef   = useRef(null);
+  const gcBottomRef      = useRef(null);
+  const gcInputRef       = useRef(null);
   // Voice call state
   const [callModal,   setCallModal]   = useState(null); // null | { peer, role: "caller"|"callee" }
   const callUnsubRef  = useRef(null);
@@ -7890,6 +8169,25 @@ function Messages({ user, toast, onUnreadChange }) {
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
   useEffect(() => { if (activeUser) setTimeout(() => inputRef.current?.focus(), 100); }, [activeUser]);
+
+  // ── Subscribe to active group chat ───────────────────────────────
+  useEffect(() => {
+    const activeClassId = isLecturerUser ? broadcastClass : myClassId;
+    if (!activeClassId || broadcastTab !== "group") return;
+    const unsub = gcSubscribe(activeClassId, incoming => {
+      setGcMsgs(incoming);
+    });
+    return () => unsub();
+  }, [broadcastClass, broadcastTab, myClassId, isLecturerUser]);
+
+  useEffect(() => { gcBottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [gcMsgs]);
+  useEffect(() => {
+    if (!isLecturerUser || !allClasses.length) return;
+    const classIds = allClasses.map(c => c.id);
+    const unsub = gcSubscribeRooms(classIds, rooms => setGcRooms(rooms));
+    return () => unsub();
+  }, [isLecturerUser, allClasses.length]);
+  useEffect(() => { if (broadcastTab === "group" && broadcastClass) setTimeout(() => gcInputRef.current?.focus(), 100); }, [broadcastTab, broadcastClass]);
 
   // ── Listen for incoming calls ─────────────────────────────────────
   const callModalRef = useRef(callModal);
@@ -8004,7 +8302,102 @@ function Messages({ user, toast, onUnreadChange }) {
 
   const formatDur = (s) => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
 
-  // ── Helpers ────────────────────────────────────────────────────────
+  // ── Group chat: send text ──────────────────────────────────────────
+  const gcSendText = async () => {
+    const text = gcInput.trim();
+    const activeClassId = isLecturerUser ? broadcastClass : myClassId;
+    if (!activeClassId) { toast("Select a class first", "error"); return; }
+    if (!text || gcSending) return;
+    setGcSending(true);
+    setGcInput("");
+    const tempId = "tmp_" + Date.now();
+    setGcMsgs(m => [...m, { id: tempId, from: user, text, type: "text", sentAt: Date.now() }]);
+    try {
+      await gcSend(activeClassId, user, { type: "text", text });
+    } catch(e) {
+      toast("⚠️ " + (e.message || "Message failed to send"), "error");
+      setGcMsgs(m => m.filter(x => x.id !== tempId));
+      setGcInput(text);
+    } finally {
+      setGcSending(false);
+    }
+  };
+
+  // ── Group chat: send file ──────────────────────────────────────────
+  const gcSendFile = async (file) => {
+    const activeClassId = isLecturerUser ? broadcastClass : myClassId;
+    if (!file || !activeClassId) return;
+    const MAX = 2 * 1024 * 1024;
+    if (file.size > MAX) { toast("File too large — max 2 MB", "error"); return; }
+    setGcSending(true);
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const fileData = e.target.result;
+      const tempId = "tmp_" + Date.now();
+      setGcMsgs(m => [...m, { id: tempId, from: user, type: "file", fileName: file.name, fileType: file.type, fileSize: file.size, fileData, sentAt: Date.now() }]);
+      try {
+        await gcSend(activeClassId, user, { type: "file", text: "", fileName: file.name, fileType: file.type, fileSize: file.size, fileData });
+      } catch(e) {
+        toast("⚠️ " + (e.message || "File send failed"), "error");
+        setGcMsgs(m => m.filter(x => x.id !== tempId));
+      } finally {
+        setGcSending(false);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // ── Group chat: voice recording ───────────────────────────────────
+  const gcStartRecording = async () => {
+    const activeClassId = isLecturerUser ? broadcastClass : myClassId;
+    if (!activeClassId) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      gcRecChunksRef.current = [];
+      const mr = new MediaRecorder(stream, { mimeType: MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/ogg" });
+      mr.ondataavailable = e => { if (e.data.size > 0) gcRecChunksRef.current.push(e.data); };
+      mr.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        const blob = new Blob(gcRecChunksRef.current, { type: mr.mimeType });
+        if (blob.size > 2 * 1024 * 1024) { toast("Voice note too long — max ~2 minutes", "error"); return; }
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+          const dur = gcRecSeconds;
+          const tempId = "tmp_" + Date.now();
+          const activeClassId = isLecturerUser ? broadcastClass : myClassId;
+          setGcMsgs(m => [...m, { id: tempId, from: user, type: "voice", fileData: e.target.result, fileType: mr.mimeType, duration: dur, sentAt: Date.now() }]);
+          const ok = await gcSend(activeClassId, user, { type: "voice", text: "", fileData: e.target.result, fileType: mr.mimeType, duration: dur });
+          if (!ok) { toast("⚠️ Voice note send failed", "error"); setGcMsgs(m => m.filter(x => x.id !== tempId)); }
+        };
+        reader.readAsDataURL(blob);
+      };
+      mr.start();
+      gcMediaRecRef.current = mr;
+      setGcRecording(true);
+      setGcRecSeconds(0);
+      gcRecTimerRef.current = setInterval(() => setGcRecSeconds(s => s + 1), 1000);
+    } catch(e) { toast("Microphone access denied", "error"); }
+  };
+
+  const gcStopRecording = () => {
+    if (gcMediaRecRef.current && gcMediaRecRef.current.state !== "inactive") gcMediaRecRef.current.stop();
+    clearInterval(gcRecTimerRef.current);
+    setGcRecording(false);
+    setGcRecSeconds(0);
+  };
+
+  const gcCancelRecording = () => {
+    if (gcMediaRecRef.current && gcMediaRecRef.current.state !== "inactive") {
+      gcMediaRecRef.current.stream?.getTracks().forEach(t => t.stop());
+      gcMediaRecRef.current.ondataavailable = null;
+      gcMediaRecRef.current.onstop = null;
+      gcMediaRecRef.current.stop();
+    }
+    clearInterval(gcRecTimerRef.current);
+    gcRecChunksRef.current = [];
+    setGcRecording(false);
+    setGcRecSeconds(0);
+  };
   const formatTime = (ts) => {
     if (!ts) return "";
     const d = new Date(ts), now = new Date();
@@ -8018,7 +8411,19 @@ function Messages({ user, toast, onUnreadChange }) {
 
   const openConv = (username) => { setActiveUser(username); setMsgs([]); setDropOpen(false); };
 
-  const filteredPeople = classmates.filter(u => {
+  // ── Helpers ────────────────────────────────────────────────────────
+  const lecturerPeople = allStudents.filter(u => {
+    if (lecturerFilter && u.class !== lecturerFilter) return false;
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return u.username.toLowerCase().includes(q) || (u.displayName||"").toLowerCase().includes(q);
+  }).sort((a, b) => {
+    const ca = convs.find(c => c.participants?.includes(a.username));
+    const cb = convs.find(c => c.participants?.includes(b.username));
+    return (cb?.lastAt||0) - (ca?.lastAt||0);
+  });
+
+  const filteredPeople = isLecturerUser ? lecturerPeople : classmates.filter(u => {
     const q = search.trim().toLowerCase();
     if (!q) return true;
     return u.username.toLowerCase().includes(q) || (u.displayName||"").toLowerCase().includes(q);
@@ -8091,8 +8496,8 @@ function Messages({ user, toast, onUnreadChange }) {
     );
   };
 
-  // ── No class assigned guard ────────────────────────────────────────
-  if (!myClassId) {
+  // ── No class assigned guard (students only — lecturers bypass) ──────
+  if (!myClassId && !isLecturerUser) {
     return (
       <div>
         <div className="sec-title">💬 Messages</div>
@@ -8116,10 +8521,15 @@ function Messages({ user, toast, onUnreadChange }) {
         <div>
           <div className="sec-title" style={{ marginBottom:2 }}>💬 Messages</div>
           <div className="sec-sub">
-            {myClass ? `🏫 ${myClass.label} classmates only` : "Private class chat"}
+            {isLecturerUser ? "Message students across all classes" : myClass ? `🏫 ${myClass.label}` : "Private class chat"}
           </div>
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          <div style={{ display:"flex", borderRadius:20, overflow:"hidden", border:"1.5px solid var(--border)", background:"var(--bg4)" }}>
+            {[{v:"direct",l:"💬 Direct"},{v:"group",l:"🏫 Group Chat"}].map(t=>(
+              <button key={t.v} onClick={()=>setBroadcastTab(t.v)} style={{ padding:"6px 14px", border:"none", background:broadcastTab===t.v?"var(--accent)":"transparent", color:broadcastTab===t.v?"#fff":"var(--text3)", fontWeight:700, fontSize:12, cursor:"pointer", transition:"all .15s" }}>{t.l}</button>
+            ))}
+          </div>
           {notifPerm === "granted"
             ? <span style={{ fontSize:11, color:"var(--success)", fontWeight:700 }}>🔔 On</span>
             : <button className="btn btn-sm" style={{ fontSize:11, borderColor:"var(--accent)", color:"var(--accent)" }}
@@ -8130,20 +8540,239 @@ function Messages({ user, toast, onUnreadChange }) {
         </div>
       </div>
 
-      {/* ── Recipient dropdown + chat fills full width ── */}
+      {/* ── GROUP CHAT PANEL ── */}
+      {broadcastTab === "group" && (
+        <div style={{ display:"flex", flex:1, borderRadius:14, overflow:"hidden", border:"1.5px solid var(--border)", background:"var(--card)", minHeight:0 }}>
+
+          {/* ── LECTURER: sidebar + chat ── */}
+          {isLecturerUser ? (
+            <>
+              {/* Sidebar: list of class group chats */}
+              <div style={{ width:220, flexShrink:0, borderRight:"1.5px solid var(--border)", display:"flex", flexDirection:"column", background:"var(--bg4)" }}>
+                <div style={{ padding:"12px 14px 8px", fontWeight:800, fontSize:13, color:"var(--text3)", borderBottom:"1px solid var(--border)", letterSpacing:.4, textTransform:"uppercase" }}>Class Chats</div>
+                <div style={{ flex:1, overflowY:"auto" }}>
+                  {allClasses.map(c => {
+                    const room    = gcRooms.find(r => r.id === c.id);
+                    const count   = allStudents.filter(u => u.class === c.id).length;
+                    const isAct   = broadcastClass === c.id;
+                    return (
+                      <div
+                        key={c.id}
+                        onClick={() => {
+  setBroadcastClass(c.id); setGcMsgs([]); setGcSending(false); setGcInput("");
+  gcTestWrite(c.id).then(err => {
+    if (err) toast("❌ Cannot send to this group: " + err, "error");
+  });
+}}
+                        style={{ padding:"11px 14px", cursor:"pointer", borderLeft:`3px solid ${isAct?"var(--accent)":"transparent"}`, background:isAct?"rgba(0,119,182,.07)":"transparent", transition:"background .12s" }}
+                        onMouseEnter={e=>{ if(!isAct) e.currentTarget.style.background="var(--bg3)"; }}
+                        onMouseLeave={e=>{ if(!isAct) e.currentTarget.style.background="transparent"; }}
+                      >
+                        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                          <div style={{ width:34, height:34, borderRadius:10, background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:15, flexShrink:0 }}>🏫</div>
+                          <div style={{ flex:1, minWidth:0 }}>
+                            <div style={{ fontWeight:700, fontSize:12, color:isAct?"var(--accent)":"var(--text)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{c.label}</div>
+                            <div style={{ fontSize:10, color:"var(--text3)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                              {room?.lastMsg ? room.lastMsg : `${count} student${count!==1?"s":""}`}
+                            </div>
+                          </div>
+                          {room?.lastAt ? <div style={{ fontSize:9, color:"var(--text3)", flexShrink:0 }}>{(() => { const d=new Date(room.lastAt),n=new Date(); return d.toDateString()===n.toDateString()?d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):d.toLocaleDateString([],{month:"short",day:"numeric"}); })()}</div> : null}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Chat panel */}
+              <div style={{ flex:1, display:"flex", flexDirection:"column", minHeight:0 }}>
+                {!broadcastClass ? (
+                  <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"var(--text3)", padding:32, textAlign:"center" }}>
+                    <div style={{ fontSize:56, marginBottom:16 }}>🏫</div>
+                    <div style={{ fontWeight:800, fontSize:16, color:"var(--text)", marginBottom:8 }}>Select a class chat</div>
+                    <div style={{ fontSize:13, maxWidth:280, lineHeight:1.7 }}>Pick a class from the sidebar to open the group chat. All students in that class can see your messages in real time.</div>
+                  </div>
+                ) : (
+                  <>
+                    {/* Header */}
+                    <div style={{ padding:"10px 16px", borderBottom:"1.5px solid var(--border)", background:"var(--bg4)", display:"flex", alignItems:"center", gap:10 }}>
+                      <div style={{ width:32, height:32, borderRadius:9, background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🏫</div>
+                      <div>
+                        <div style={{ fontWeight:800, fontSize:14, color:"var(--text)" }}>{allClasses.find(c=>c.id===broadcastClass)?.label}</div>
+                        <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===broadcastClass).length} students • Group chat</div>
+                      </div>
+                    </div>
+
+                    {/* Messages */}
+                    <div style={{ flex:1, overflowY:"auto", padding:"16px 20px", display:"flex", flexDirection:"column", gap:10 }}>
+                      {gcMsgs.length === 0 && (
+                        <div style={{ margin:"auto", textAlign:"center", color:"var(--text3)", fontSize:13 }}>No messages yet — start the conversation! 👋</div>
+                      )}
+                      {gcMsgs.map((m, i) => {
+                        const mine = m.from === user;
+                        const showAvatar = !mine && (i === 0 || gcMsgs[i-1]?.from !== m.from);
+                        const bubbleColor = mine ? "linear-gradient(135deg,var(--accent),var(--accent2))" : "var(--bg4)";
+                        const textColor   = mine ? "#fff" : "var(--text)";
+                        const renderGcContent = () => {
+                          if (m.type === "voice") return (
+                            <div style={{ display:"flex", alignItems:"center", gap:10, padding:"8px 12px", background:mine?"rgba(255,255,255,.15)":"var(--bg3)", borderRadius:10, minWidth:180 }}>
+                              <button onClick={()=>{ const a=new Audio(m.fileData); a.play(); }} style={{ width:32,height:32,borderRadius:"50%",background:mine?"rgba(255,255,255,.25)":"var(--accent)",border:"none",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,color:"white",flexShrink:0 }}>▶</button>
+                              <div style={{ flex:1 }}><div style={{ fontSize:11,fontWeight:700,color:mine?"rgba(255,255,255,.8)":"var(--text3)" }}>Voice note</div><div style={{ fontSize:12,color:mine?"rgba(255,255,255,.9)":"var(--text3)" }}>{formatDur(m.duration||0)}</div></div>
+                              <span style={{ fontSize:18,flexShrink:0 }}>🎤</span>
+                            </div>
+                          );
+                          if (m.type === "file") {
+                            if (m.fileType?.startsWith("image/")) return <img src={m.fileData} alt={m.fileName} style={{ maxWidth:220,maxHeight:200,borderRadius:10,display:"block",cursor:"pointer" }} onClick={()=>window.open(m.fileData,"_blank")} />;
+                            return (
+                              <div style={{ display:"flex",alignItems:"center",gap:10,padding:"8px 12px",background:mine?"rgba(255,255,255,.15)":"var(--bg3)",borderRadius:10,minWidth:160 }}>
+                                <span style={{ fontSize:22,flexShrink:0 }}>📎</span>
+                                <div style={{ flex:1,minWidth:0 }}><div style={{ fontSize:13,fontWeight:700,color:mine?"#fff":"var(--text)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>{m.fileName}</div><div style={{ fontSize:11,color:mine?"rgba(255,255,255,.7)":"var(--text3)" }}>{formatFileSize(m.fileSize)}</div></div>
+                                <a href={m.fileData} download={m.fileName} style={{ color:mine?"white":"var(--accent)",fontSize:20,textDecoration:"none",flexShrink:0 }} title="Download">⬇</a>
+                              </div>
+                            );
+                          }
+                          return <div style={{ background:bubbleColor,borderRadius:mine?"18px 18px 4px 18px":"18px 18px 18px 4px",padding:"9px 14px",fontSize:14,color:textColor,boxShadow:"0 1px 4px rgba(0,0,0,.08)",wordBreak:"break-word",opacity:m.id?.startsWith("tmp_")?0.6:1 }}>{m.text}</div>;
+                        };
+                        return (
+                          <div key={m.id} style={{ display:"flex",gap:8,justifyContent:mine?"flex-end":"flex-start",alignItems:"flex-end" }}>
+                            {!mine && <div style={{ width:28,height:28,borderRadius:"50%",flexShrink:0,background:showAvatar?"linear-gradient(135deg,var(--accent),var(--accent2))":"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:"white" }}>{showAvatar?avatarChar(m.from):""}</div>}
+                            <div style={{ maxWidth:"72%",display:"flex",flexDirection:"column",alignItems:mine?"flex-end":"flex-start" }}>
+                              {showAvatar&&!mine&&<div style={{ fontSize:11,fontWeight:700,color:"var(--text3)",marginBottom:3,paddingLeft:4 }}>{displayName(m.from)}</div>}
+                              {renderGcContent()}
+                              <div style={{ fontSize:10,color:"var(--text3)",marginTop:3,paddingLeft:4,paddingRight:4 }}>{formatTime(m.sentAt)}{m.id?.startsWith("tmp_")&&<span style={{ marginLeft:4 }}>⏳</span>}</div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                      <div ref={gcBottomRef} />
+                    </div>
+
+                    {/* Input toolbar */}
+                    {gcRecording ? (
+                      <div style={{ padding:"10px 14px",borderTop:"1.5px solid var(--border)",display:"flex",alignItems:"center",gap:10,background:"var(--bg4)" }}>
+                        <div style={{ flex:1,display:"flex",alignItems:"center",gap:10,padding:"10px 16px",borderRadius:20,background:"rgba(239,68,68,.08)",border:"1.5px solid rgba(239,68,68,.3)" }}>
+                          <span style={{ width:10,height:10,borderRadius:"50%",background:"var(--danger)",animation:"pulse 1s infinite",flexShrink:0 }} />
+                          <span style={{ fontWeight:700,fontSize:13,color:"var(--danger)" }}>Recording…</span>
+                          <span style={{ fontFamily:"'DM Mono',monospace",fontSize:13,color:"var(--danger)",marginLeft:"auto" }}>{formatDur(gcRecSeconds)}</span>
+                        </div>
+                        <button className="btn btn-sm" style={{ flexShrink:0 }} onClick={gcCancelRecording} title="Cancel">✕</button>
+                        <button onClick={gcStopRecording} style={{ width:42,height:42,borderRadius:"50%",background:"var(--danger)",border:"none",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0,boxShadow:"0 2px 8px rgba(239,68,68,.4)" }} title="Stop & Send">⏹</button>
+                      </div>
+                    ) : (
+                      <div style={{ padding:"10px 14px",borderTop:"1.5px solid var(--border)",display:"flex",alignItems:"center",gap:8,background:"var(--card)" }}>
+                        <input ref={gcFileInputRef} type="file" style={{ display:"none" }} accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.zip" onChange={e=>{ if(e.target.files[0]){gcSendFile(e.target.files[0]);e.target.value="";} }} />
+                        <button className="btn btn-sm" style={{ width:38,height:38,borderRadius:"50%",padding:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0 }} onClick={()=>gcFileInputRef.current?.click()} title="Attach file" disabled={gcSending}>📎</button>
+                        <button className="btn btn-sm" style={{ width:38,height:38,borderRadius:"50%",padding:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0 }} onClick={gcStartRecording} title="Record voice note" disabled={gcSending}>🎤</button>
+                        <input ref={gcInputRef} className="inp" style={{ flex:1,marginBottom:0,borderRadius:20,padding:"10px 16px" }} placeholder={`Message ${allClasses.find(c=>c.id===broadcastClass)?.label||"group"}…`} value={gcInput} onChange={e=>setGcInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&!e.shiftKey&&gcSendText()} disabled={gcSending} />
+                        <button className="btn btn-accent" style={{ width:42,height:42,borderRadius:"50%",padding:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:19,flexShrink:0,opacity:(!gcInput.trim()||gcSending)?0.45:1,transition:"opacity .15s" }} onClick={gcSendText} disabled={!gcInput.trim()||gcSending} title="Send">➤</button>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </>
+          ) : (
+            /* ── STUDENT: auto-joined to their own class group chat ── */
+            <div style={{ display:"flex", flexDirection:"column", flex:1, minHeight:0 }}>
+              {/* Header */}
+              {(() => { if (!broadcastClass && myClassId) setTimeout(()=>setBroadcastClass(myClassId),0); return null; })()}
+              <div style={{ padding:"10px 16px", borderBottom:"1.5px solid var(--border)", background:"var(--bg4)", display:"flex", alignItems:"center", gap:10 }}>
+                <div style={{ width:32, height:32, borderRadius:9, background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🏫</div>
+                <div>
+                  <div style={{ fontWeight:800, fontSize:14, color:"var(--text)" }}>{allClasses.find(c=>c.id===myClassId)?.label || "Class Group Chat"}</div>
+                  <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===myClassId).length + 1} members • Group chat</div>
+                </div>
+              </div>
+              {/* Messages */}
+              <div style={{ flex:1, overflowY:"auto", padding:"16px 20px", display:"flex", flexDirection:"column", gap:10 }}>
+                {gcMsgs.length === 0 && <div style={{ margin:"auto", textAlign:"center", color:"var(--text3)", fontSize:13 }}>No messages yet — start the conversation! 👋</div>}
+                {gcMsgs.map((m, i) => {
+                  const mine = m.from === user;
+                  const showAvatar = !mine && (i === 0 || gcMsgs[i-1]?.from !== m.from);
+                  const bubbleColor = mine ? "linear-gradient(135deg,var(--accent),var(--accent2))" : "var(--bg4)";
+                  const textColor   = mine ? "#fff" : "var(--text)";
+                  const renderGcContent = () => {
+                    if (m.type === "voice") return (
+                      <div style={{ display:"flex",alignItems:"center",gap:10,padding:"8px 12px",background:mine?"rgba(255,255,255,.15)":"var(--bg3)",borderRadius:10,minWidth:180 }}>
+                        <button onClick={()=>{ const a=new Audio(m.fileData); a.play(); }} style={{ width:32,height:32,borderRadius:"50%",background:mine?"rgba(255,255,255,.25)":"var(--accent)",border:"none",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,color:"white",flexShrink:0 }}>▶</button>
+                        <div style={{ flex:1 }}><div style={{ fontSize:11,fontWeight:700,color:mine?"rgba(255,255,255,.8)":"var(--text3)" }}>Voice note</div><div style={{ fontSize:12,color:mine?"rgba(255,255,255,.9)":"var(--text3)" }}>{formatDur(m.duration||0)}</div></div>
+                        <span style={{ fontSize:18,flexShrink:0 }}>🎤</span>
+                      </div>
+                    );
+                    if (m.type === "file") {
+                      if (m.fileType?.startsWith("image/")) return <img src={m.fileData} alt={m.fileName} style={{ maxWidth:220,maxHeight:200,borderRadius:10,display:"block",cursor:"pointer" }} onClick={()=>window.open(m.fileData,"_blank")} />;
+                      return (
+                        <div style={{ display:"flex",alignItems:"center",gap:10,padding:"8px 12px",background:mine?"rgba(255,255,255,.15)":"var(--bg3)",borderRadius:10,minWidth:160 }}>
+                          <span style={{ fontSize:22,flexShrink:0 }}>📎</span>
+                          <div style={{ flex:1,minWidth:0 }}><div style={{ fontSize:13,fontWeight:700,color:mine?"#fff":"var(--text)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>{m.fileName}</div><div style={{ fontSize:11,color:mine?"rgba(255,255,255,.7)":"var(--text3)" }}>{formatFileSize(m.fileSize)}</div></div>
+                          <a href={m.fileData} download={m.fileName} style={{ color:mine?"white":"var(--accent)",fontSize:20,textDecoration:"none",flexShrink:0 }} title="Download">⬇</a>
+                        </div>
+                      );
+                    }
+                    return <div style={{ background:bubbleColor,borderRadius:mine?"18px 18px 4px 18px":"18px 18px 18px 4px",padding:"9px 14px",fontSize:14,color:textColor,boxShadow:"0 1px 4px rgba(0,0,0,.08)",wordBreak:"break-word",opacity:m.id?.startsWith("tmp_")?0.6:1 }}>{m.text}</div>;
+                  };
+                  return (
+                    <div key={m.id} style={{ display:"flex",gap:8,justifyContent:mine?"flex-end":"flex-start",alignItems:"flex-end" }}>
+                      {!mine && <div style={{ width:28,height:28,borderRadius:"50%",flexShrink:0,background:showAvatar?"linear-gradient(135deg,var(--accent),var(--accent2))":"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:"white" }}>{showAvatar?avatarChar(m.from):""}</div>}
+                      <div style={{ maxWidth:"72%",display:"flex",flexDirection:"column",alignItems:mine?"flex-end":"flex-start" }}>
+                        {showAvatar&&!mine&&<div style={{ fontSize:11,fontWeight:700,color:"var(--text3)",marginBottom:3,paddingLeft:4 }}>{displayName(m.from)}</div>}
+                        {renderGcContent()}
+                        <div style={{ fontSize:10,color:"var(--text3)",marginTop:3,paddingLeft:4,paddingRight:4 }}>{formatTime(m.sentAt)}{m.id?.startsWith("tmp_")&&<span style={{ marginLeft:4 }}>⏳</span>}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+                <div ref={gcBottomRef} />
+              </div>
+              {/* Input toolbar */}
+              {gcRecording ? (
+                <div style={{ padding:"10px 14px",borderTop:"1.5px solid var(--border)",display:"flex",alignItems:"center",gap:10,background:"var(--bg4)" }}>
+                  <div style={{ flex:1,display:"flex",alignItems:"center",gap:10,padding:"10px 16px",borderRadius:20,background:"rgba(239,68,68,.08)",border:"1.5px solid rgba(239,68,68,.3)" }}>
+                    <span style={{ width:10,height:10,borderRadius:"50%",background:"var(--danger)",animation:"pulse 1s infinite",flexShrink:0 }} />
+                    <span style={{ fontWeight:700,fontSize:13,color:"var(--danger)" }}>Recording…</span>
+                    <span style={{ fontFamily:"'DM Mono',monospace",fontSize:13,color:"var(--danger)",marginLeft:"auto" }}>{formatDur(gcRecSeconds)}</span>
+                  </div>
+                  <button className="btn btn-sm" style={{ flexShrink:0 }} onClick={gcCancelRecording} title="Cancel">✕</button>
+                  <button onClick={gcStopRecording} style={{ width:42,height:42,borderRadius:"50%",background:"var(--danger)",border:"none",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0,boxShadow:"0 2px 8px rgba(239,68,68,.4)" }} title="Stop & Send">⏹</button>
+                </div>
+              ) : (
+                <div style={{ padding:"10px 14px",borderTop:"1.5px solid var(--border)",display:"flex",alignItems:"center",gap:8,background:"var(--card)" }}>
+                  <input ref={gcFileInputRef} type="file" style={{ display:"none" }} accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.zip" onChange={e=>{ if(e.target.files[0]){gcSendFile(e.target.files[0]);e.target.value="";} }} />
+                  <button className="btn btn-sm" style={{ width:38,height:38,borderRadius:"50%",padding:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0 }} onClick={()=>gcFileInputRef.current?.click()} title="Attach file" disabled={gcSending}>📎</button>
+                  <button className="btn btn-sm" style={{ width:38,height:38,borderRadius:"50%",padding:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0 }} onClick={gcStartRecording} title="Record voice note" disabled={gcSending}>🎤</button>
+                  <input ref={gcInputRef} className="inp" style={{ flex:1,marginBottom:0,borderRadius:20,padding:"10px 16px" }} placeholder={`Message ${allClasses.find(c=>c.id===myClassId)?.label||"group"}…`} value={gcInput} onChange={e=>setGcInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&!e.shiftKey&&gcSendText()} disabled={gcSending} />
+                  <button className="btn btn-accent" style={{ width:42,height:42,borderRadius:"50%",padding:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:19,flexShrink:0,opacity:(!gcInput.trim()||gcSending)?0.45:1,transition:"opacity .15s" }} onClick={gcSendText} disabled={!gcInput.trim()||gcSending} title="Send">➤</button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+
+      {/* ── DIRECT MESSAGES PANEL ── */}
+      {broadcastTab === "direct" && (
       <div style={{ display:"flex", flexDirection:"column", flex:1, borderRadius:14, overflow:"hidden", border:"1.5px solid var(--border)", background:"var(--card)", minHeight:0 }}>
 
         {/* Recipient selector bar */}
         <div style={{ padding:"10px 14px", borderBottom:"1.5px solid var(--border)", background:"var(--bg4)", display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
           <span style={{ fontSize:13, fontWeight:700, color:"var(--text3)", flexShrink:0 }}>To:</span>
 
+          {/* Lecturer class filter */}
+          {isLecturerUser && (
+            <select
+              style={{ padding:"7px 12px", borderRadius:20, border:"1.5px solid var(--border)", background:"var(--card)", color:"var(--text)", fontSize:12, fontWeight:700, cursor:"pointer", outline:"none", maxWidth:160 }}
+              value={lecturerFilter} onChange={e=>{ setLecturerFilter(e.target.value); setSearch(""); }}
+            >
+              <option value="">All classes</option>
+              {allClasses.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
+            </select>
+          )}
+
           {/* Dropdown trigger */}
           <div ref={dropRef} style={{ position:"relative", flex:1, minWidth:160, maxWidth:320 }}>
             <div
               onClick={() => setDropOpen(o => !o)}
-              style={{ display:"flex", alignItems:"center", gap:8, padding:"8px 12px", borderRadius:20, border:"1.5px solid var(--border)", background:"var(--card)", cursor:"pointer", userSelect:"none", transition:"border-color .15s" }}
-              onMouseEnter={e=>e.currentTarget.style.borderColor="var(--accent)"}
-              onMouseLeave={e=>e.currentTarget.style.borderColor=activeUser?"var(--accent)":"var(--border)"}
               style={{ display:"flex", alignItems:"center", gap:8, padding:"8px 12px", borderRadius:20, border:`1.5px solid ${activeUser?"var(--accent)":"var(--border)"}`, background:"var(--card)", cursor:"pointer" }}
             >
               {activeUser ? (
@@ -8153,7 +8782,7 @@ function Messages({ user, toast, onUnreadChange }) {
                   {hasUnread(activeUser) && <span style={{ width:8, height:8, borderRadius:"50%", background:"var(--danger)", flexShrink:0 }} />}
                 </>
               ) : (
-                <span style={{ color:"var(--text3)", fontSize:13, flex:1 }}>Select a classmate…</span>
+                <span style={{ color:"var(--text3)", fontSize:13, flex:1 }}>{isLecturerUser ? "Select a student…" : "Select a classmate…"}</span>
               )}
               <span style={{ color:"var(--text3)", fontSize:12, flexShrink:0, transition:"transform .2s", transform: dropOpen?"rotate(180deg)":"none" }}>▾</span>
             </div>
@@ -8175,7 +8804,7 @@ function Messages({ user, toast, onUnreadChange }) {
                 <div style={{ maxHeight:280, overflowY:"auto" }}>
                   {filteredPeople.length === 0 && (
                     <div style={{ padding:"20px 16px", textAlign:"center", color:"var(--text3)", fontSize:13 }}>
-                      {search ? "No match found" : classmates.length === 0 ? "No classmates in your class yet" : "No results"}
+                    {search ? "No match found" : !isLecturerUser && classmates.length === 0 ? "No classmates in your class yet" : "No results"}
                     </div>
                   )}
                   {filteredPeople.map(u => {
@@ -8332,6 +8961,7 @@ function Messages({ user, toast, onUnreadChange }) {
           </div>
         )}
       </div>
+      )} {/* end broadcastTab === "direct" */}
     </div>
     {/* ── Voice Call Modal ── */}
     {callModal && (
@@ -8403,7 +9033,7 @@ function Notifications({ currentUser, onRead }) {
                 <div style={{flex:1}}>
                   <div style={{fontWeight:700,fontSize:14,marginBottom:3}}>{n.title}</div>
                   <div style={{fontSize:13,color:"var(--text2)",marginBottom:6}}>{n.body}</div>
-                  <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{n.date} · {n.time}</div>
+                  <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{n.date} • {n.time}</div>
                 </div>
                 <button className="btn btn-sm" style={{flexShrink:0}} onClick={()=>del(n.id)}>✕</button>
               </div>
@@ -8533,7 +9163,7 @@ function CbtExamManager({ toast, currentUser }) {
     else {
       const withAns  = items.filter(i => i._hasAns).length;
       const noAns    = items.length - withAns;
-      setParseMsg(`✅ ${items.length} question${items.length>1?"s":""} detected${noAns>0?` · ⚠️ ${noAns} missing answer`:""}. Review below then import.`);
+      setParseMsg(`✅ ${items.length} question${items.length>1?"s":""} detected${noAns>0?` • ⚠️ ${noAns} missing answer`:""}. Review below then import.`);
     }
   }, [pasteQ, pasteA]);
 
@@ -8669,7 +9299,7 @@ function CbtExamManager({ toast, currentUser }) {
     @media print{.no-print{display:none}}</style></head>
     <body>
     <h1>📋 ${exam.title}</h1>
-    <p>Class: ${cls?.label||exam.classId} &nbsp;·&nbsp; Subject: ${exam.subject||"—"} &nbsp;·&nbsp; Questions: ${exam.questions.length} &nbsp;·&nbsp; Duration: ${exam.duration} min &nbsp;·&nbsp; Generated: ${new Date().toLocaleString()}</p>
+    <p>Class: ${cls?.label||exam.classId} &nbsp;•&nbsp; Subject: ${exam.subject||"—"} &nbsp;•&nbsp; Questions: ${exam.questions.length} &nbsp;•&nbsp; Duration: ${exam.duration} min &nbsp;•&nbsp; Generated: ${new Date().toLocaleString()}</p>
     <button class="no-print" onclick="window.print()" style="margin-bottom:16px;padding:8px 20px;background:#0077b6;color:white;border:none;border-radius:6px;cursor:pointer;font-size:14px">🖨️ Print</button>
     <table><thead><tr><th>#</th><th>Student</th><th>Score</th><th>%</th><th>Grade</th><th>Submitted</th></tr></thead>
     <tbody>${rows}</tbody></table>
@@ -8782,7 +9412,7 @@ function CbtExamManager({ toast, currentUser }) {
               <div>
                 <div style={{fontSize:11,fontWeight:800,color:"var(--accent)",marginBottom:5}}>
                   📝 Paste Questions
-                  <span style={{fontWeight:400,color:"var(--text3)",marginLeft:8}}>Supports: Q:/1./numbered · A:/B: or A)/B) or 1)/2) options · ANS: inline</span>
+                  <span style={{fontWeight:400,color:"var(--text3)",marginLeft:8}}>Supports: Q:/1./numbered • A:/B: or A)/B) or 1)/2) options • ANS: inline</span>
                 </div>
                 <textarea
                   className="paste-box"
@@ -8938,7 +9568,7 @@ function CbtExamManager({ toast, currentUser }) {
         <button className="btn" onClick={()=>{setView("list");setForm({...blank});setEditQIdx(null);setSingleQ({q:"",options:["","","",""],ans:0});}}>✕ Cancel</button>
       </div>
       <div style={{fontSize:11,color:"var(--text3)",textAlign:"center",paddingBottom:8}}>
-        Drafts are saved but invisible to students · Published exams auto-archive after 24 hours
+        Drafts are saved but invisible to students • Published exams auto-archive after 24 hours
       </div>
     </div>
   );
@@ -8961,7 +9591,7 @@ function CbtExamManager({ toast, currentUser }) {
           <div style={{flex:1}}>
             <div style={{fontWeight:800,fontSize:16}}>{selExam.title}</div>
             <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>
-              {classes.find(c=>c.id===selExam.classId)?.label} · {selExam.questions.length}Q · {selExam.duration}min
+              {classes.find(c=>c.id===selExam.classId)?.label} • {selExam.questions.length}Q • {selExam.duration}min
               {selExam.publishedAt&&<span style={{marginLeft:8}}>Published: {new Date(selExam.publishedAt).toLocaleString()}</span>}
             </div>
           </div>
@@ -8973,7 +9603,7 @@ function CbtExamManager({ toast, currentUser }) {
         {/* Summary stats */}
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))",gap:10,marginBottom:16}}>
           {[
-            {icon:"👨‍🎓",label:"Enrolled",    val:studentsInClass.length,    color:"var(--accent)"},
+            {icon:"👨🎓",label:"Enrolled",    val:studentsInClass.length,    color:"var(--accent)"},
             {icon:"✅",label:"Submitted",    val:examResults.length,         color:"var(--success)"},
             {icon:"⏳",label:"Pending",      val:notYetTaken.length,         color:"var(--warn)"},
             {icon:"📊",label:"Avg Score",    val:avgPct!==null?avgPct+"%":"—", color:"var(--purple)"},
@@ -9099,7 +9729,7 @@ function CbtExamManager({ toast, currentUser }) {
                       <div>
                         <div style={{fontWeight:700,fontSize:13,marginBottom:3}}>{student}</div>
                         {devInfo&&<div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>
-                          🌐 {devInfo.ip||"unknown IP"} · {devInfo.ua?.slice(0,60)||"unknown UA"}
+                          🌐 {devInfo.ip||"unknown IP"} • {devInfo.ua?.slice(0,60)||"unknown UA"}
                         </div>}
                       </div>
                       <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
@@ -9120,7 +9750,7 @@ function CbtExamManager({ toast, currentUser }) {
                             <img src={v.snapshot} alt="snapshot"
                               style={{width:90,height:68,objectFit:"cover",borderRadius:6,border:"2px solid rgba(168,85,247,.3)",cursor:"pointer"}}
                               onClick={()=>window.open(v.snapshot,"_blank")}
-                              title={`${v.type} · ${new Date(v.ts).toLocaleTimeString()}`}
+                              title={`${v.type} • ${new Date(v.ts).toLocaleTimeString()}`}
                             />
                             <div style={{position:"absolute",bottom:2,left:2,right:2,fontSize:9,
                               background:"rgba(0,0,0,.65)",color:"white",borderRadius:3,padding:"1px 3px",textAlign:"center"}}>
@@ -9868,7 +10498,7 @@ function CbtStudentView({ toast, currentUser }) {
           <button className="btn btn-sm" onClick={()=>{setMode("list");setActiveExam(null);}}>← Back</button>
           <div style={{flex:1}}>
             <div style={{fontWeight:800,fontSize:15,color:"var(--warn)"}}>🗄️ {activeExam.title}</div>
-            <div style={{fontSize:11,color:"var(--text3)"}}>Archived · Read-Only Review Mode</div>
+            <div style={{fontSize:11,color:"var(--text3)"}}>Archived • Read-Only Review Mode</div>
           </div>
           <button className="btn btn-sm" onClick={()=>setShowAns(activeExam.questions.reduce((o,_,i)=>({...o,[i]:true}),{}))}>Show All ✓</button>
           <button className="btn btn-sm" onClick={()=>setShowAns({})}>Hide All</button>
@@ -9876,7 +10506,7 @@ function CbtStudentView({ toast, currentUser }) {
         {myR&&(
           <div className="card" style={{marginBottom:14,textAlign:"center",borderTop:`3px solid ${myR.percent>=70?"var(--success)":myR.percent>=50?"var(--warn)":"var(--danger)"}`}}>
             <div style={{fontSize:12,color:"var(--text3)",marginBottom:4}}>Your score on this exam</div>
-            <div style={{fontWeight:800,fontSize:20,color:"var(--accent)"}}>{myR.score}/{myR.total} · {myR.percent}% · Grade {myR.percent>=70?"A":myR.percent>=60?"B":myR.percent>=50?"C":myR.percent>=40?"D":"F"}</div>
+            <div style={{fontWeight:800,fontSize:20,color:"var(--accent)"}}>{myR.score}/{myR.total} • {myR.percent}% • Grade {myR.percent>=70?"A":myR.percent>=60?"B":myR.percent>=50?"C":myR.percent>=40?"D":"F"}</div>
           </div>
         )}
         {activeExam.questions.map((q,i)=>(
@@ -10370,7 +11000,7 @@ function PoolList({ pool, editIdx, setForm, setEditIdx, setMode, deleteOne }) {
         {pages>1&&(
           <div style={{display:"flex",gap:6,alignItems:"center"}}>
             <button className="btn btn-sm" disabled={page===0} onClick={()=>setPage(p=>p-1)}>← Prev</button>
-            <span style={{fontSize:11,color:"var(--text3)"}}>Page {page+1}/{pages} · Q{page*PER_PAGE+1}–{Math.min((page+1)*PER_PAGE,pool.length)}</span>
+            <span style={{fontSize:11,color:"var(--text3)"}}>Page {page+1}/{pages} • Q{page*PER_PAGE+1}–{Math.min((page+1)*PER_PAGE,pool.length)}</span>
             <button className="btn btn-sm" disabled={page>=pages-1} onClick={()=>setPage(p=>p+1)}>Next →</button>
           </div>
         )}
@@ -10451,7 +11081,7 @@ function AdminNcArchiveManager({ toast }) {
         <div>
           <div style={{fontWeight:800,fontSize:15,color:"var(--accent)"}}>🗄️ NC Exam Archive</div>
           <div style={{fontSize:12,color:"var(--text3)",marginTop:2}}>
-            {archive.length} item{archive.length!==1?"s":""} saved · Students can retake or review anytime
+            {archive.length} item{archive.length!==1?"s":""} saved • Students can retake or review anytime
           </div>
         </div>
         {archive.length>0&&<button className="btn btn-sm btn-danger" onClick={deleteAll}>🗑️ Delete All</button>}
@@ -10476,7 +11106,7 @@ function AdminNcArchiveManager({ toast }) {
                 <div style={{fontWeight:700,fontSize:13}}>{e.title}</div>
                 <div style={{fontSize:11,color:"var(--text3)"}}>
                   {e.type==="osce"?`${e.checklists?.length||0} skills`:e.type==="dailymock"?`${e.questions?.length||0} questions`:`${e.questions?.length||0} questions`}
-                  {" · "}Saved {new Date(e.savedAt).toLocaleDateString()}
+                  {" • "}Saved {new Date(e.savedAt).toLocaleDateString()}
                 </div>
               </div>
               <button className="btn btn-sm btn-danger" onClick={()=>deleteEntry(e.id)}>🗑️</button>
@@ -10538,7 +11168,7 @@ function NcArchiveView({ toast, currentUser }) {
     <div>
       <div style={{fontWeight:800,fontSize:15,marginBottom:4,color:"var(--accent)"}}>🗄️ Exam Archive</div>
       <div style={{fontSize:12,color:"var(--text3)",marginBottom:20}}>
-        {archive.length} item{archive.length!==1?"s":" "} · Retake anytime · No attempt limit
+        {archive.length} item{archive.length!==1?"s":" "} • Retake anytime • No attempt limit
       </div>
 
       {mcqEntries.length>0&&(
@@ -10553,8 +11183,8 @@ function NcArchiveView({ toast, currentUser }) {
                     <div style={{flex:1}}>
                       <div style={{fontWeight:800,fontSize:14,marginBottom:3}}>{e.title}</div>
                       <div style={{fontSize:11,color:"var(--text3)"}}>
-                        {e.type==="dailymock"?"📅 Daily Mock":"📄 Past Paper"} · {e.questions?.length||0} questions
-                        {" · "}🗄️ {new Date(e.savedAt).toLocaleDateString()}
+                        {e.type==="dailymock"?"📅 Daily Mock":"📄 Past Paper"} • {e.questions?.length||0} questions
+                        {" • "}🗄️ {new Date(e.savedAt).toLocaleDateString()}
                       </div>
                     </div>
                     <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
@@ -10583,7 +11213,7 @@ function NcArchiveView({ toast, currentUser }) {
                   <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
                     <div style={{flex:1}}>
                       <div style={{fontWeight:800,fontSize:14,marginBottom:3}}>{e.title}</div>
-                      <div style={{fontSize:11,color:"var(--text3)"}}>🩺 {e.checklists?.length||0} clinical skills · 🗄️ {new Date(e.savedAt).toLocaleDateString()}</div>
+                      <div style={{fontSize:11,color:"var(--text3)"}}>🩺 {e.checklists?.length||0} clinical skills • 🗄️ {new Date(e.savedAt).toLocaleDateString()}</div>
                     </div>
                     <button className="btn btn-sm btn-accent"
                       style={{background:`linear-gradient(135deg,${meta.color},${meta.color}bb)`,border:"none"}}
@@ -10690,7 +11320,7 @@ function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
       <div className="nc-card" style={{textAlign:"center",padding:"32px 28px"}}>
         <div style={{fontSize:52,marginBottom:10}}>📅</div>
         <div style={{fontWeight:800,fontSize:22,color:"#2d4a1e",marginBottom:4}}>{mockTitle || "Daily Mock Exam"}</div>
-        <div style={{fontSize:13,color:"#6b8a52",marginBottom:20}}>{today} · {questions.length} Questions · Mixed Specialties</div>
+        <div style={{fontSize:13,color:"#6b8a52",marginBottom:20}}>{today} • {questions.length} Questions • Mixed Specialties</div>
         {!isUnlockedFull && (
           <div style={{padding:"8px 14px",borderRadius:9,marginBottom:16,background:"rgba(251,146,60,.1)",border:"1px solid rgba(251,146,60,.3)",fontSize:12,color:"#c05621",fontWeight:700,textAlign:"center"}}>
             ⚠️ Free preview: first {NC_MOCK_FREE_LIMIT} questions — enter a production code to unlock all {questions.length}
@@ -10801,7 +11431,7 @@ function NcDailyMockExam({ toast, currentUser, onBack, isAdmin }) {
       <div className="nc-progress-wrap" style={{marginBottom:14}}>
         <div className="nc-progress-fill" style={{width:`${(answeredCount/questions.length)*100}%`}} />
       </div>
-      <div style={{fontSize:10,color:"#6b8a52",marginBottom:4}}>Question {qIdx+1} of {questions.length} · <span style={{background:"rgba(74,122,46,.1)",borderRadius:4,padding:"1px 5px",color:"#2d4a1e",fontWeight:700}}>{q.cat}</span></div>
+      <div style={{fontSize:10,color:"#6b8a52",marginBottom:4}}>Question {qIdx+1} of {questions.length} • <span style={{background:"rgba(74,122,46,.1)",borderRadius:4,padding:"1px 5px",color:"#2d4a1e",fontWeight:700}}>{q.cat}</span></div>
       <div className="nc-card" style={{marginBottom:12}}>
         <div style={{fontWeight:700,fontSize:16,lineHeight:1.6,color:"#1a2e0a"}}>{q.q}</div>
       </div>
@@ -10830,7 +11460,7 @@ function NcSpecialtyExams({ toast, currentUser, isAdmin }) {
   return (
     <div>
       <div className="nc-sec-title">🎓 Specialty Exam Papers</div>
-      <div className="nc-sec-sub">Select specialty · choose year · pick Paper 1, Paper 2 or OSCE</div>
+      <div className="nc-sec-sub">Select specialty • choose year • pick Paper 1, Paper 2 or OSCE</div>
       <NursingExamsView toast={toast} currentUser={currentUser} isAdmin={isAdmin} />
     </div>
   );
@@ -10879,7 +11509,7 @@ function NcDashboard({ currentUser, onNavigate }) {
           <div style={{width:52,height:52,borderRadius:12,background:"linear-gradient(135deg,#4a7a2e,#7bc950)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:26}}>📅</div>
           <div style={{flex:1}}>
             <div style={{fontWeight:800,fontSize:16,color:"#2d4a1e",marginBottom:2}}>{mockTitle || "Daily Mock Exam"}</div>
-            <div style={{fontSize:12,color:"#6b8a52"}}>{mockQCount>0?`${mockQCount} questions`:"No questions yet"} · Updates daily · {mockDone?"Completed ✅":"Not taken yet"}</div>
+            <div style={{fontSize:12,color:"#6b8a52"}}>{mockQCount>0?`${mockQCount} questions`:"No questions yet"} • Updates daily • {mockDone?"Completed ✅":"Not taken yet"}</div>
           </div>
           {!mockDone&&mockQCount>0&&<button className="nc-btn nc-btn-primary" style={{fontSize:13}} onClick={()=>onNavigate("daily")}>Start Now →</button>}
           {mockDone&&<span style={{fontSize:12,fontWeight:700,color:"#4a7a2e"}}>✅ Done for today!</span>}
@@ -11396,6 +12026,1424 @@ function AdminPushNotifications({ toast }) {
   );
 }
 
+
+// ════════════════════════════════════════════════════════════════════
+// STUDY GROUPS
+// ════════════════════════════════════════════════════════════════════
+function StudyGroups({ currentUser, toast }) {
+  const [classes]   = useSharedData("nv-classes", DEFAULT_CLASSES);
+  const allUsers    = ls("nv-users", []);
+  const me          = allUsers.find(u => u.username === currentUser);
+  const myClassId   = me?.class || "";
+  const myClass     = classes.find(c => c.id === myClassId);
+
+  const [groups, setGroups] = useState([]);
+  const [activeGroup, setActiveGroup] = useState(null);
+  const [msgs, setMsgs] = useState([]);
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newDesc, setNewDesc] = useState("");
+  const bottomRef = useRef(null);
+
+  useEffect(() => {
+    if (!myClassId) return;
+    const unsub = sgSubscribeGroups(myClassId, setGroups);
+    return () => unsub();
+  }, [myClassId]);
+
+  useEffect(() => {
+    if (!activeGroup) return;
+    const unsub = sgSubscribe(activeGroup.id, setMsgs);
+    return () => unsub();
+  }, [activeGroup?.id]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior:"smooth" });
+  }, [msgs]);
+
+  const createGroup = async () => {
+    if (!newName.trim()) return toast("Group name required","error");
+    const id = "sg_" + Date.now();
+    const group = { id, name:newName.trim(), desc:newDesc.trim(), classId:myClassId, createdBy:currentUser, createdAt:Date.now(), members:[currentUser], lastAt:Date.now(), lastMsg:"Group created" };
+    const ok = await sgCreateGroup(group);
+    if (ok) { toast("Group created ✅","success"); setNewName(""); setNewDesc(""); setShowCreate(false); }
+    else toast("Failed to create group","error");
+  };
+
+  const send = async () => {
+    if (!text.trim() || !activeGroup || sending) return;
+    setSending(true);
+    await sgSend(activeGroup.id, currentUser, text.trim());
+    setText(""); setSending(false);
+  };
+
+  const displayName = (email) => { const u = allUsers.find(x=>x.username===email); return u?.displayName||email.split("@")[0]; };
+  const avatarChar  = (email) => (displayName(email)[0]||"?").toUpperCase();
+
+  if (activeGroup) return (
+    <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 120px)",maxWidth:700,margin:"0 auto"}}>
+      <div style={{display:"flex",alignItems:"center",gap:12,padding:"12px 0",borderBottom:"1px solid var(--border)",marginBottom:12}}>
+        <button onClick={()=>setActiveGroup(null)} style={{background:"none",border:"none",cursor:"pointer",fontSize:20,color:"var(--text3)"}}>←</button>
+        <div style={{width:40,height:40,borderRadius:50,background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>👥</div>
+        <div><div style={{fontWeight:800,fontSize:16}}>{activeGroup.name}</div><div style={{fontSize:11,color:"var(--text3)"}}>{activeGroup.desc||myClass?.label||"Study group"}</div></div>
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"0 4px",display:"flex",flexDirection:"column",gap:8}}>
+        {msgs.map(m => {
+          const mine = m.from === currentUser;
+          return (
+            <div key={m.id} style={{display:"flex",alignItems:"flex-end",gap:8,flexDirection:mine?"row-reverse":"row"}}>
+              {!mine && <div style={{width:28,height:28,borderRadius:"50%",background:"var(--accent)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:800,color:"#fff",flexShrink:0}}>{avatarChar(m.from)}</div>}
+              <div>
+                {!mine && <div style={{fontSize:10,color:"var(--text3)",marginBottom:3,marginLeft:2}}>{displayName(m.from)}</div>}
+                <div className={`sg-bubble ${mine?"mine":"theirs"}`}>{m.text}</div>
+                <div style={{fontSize:10,color:"var(--text3)",marginTop:3,textAlign:mine?"right":"left"}}>{new Date(m.sentAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}</div>
+              </div>
+            </div>
+          );
+        })}
+        {msgs.length === 0 && <div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>No messages yet. Say hello! 👋</div>}
+        <div ref={bottomRef} />
+      </div>
+      <div style={{display:"flex",gap:8,paddingTop:12,borderTop:"1px solid var(--border)"}}>
+        <input value={text} onChange={e=>setText(e.target.value)} onKeyDown={e=>e.key==="Enter"&&!e.shiftKey&&send()}
+          placeholder="Type a message…" style={{flex:1,padding:"10px 14px",borderRadius:22,border:"1.5px solid var(--border)",background:"var(--bg4)",color:"var(--text)",fontSize:14,outline:"none"}} />
+        <button onClick={send} disabled={sending||!text.trim()} style={{padding:"10px 20px",borderRadius:22,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700,opacity:sending?0.6:1}}>Send</button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{maxWidth:700,margin:"0 auto"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+        <div><div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:22}}>👥 Study Groups</div>
+          <div style={{color:"var(--text3)",fontSize:13}}>{myClass?.label||"Your class"} • Group chats</div></div>
+        <button onClick={()=>setShowCreate(true)} style={{padding:"9px 18px",borderRadius:10,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700,fontSize:13}}>+ New Group</button>
+      </div>
+      {showCreate && (
+        <div style={{background:"var(--card)",border:"1.5px solid var(--accent)",borderRadius:14,padding:20,marginBottom:20}}>
+          <div style={{fontWeight:800,marginBottom:12}}>Create Study Group</div>
+          <label className="lbl">Group Name</label>
+          <input className="inp" value={newName} onChange={e=>setNewName(e.target.value)} placeholder="e.g. Pharmacology Study Crew" />
+          <label className="lbl">Description (optional)</label>
+          <input className="inp" value={newDesc} onChange={e=>setNewDesc(e.target.value)} placeholder="What will you study?" />
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={createGroup} style={{flex:1,padding:"10px",borderRadius:10,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700}}>Create</button>
+            <button onClick={()=>setShowCreate(false)} style={{padding:"10px 18px",borderRadius:10,background:"var(--bg4)",color:"var(--text)",border:"1px solid var(--border)",cursor:"pointer",fontWeight:700}}>Cancel</button>
+          </div>
+        </div>
+      )}
+      {!myClassId && <div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>You need to be assigned to a class to join study groups. Contact your admin.</div>}
+      {groups.length === 0 && myClassId && <div style={{textAlign:"center",padding:60,color:"var(--text3)"}}><div style={{fontSize:48,marginBottom:12}}>👥</div><div style={{fontWeight:700,fontSize:16}}>No study groups yet</div><div style={{fontSize:13,marginTop:4}}>Create the first group for your class!</div></div>}
+      {groups.map(g => (
+        <div key={g.id} className="sg-room" onClick={()=>setActiveGroup(g)}>
+          <div style={{display:"flex",alignItems:"center",gap:12}}>
+            <div style={{width:44,height:44,borderRadius:12,background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>👥</div>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontWeight:800,fontSize:15}}>{g.name}</div>
+              <div style={{fontSize:12,color:"var(--text3)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{g.lastMsg||g.desc||"No messages yet"}</div>
+            </div>
+            <div style={{fontSize:11,color:"var(--text3)",flexShrink:0,textAlign:"right"}}>
+              {g.lastAt ? new Date(g.lastAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}) : ""}
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// TIMETABLE
+// ════════════════════════════════════════════════════════════════════
+const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat"];
+const HOURS = ["07:00","08:00","09:00","10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00"];
+function Timetable({ currentUser, toast, isLecturer }) {
+  const [classes]  = useSharedData("nv-classes", DEFAULT_CLASSES);
+  const allUsers   = ls("nv-users", []);
+  const me         = allUsers.find(u => u.username === currentUser);
+  const myClassId  = me?.class || (isLecturer ? (classes[0]?.id||"") : "");
+  const [selClass, setSelClass] = useState(myClassId || (classes[0]?.id||""));
+  const [slots, setSlots]   = useState([]);
+  const [editing, setEditing] = useState(null); // {day, hour}
+  const [form, setForm]     = useState({subject:"",lecturer:"",room:""});
+  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!selClass) return;
+    setLoading(true);
+    ttLoad(selClass).then(s => { setSlots(s||[]); setLoading(false); });
+  }, [selClass]);
+
+  const slotAt = (day, hour) => slots.find(s => s.day===day && s.hour===hour);
+
+  const saveSlot = async () => {
+    if (!form.subject.trim()) return toast("Subject required","error");
+    setSaving(true);
+    const updated = slots.filter(s=>!(s.day===editing.day&&s.hour===editing.hour));
+    if (form.subject.trim()) updated.push({day:editing.day,hour:editing.hour,...form});
+    const ok = await ttSave(selClass, updated);
+    if (ok) { setSlots(updated); toast("Timetable saved ✅","success"); }
+    else toast("Save failed","error");
+    setEditing(null); setForm({subject:"",lecturer:"",room:""}); setSaving(false);
+  };
+
+  const deleteSlot = async (day, hour) => {
+    const updated = slots.filter(s=>!(s.day===day&&s.hour===hour));
+    await ttSave(selClass, updated);
+    setSlots(updated);
+  };
+
+  const today = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date().getDay()];
+
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:10}}>
+        <div><div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:22}}>📅 Timetable</div>
+          <div style={{color:"var(--text3)",fontSize:13}}>Class schedule at a glance</div></div>
+        {isLecturer && <select className="inp" style={{marginBottom:0,width:"auto",minWidth:180}} value={selClass} onChange={e=>setSelClass(e.target.value)}>
+          {classes.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
+        </select>}
+      </div>
+
+      {editing && (
+        <div style={{position:"fixed",inset:0,zIndex:9000,display:"flex",alignItems:"center",justifyContent:"center",background:"rgba(0,0,0,.5)",backdropFilter:"blur(4px)"}}>
+          <div style={{background:"var(--card)",borderRadius:18,padding:28,width:"90vw",maxWidth:400,border:"1.5px solid var(--border)"}}>
+            <div style={{fontWeight:800,fontSize:16,marginBottom:16}}>📅 {editing.day} • {editing.hour}</div>
+            <label className="lbl">Subject</label>
+            <input className="inp" value={form.subject} onChange={e=>setForm({...form,subject:e.target.value})} placeholder="e.g. Pharmacology" />
+            <label className="lbl">Lecturer</label>
+            <input className="inp" value={form.lecturer} onChange={e=>setForm({...form,lecturer:e.target.value})} placeholder="e.g. Dr. Adeleke" />
+            <label className="lbl">Room / Venue</label>
+            <input className="inp" value={form.room} onChange={e=>setForm({...form,room:e.target.value})} placeholder="e.g. Hall A" />
+            <div style={{display:"flex",gap:8,marginTop:4}}>
+              <button onClick={saveSlot} disabled={saving} style={{flex:1,padding:10,borderRadius:10,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700}}>{saving?"Saving…":"Save"}</button>
+              <button onClick={()=>setEditing(null)} style={{padding:"10px 16px",borderRadius:10,background:"var(--bg4)",color:"var(--text)",border:"1px solid var(--border)",cursor:"pointer",fontWeight:700}}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {loading ? <div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>Loading timetable…</div> : (
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"separate",borderSpacing:4}}>
+            <thead>
+              <tr>
+                <th style={{width:56,padding:6,fontSize:11,color:"var(--text3)"}}>Time</th>
+                {DAYS.map(d=><th key={d} className="tt-day-hdr" style={{color:d===today?"var(--accent)":"var(--text3)",background:d===today?"rgba(0,119,182,.07)":"transparent",borderRadius:8}}>{d}{d===today?" 📌":""}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {HOURS.map(hour=>(
+                <tr key={hour}>
+                  <td style={{fontSize:11,color:"var(--text3)",fontFamily:"'DM Mono',monospace",padding:"4px 4px",textAlign:"right",whiteSpace:"nowrap"}}>{hour}</td>
+                  {DAYS.map(day=>{
+                    const slot = slotAt(day,hour);
+                    return (
+                      <td key={day} style={{padding:3}}>
+                        {slot ? (
+                          <div className="tt-cell has-class" onClick={()=>{if(isLecturer){setEditing({day,hour});setForm({subject:slot.subject,lecturer:slot.lecturer||"",room:slot.room||""});}}}>
+                            <div style={{fontWeight:700,fontSize:11,color:"var(--accent)",marginBottom:2}}>{slot.subject}</div>
+                            {slot.lecturer&&<div style={{fontSize:10,color:"var(--text3)"}}>{slot.lecturer}</div>}
+                            {slot.room&&<div style={{fontSize:10,color:"var(--text3)"}}>{slot.room}</div>}
+                            {isLecturer&&<div onClick={e=>{e.stopPropagation();deleteSlot(day,hour);}} style={{fontSize:10,color:"var(--danger)",cursor:"pointer",marginTop:3}}>✕ remove</div>}
+                          </div>
+                        ) : (
+                          <div className="tt-cell" onClick={()=>{if(isLecturer){setEditing({day,hour});setForm({subject:"",lecturer:"",room:""});}}} style={{opacity:isLecturer?.5:0.2,cursor:isLecturer?"pointer":"default"}}>
+                            {isLecturer && <div style={{fontSize:16,textAlign:"center",color:"var(--text3)"}}>+</div>}
+                          </div>
+                        )}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div style={{marginTop:16,fontSize:12,color:"var(--text3)",textAlign:"center"}}>{isLecturer?"Click any cell to add or edit a class":"Read-only view — lecturers manage the schedule"}</div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// ASSIGNMENTS
+// ════════════════════════════════════════════════════════════════════
+function Assignments({ currentUser, toast, isLecturer }) {
+  const [classes]  = useSharedData("nv-classes", DEFAULT_CLASSES);
+  const allUsers   = ls("nv-users", []);
+  const me         = allUsers.find(u => u.username === currentUser);
+  const myClassId  = me?.class || "";
+  const [selClass, setSelClass] = useState(myClassId || classes[0]?.id || "");
+  const [assignments, setAssignments] = useState([]);
+  const [selAsgn, setSelAsgn] = useState(null); // for lecturer grading view
+  const [submissions, setSubmissions] = useState([]);
+  const [mySubmission, setMySubmission] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({title:"",desc:"",dueAt:"",maxScore:100});
+  const [uploading, setUploading] = useState(false);
+  const [gradingId, setGradingId] = useState(null);
+  const [gradeForm, setGradeForm] = useState({grade:"",feedback:""});
+
+  useEffect(() => {
+    if (!selClass) return;
+    const unsub = asgSubscribe(selClass, setAssignments);
+    return () => unsub();
+  }, [selClass]);
+
+  useEffect(() => {
+    if (!selAsgn) return;
+    if (isLecturer) asgLoadSubmissions(selAsgn.id).then(setSubmissions);
+    else asgLoadMySubmission(selAsgn.id, currentUser).then(setMySubmission);
+  }, [selAsgn?.id, isLecturer]);
+
+  const createAsgn = async () => {
+    if (!form.title.trim()) return toast("Title required","error");
+    if (!form.dueAt) return toast("Due date required","error");
+    const id = "asgn_" + Date.now();
+    const asgn = { id, classId:selClass, title:form.title.trim(), desc:form.desc.trim(), dueAt:new Date(form.dueAt).getTime(), maxScore:+form.maxScore||100, createdBy:currentUser, createdAt:Date.now() };
+    const ok = await asgSave(asgn);
+    if (ok) { toast("Assignment posted ✅","success"); setShowForm(false); setForm({title:"",desc:"",dueAt:"",maxScore:100}); }
+    else toast("Failed to post","error");
+  };
+
+  const submitWork = async (asgn) => {
+    const input = document.createElement("input"); input.type="file"; input.accept=".pdf,.doc,.docx,.png,.jpg,.txt";
+    input.onchange = async (e) => {
+      const file = e.target.files[0]; if (!file) return;
+      if (file.size > 2*1024*1024) return toast("File too large — max 2MB","error");
+      setUploading(true);
+      const reader = new FileReader();
+      reader.onload = async (ev) => {
+        const ok = await asgSubmit(asgn.id, currentUser, ev.target.result, file.name);
+        if (ok) { toast("Submitted ✅","success"); asgLoadMySubmission(asgn.id, currentUser).then(setMySubmission); }
+        else toast("Submit failed","error");
+        setUploading(false);
+      };
+      reader.readAsDataURL(file);
+    };
+    input.click();
+  };
+
+  const saveGrade = async () => {
+    if (!gradeForm.grade) return toast("Enter a grade","error");
+    const ok = await asgGrade(selAsgn.id, gradingId, +gradeForm.grade, gradeForm.feedback);
+    if (ok) { toast("Graded ✅","success"); asgLoadSubmissions(selAsgn.id).then(setSubmissions); setGradingId(null); }
+  };
+
+  const statusColor = (asgn) => {
+    const now = Date.now();
+    if (now > asgn.dueAt) return { bg:"rgba(239,68,68,.1)", color:"var(--danger)", label:"Overdue" };
+    if (asgn.dueAt - now < 86400000) return { bg:"rgba(251,146,60,.1)", color:"var(--warn)", label:"Due soon" };
+    return { bg:"rgba(34,197,94,.1)", color:"var(--success)", label:"Open" };
+  };
+
+  if (selAsgn) {
+    const st = statusColor(selAsgn);
+    return (
+      <div style={{maxWidth:700,margin:"0 auto"}}>
+        <button onClick={()=>{setSelAsgn(null);setSubmissions([]);setMySubmission(null);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:13,color:"var(--text3)",marginBottom:16,display:"flex",alignItems:"center",gap:4}}>← Back</button>
+        <div className="asgn-card">
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+            <div style={{fontWeight:800,fontSize:18}}>{selAsgn.title}</div>
+            <span className="asgn-status" style={{background:st.bg,color:st.color}}>{st.label}</span>
+          </div>
+          <div style={{color:"var(--text2)",fontSize:13,marginBottom:12,lineHeight:1.6}}>{selAsgn.desc}</div>
+          <div style={{fontSize:12,color:"var(--text3)"}}>📅 Due: <b>{new Date(selAsgn.dueAt).toLocaleString()}</b> • Max score: <b>{selAsgn.maxScore}</b></div>
+        </div>
+
+        {isLecturer ? (
+          <div>
+            <div style={{fontWeight:800,marginBottom:12}}>Submissions ({submissions.length})</div>
+            {submissions.length===0 && <div style={{textAlign:"center",padding:30,color:"var(--text3)"}}>No submissions yet</div>}
+            {submissions.map(sub => (
+              <div key={sub.student} style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px",marginBottom:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                  <div style={{fontWeight:700}}>{allUsers.find(u=>u.username===sub.student)?.displayName||sub.student.split("@")[0]}</div>
+                  <div style={{fontSize:11,color:"var(--text3)"}}>{new Date(sub.submittedAt).toLocaleString()}</div>
+                </div>
+                <div style={{fontSize:12,color:"var(--text3)",marginBottom:8}}>📎 {sub.fileName}</div>
+                {sub.fileData && <a href={sub.fileData} download={sub.fileName} style={{fontSize:12,color:"var(--accent)",textDecoration:"none",display:"inline-block",marginBottom:8}}>⬇ Download</a>}
+                {sub.grade!=null ? (
+                  <div style={{background:"rgba(34,197,94,.1)",borderRadius:8,padding:"8px 12px",fontSize:13}}>
+                    ✅ Graded: <b>{sub.grade}/{selAsgn.maxScore}</b>{sub.feedback&&<span> • {sub.feedback}</span>}
+                  </div>
+                ) : gradingId===sub.student ? (
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:8}}>
+                    <input type="number" className="inp" style={{width:80,marginBottom:0}} placeholder="Score" value={gradeForm.grade} onChange={e=>setGradeForm({...gradeForm,grade:e.target.value})} />
+                    <input className="inp" style={{flex:1,marginBottom:0,minWidth:120}} placeholder="Feedback (optional)" value={gradeForm.feedback} onChange={e=>setGradeForm({...gradeForm,feedback:e.target.value})} />
+                    <button onClick={saveGrade} style={{padding:"9px 16px",borderRadius:9,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700}}>Save</button>
+                    <button onClick={()=>setGradingId(null)} style={{padding:"9px 14px",borderRadius:9,background:"var(--bg4)",color:"var(--text)",border:"1px solid var(--border)",cursor:"pointer"}}>✕</button>
+                  </div>
+                ) : (
+                  <button onClick={()=>{setGradingId(sub.student);setGradeForm({grade:"",feedback:""});}} style={{padding:"7px 14px",borderRadius:9,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700,fontSize:12}}>Grade</button>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div>
+            {mySubmission ? (
+              <div style={{background:"rgba(34,197,94,.08)",border:"1.5px solid var(--success)",borderRadius:14,padding:20,textAlign:"center"}}>
+                <div style={{fontSize:32,marginBottom:8}}>✅</div>
+                <div style={{fontWeight:800,fontSize:16,marginBottom:4}}>Submitted!</div>
+                <div style={{fontSize:13,color:"var(--text3)",marginBottom:8}}>📎 {mySubmission.fileName}</div>
+                {mySubmission.grade!=null && <div style={{background:"rgba(0,119,182,.1)",borderRadius:10,padding:"10px 16px",fontSize:14,fontWeight:700}}>
+                  Score: {mySubmission.grade}/{selAsgn.maxScore} {mySubmission.feedback&&`• ${mySubmission.feedback}`}
+                </div>}
+                {mySubmission.grade==null && <div style={{fontSize:12,color:"var(--text3)"}}>Waiting for lecturer to grade…</div>}
+              </div>
+            ) : (
+              <div style={{textAlign:"center",padding:30}}>
+                <div style={{fontSize:40,marginBottom:12}}>📤</div>
+                <div style={{fontWeight:700,marginBottom:8}}>Upload your work</div>
+                <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>PDF, Word, image or text file • Max 2MB</div>
+                <button onClick={()=>submitWork(selAsgn)} disabled={uploading} style={{padding:"12px 28px",borderRadius:12,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700}}>{uploading?"Uploading…":"Choose File & Submit"}</button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{maxWidth:700,margin:"0 auto"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:10}}>
+        <div><div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:22}}>📝 Assignments</div>
+          <div style={{color:"var(--text3)",fontSize:13}}>Submit work and get grades</div></div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          {isLecturer && <select className="inp" style={{marginBottom:0,width:"auto",minWidth:160}} value={selClass} onChange={e=>setSelClass(e.target.value)}>
+            {classes.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
+          </select>}
+          {isLecturer && <button onClick={()=>setShowForm(true)} style={{padding:"9px 18px",borderRadius:10,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700,fontSize:13,whiteSpace:"nowrap"}}>+ Post Assignment</button>}
+        </div>
+      </div>
+
+      {showForm && (
+        <div style={{background:"var(--card)",border:"1.5px solid var(--accent)",borderRadius:14,padding:20,marginBottom:20}}>
+          <div style={{fontWeight:800,marginBottom:12}}>New Assignment</div>
+          <label className="lbl">Title</label>
+          <input className="inp" value={form.title} onChange={e=>setForm({...form,title:e.target.value})} placeholder="e.g. Pharmacology Case Study" />
+          <label className="lbl">Description / Instructions</label>
+          <textarea className="inp" rows={3} value={form.desc} onChange={e=>setForm({...form,desc:e.target.value})} placeholder="Describe what students need to do…" style={{resize:"vertical"}} />
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <div><label className="lbl">Due Date & Time</label><input className="inp" type="datetime-local" value={form.dueAt} onChange={e=>setForm({...form,dueAt:e.target.value})} /></div>
+            <div><label className="lbl">Max Score</label><input className="inp" type="number" value={form.maxScore} onChange={e=>setForm({...form,maxScore:e.target.value})} /></div>
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={createAsgn} style={{flex:1,padding:10,borderRadius:10,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700}}>Post</button>
+            <button onClick={()=>setShowForm(false)} style={{padding:"10px 18px",borderRadius:10,background:"var(--bg4)",color:"var(--text)",border:"1px solid var(--border)",cursor:"pointer",fontWeight:700}}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {assignments.length===0 && <div style={{textAlign:"center",padding:60,color:"var(--text3)"}}><div style={{fontSize:48,marginBottom:12}}>📝</div><div style={{fontWeight:700}}>No assignments yet</div><div style={{fontSize:13,marginTop:4}}>{isLecturer?"Post the first assignment above":"Check back later"}</div></div>}
+      {assignments.map(a => {
+        const st = statusColor(a);
+        return (
+          <div key={a.id} className="asgn-card" onClick={()=>setSelAsgn(a)} style={{cursor:"pointer"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+              <div style={{fontWeight:800,fontSize:15,flex:1,paddingRight:10}}>{a.title}</div>
+              <span className="asgn-status" style={{background:st.bg,color:st.color,flexShrink:0}}>{st.label}</span>
+            </div>
+            {a.desc && <div style={{fontSize:12,color:"var(--text3)",marginTop:6,lineHeight:1.5}}>{a.desc.slice(0,120)}{a.desc.length>120?"…":""}</div>}
+            <div style={{fontSize:11,color:"var(--text3)",marginTop:8}}>📅 Due: {new Date(a.dueAt).toLocaleString()} • Max: {a.maxScore} pts</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// ATTENDANCE
+// ════════════════════════════════════════════════════════════════════
+function AttendanceView({ currentUser, toast, isLecturer }) {
+  const [classes]  = useSharedData("nv-classes", DEFAULT_CLASSES);
+  const allUsers   = ls("nv-users", []);
+  const me         = allUsers.find(u => u.username === currentUser);
+  const myClassId  = me?.class || "";
+  const [selClass, setSelClass] = useState(myClassId || classes[0]?.id || "");
+  const [selDate,  setSelDate]  = useState(new Date().toISOString().slice(0,10));
+  const [records,  setRecords]  = useState({});
+  const [saving, setSaving]     = useState(false);
+  const [myHistory, setMyHistory] = useState({});
+
+  const classStudents = allUsers.filter(u => u.class === selClass && u.role !== "admin" && u.role !== "lecturer");
+
+  useEffect(() => {
+    if (!selClass || !selDate) return;
+    attLoad(selClass, selDate).then(setRecords);
+  }, [selClass, selDate]);
+
+  useEffect(() => {
+    if (!myClassId || isLecturer) return;
+    // Load last 30 days for student
+    const dates = Array.from({length:30},(_,i) => {
+      const d = new Date(); d.setDate(d.getDate()-i);
+      return d.toISOString().slice(0,10);
+    });
+    attLoadRange(myClassId, dates).then(setMyHistory);
+  }, [myClassId, isLecturer]);
+
+  const mark = (student, status) => setRecords(r => ({...r, [_safeKey(student)]: status}));
+
+  const saveAll = async () => {
+    setSaving(true);
+    const all = Object.entries(records);
+    for (const [sk, status] of all) {
+      const student = classStudents.find(u => _safeKey(u.username)===sk)?.username || sk;
+      await attMark(selClass, selDate, student, status);
+    }
+    toast("Attendance saved ✅","success");
+    setSaving(false);
+  };
+
+  const quickMarkAll = (status) => {
+    const upd = {};
+    classStudents.forEach(u => { upd[_safeKey(u.username)] = status; });
+    setRecords(upd);
+  };
+
+  const pct = (days) => {
+    let present=0,total=0;
+    Object.values(days).forEach(d => {
+      Object.values(d).forEach(s => { total++; if(s==="present") present++; });
+    });
+    return total===0 ? null : Math.round((present/total)*100);
+  };
+
+  if (!isLecturer) {
+    const myDates = Object.keys(myHistory).sort().reverse().slice(0,30);
+    const attended = myDates.filter(d => myHistory[d][_safeKey(currentUser)]==="present").length;
+    const totalMarked = myDates.filter(d => myHistory[d][_safeKey(currentUser)]).length;
+    const attPct = totalMarked ? Math.round((attended/totalMarked)*100) : null;
+    return (
+      <div style={{maxWidth:600,margin:"0 auto"}}>
+        <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:22,marginBottom:4}}>📋 My Attendance</div>
+        <div style={{color:"var(--text3)",fontSize:13,marginBottom:20}}>Your attendance record for the last 30 days</div>
+        {attPct!==null && (
+          <div style={{background:"var(--card)",border:"1.5px solid var(--border)",borderRadius:16,padding:24,textAlign:"center",marginBottom:20}}>
+            <div style={{fontSize:52,fontWeight:800,color:attPct>=75?"var(--success)":attPct>=50?"var(--warn)":"var(--danger)"}}>{attPct}%</div>
+            <div style={{fontSize:14,color:"var(--text2)",marginTop:4}}>Attendance Rate • {attended}/{totalMarked} classes</div>
+            <div style={{marginTop:12,background:"var(--bg3)",borderRadius:10,height:8,overflow:"hidden"}}>
+              <div style={{height:"100%",borderRadius:10,background:attPct>=75?"var(--success)":attPct>=50?"var(--warn)":"var(--danger)",width:`${attPct}%`,transition:"width .5s"}} />
+            </div>
+            {attPct<75&&<div style={{fontSize:12,color:"var(--warn)",marginTop:8}}>⚠️ Attendance below 75% — you may be at risk</div>}
+          </div>
+        )}
+        <div style={{display:"flex",flexDirection:"column",gap:6}}>
+          {myDates.map(date => {
+            const status = myHistory[date][_safeKey(currentUser)];
+            if (!status) return null;
+            const color = status==="present"?"var(--success)":status==="absent"?"var(--danger)":"var(--warn)";
+            const icon  = status==="present"?"✅":status==="absent"?"❌":"⚠️";
+            return (
+              <div key={date} style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:10,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:13}}>{new Date(date+"T00:00:00").toLocaleDateString([],{weekday:"short",month:"short",day:"numeric"})}</span>
+                <span style={{fontSize:13,fontWeight:700,color}}>{icon} {status.charAt(0).toUpperCase()+status.slice(1)}</span>
+              </div>
+            );
+          })}
+          {myDates.length===0&&<div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>No attendance records yet</div>}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{maxWidth:700,margin:"0 auto"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:10}}>
+        <div><div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:22}}>📋 Attendance</div>
+          <div style={{color:"var(--text3)",fontSize:13}}>Mark and track class attendance</div></div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          <select className="inp" style={{marginBottom:0,width:"auto",minWidth:150}} value={selClass} onChange={e=>setSelClass(e.target.value)}>
+            {classes.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
+          </select>
+          <input type="date" className="inp" style={{marginBottom:0,width:"auto"}} value={selDate} onChange={e=>setSelDate(e.target.value)} />
+        </div>
+      </div>
+
+      <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
+        <button onClick={()=>quickMarkAll("present")} style={{padding:"7px 14px",borderRadius:8,background:"rgba(34,197,94,.15)",color:"var(--success)",border:"1px solid var(--success)",cursor:"pointer",fontWeight:700,fontSize:12}}>✅ All Present</button>
+        <button onClick={()=>quickMarkAll("absent")} style={{padding:"7px 14px",borderRadius:8,background:"rgba(239,68,68,.1)",color:"var(--danger)",border:"1px solid var(--danger)",cursor:"pointer",fontWeight:700,fontSize:12}}>❌ All Absent</button>
+        <button onClick={saveAll} disabled={saving} style={{padding:"7px 18px",borderRadius:8,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700,fontSize:12,marginLeft:"auto"}}>{saving?"Saving…":"💾 Save"}</button>
+      </div>
+
+      {classStudents.length===0 && <div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>No students in this class yet</div>}
+      {classStudents.map(student => {
+        const sk = _safeKey(student.username);
+        const status = records[sk] || "";
+        return (
+          <div key={student.username} className="att-row">
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <div style={{width:36,height:36,borderRadius:"50%",background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:"#fff",flexShrink:0}}>
+                {(student.avatar||(student.displayName||student.username)[0]||"?").toUpperCase()}
+              </div>
+              <div>
+                <div style={{fontWeight:700,fontSize:14}}>{student.displayName||student.username.split("@")[0]}</div>
+                <div style={{fontSize:11,color:"var(--text3)"}}>{student.username}</div>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:6}}>
+              {["present","absent","late"].map(s => (
+                <button key={s} onClick={()=>mark(student.username,s)} style={{padding:"6px 12px",borderRadius:8,border:`1.5px solid ${status===s?(s==="present"?"var(--success)":s==="absent"?"var(--danger)":"var(--warn)"):"var(--border)"}`,background:status===s?(s==="present"?"rgba(34,197,94,.15)":s==="absent"?"rgba(239,68,68,.1)":"rgba(251,146,60,.1)"):"transparent",color:status===s?(s==="present"?"var(--success)":s==="absent"?"var(--danger)":"var(--warn)"):"var(--text3)",cursor:"pointer",fontWeight:700,fontSize:11,textTransform:"capitalize"}}>
+                  {s==="present"?"✅":s==="absent"?"❌":"⚠️"} {s}
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// LEADERBOARD + STREAKS
+// ════════════════════════════════════════════════════════════════════
+function LeaderboardStreaks({ currentUser }) {
+  const allUsers = ls("nv-users", []);
+  const [classes] = useSharedData("nv-classes", DEFAULT_CLASSES);
+  const me = allUsers.find(u => u.username === currentUser);
+  const myClassId = me?.class || "";
+  const [tab, setTab] = useState("leaderboard");
+
+  // Build leaderboard from CBT results stored in localStorage
+  const buildLeaderboard = () => {
+    const scores = [];
+    allUsers.forEach(u => {
+      const results = ls("nv-cbt-results-" + u.username, null) || ls("nv-cbt-results", []);
+      // Try per-user results first
+      try {
+        const perUser = localStorage.getItem("nv-cbt-results-" + u.username);
+        const parsed = perUser ? JSON.parse(perUser) : null;
+        const userResults = parsed || results.filter(r => r.student === u.username);
+        if (userResults.length === 0) return;
+        const avg = Math.round(userResults.reduce((s,r) => s + (r.pct||r.score||0), 0) / userResults.length);
+        scores.push({ user: u.username, name: u.displayName||u.username.split("@")[0], avatar: u.avatar||(u.displayName||u.username)[0]?.toUpperCase()||"?", avg, count: userResults.length, classId: u.class });
+      } catch(e) {}
+    });
+    return scores.sort((a,b) => b.avg - a.avg);
+  };
+
+  // Streak: consecutive days with study timer activity
+  const getStreak = () => {
+    try {
+      const logs = ls("nv-study-logs-" + currentUser, []);
+      if (!logs.length) return 0;
+      const days = [...new Set(logs.map(l => new Date(l.ts).toISOString().slice(0,10)))].sort().reverse();
+      let streak = 0;
+      const today = new Date().toISOString().slice(0,10);
+      let check = today;
+      for (const day of days) {
+        if (day === check) { streak++; const d=new Date(check); d.setDate(d.getDate()-1); check=d.toISOString().slice(0,10); }
+        else break;
+      }
+      return streak;
+    } catch(e) { return 0; }
+  };
+
+  const leaderboard = buildLeaderboard();
+  const myRank = leaderboard.findIndex(x=>x.user===currentUser) + 1;
+  const streak = getStreak();
+  const myEntry = leaderboard.find(x=>x.user===currentUser);
+  const studyLogs = ls("nv-study-logs-" + currentUser, []);
+  const totalStudyMins = Math.round(studyLogs.reduce((s,l)=>s+(l.mins||0),0));
+  const totalExams = ls("nv-cbt-results", []).filter(r=>r.student===currentUser).length;
+
+  const medals = ["🥇","🥈","🥉"];
+
+  return (
+    <div style={{maxWidth:600,margin:"0 auto"}}>
+      <div style={{display:"flex",gap:6,marginBottom:20,background:"var(--bg4)",borderRadius:12,padding:4}}>
+        {["leaderboard","streaks"].map(t=>(
+          <button key={t} onClick={()=>setTab(t)} style={{flex:1,padding:"9px",borderRadius:9,border:"none",cursor:"pointer",fontWeight:700,fontSize:13,background:tab===t?"var(--card)":"transparent",color:tab===t?"var(--accent)":"var(--text3)",boxShadow:tab===t?"0 2px 8px rgba(0,0,0,.1)":"none",transition:"all .2s",textTransform:"capitalize"}}>
+            {t==="leaderboard"?"🏆 Leaderboard":"🔥 Streaks & Stats"}
+          </button>
+        ))}
+      </div>
+
+      {tab==="leaderboard" && (
+        <div>
+          {myRank > 0 && (
+            <div style={{background:"linear-gradient(135deg,var(--accent),var(--accent2))",borderRadius:16,padding:"18px 20px",marginBottom:20,color:"#fff",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div><div style={{fontSize:13,opacity:.8}}>Your Ranking</div><div style={{fontSize:32,fontWeight:800}}>#{myRank}</div></div>
+              <div style={{textAlign:"right"}}><div style={{fontSize:13,opacity:.8}}>Avg Score</div><div style={{fontSize:32,fontWeight:800}}>{myEntry?.avg||0}%</div></div>
+            </div>
+          )}
+          {leaderboard.length===0 && <div style={{textAlign:"center",padding:60,color:"var(--text3)"}}><div style={{fontSize:48,marginBottom:12}}>🏆</div><div style={{fontWeight:700}}>No scores yet</div><div style={{fontSize:13,marginTop:4}}>Take CBT exams to appear on the leaderboard</div></div>}
+          {leaderboard.slice(0,20).map((entry,i) => {
+            const isMe = entry.user === currentUser;
+            return (
+              <div key={entry.user} className="lb-row" style={{border:isMe?"1.5px solid var(--accent)":"1px solid var(--border)",background:isMe?"rgba(0,119,182,.05)":"var(--card)"}}>
+                <div className="lb-rank" style={{background:i<3?"linear-gradient(135deg,#f59e0b,#d97706)":"var(--bg3)",color:i<3?"#fff":"var(--text3)",fontSize:i<3?20:14}}>
+                  {i<3?medals[i]:i+1}
+                </div>
+                <div style={{width:36,height:36,borderRadius:"50%",background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,color:"#fff",fontSize:15,flexShrink:0}}>
+                  {entry.avatar}
+                </div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:700,fontSize:14}}>{entry.name}{isMe&&<span style={{fontSize:10,color:"var(--accent)",marginLeft:6}}>• You</span>}</div>
+                  <div style={{fontSize:11,color:"var(--text3)"}}>{entry.count} exam{entry.count!==1?"s":""} taken</div>
+                </div>
+                <div style={{textAlign:"right",flexShrink:0}}>
+                  <div style={{fontWeight:800,fontSize:18,color:entry.avg>=70?"var(--success)":entry.avg>=50?"var(--warn)":"var(--danger)"}}>{entry.avg}%</div>
+                  <div style={{fontSize:10,color:"var(--text3)"}}>avg score</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {tab==="streaks" && (
+        <div>
+          <div style={{background:"var(--card)",border:"1.5px solid var(--border)",borderRadius:18,padding:28,textAlign:"center",marginBottom:16}}>
+            <div className="streak-flame">{streak>0?"🔥":"💤"}</div>
+            <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:52,marginTop:4,color:streak>=7?"var(--warn)":"var(--text)"}}>{streak}</div>
+            <div style={{fontSize:16,fontWeight:700,marginBottom:4}}>Day Streak</div>
+            <div style={{fontSize:13,color:"var(--text3)"}}>{streak===0?"Start studying today to begin your streak!":streak<3?"Keep going — you're building momentum!":streak<7?"Great consistency! Keep it up!":"🌟 You're on fire! Amazing dedication!"}</div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+            {[
+              {icon:"⏱️",label:"Total Study Time",val:`${totalStudyMins} min`},
+              {icon:"📝",label:"Exams Taken",val:totalExams},
+              {icon:"📅",label:"Days Active",val:new Set(studyLogs.map(l=>new Date(l.ts).toISOString().slice(0,10))).size},
+              {icon:"🎯",label:"Best Score",val:(()=>{const r=ls("nv-cbt-results",[]).filter(x=>x.student===currentUser);return r.length?Math.max(...r.map(x=>x.pct||x.score||0))+"%":"—"})()},
+            ].map(s=>(
+              <div key={s.label} style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:14,padding:"16px",textAlign:"center"}}>
+                <div style={{fontSize:24,marginBottom:4}}>{s.icon}</div>
+                <div style={{fontWeight:800,fontSize:20}}>{s.val}</div>
+                <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:14,padding:16}}>
+            <div style={{fontWeight:700,marginBottom:10,fontSize:13}}>📅 Last 14 Days</div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4}}>
+              {Array.from({length:14},(_,i)=>{
+                const d=new Date(); d.setDate(d.getDate()-(13-i));
+                const dateStr=d.toISOString().slice(0,10);
+                const active=studyLogs.some(l=>new Date(l.ts).toISOString().slice(0,10)===dateStr);
+                return (
+                  <div key={dateStr} title={dateStr} style={{aspectRatio:"1",borderRadius:6,background:active?"var(--accent)":"var(--bg3)",opacity:active?1:0.3,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:active?"#fff":"var(--text3)"}} >
+                    {d.getDate()}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// STUDENT PROGRESS DASHBOARD
+// ════════════════════════════════════════════════════════════════════
+function ProgressDashboard({ currentUser }) {
+  const allUsers = ls("nv-users", []);
+  const me = allUsers.find(u => u.username === currentUser);
+  const [classes] = useSharedData("nv-classes", DEFAULT_CLASSES);
+  const myClass = classes.find(c => c.id === me?.class);
+
+  const cbtResults = ls("nv-cbt-results", []).filter(r => r.student === currentUser);
+  const gpaResults = ls("nv-results", []);
+  const studyLogs  = ls("nv-study-logs-" + currentUser, []);
+  const flashDecks = ls("nv-flashcard-decks", []);
+
+  const avgScore = cbtResults.length ? Math.round(cbtResults.reduce((s,r)=>s+(r.pct||r.score||0),0)/cbtResults.length) : 0;
+  const totalStudyMins = Math.round(studyLogs.reduce((s,l)=>s+(l.mins||0),0));
+  const totalCards = flashDecks.reduce((s,d)=>s+d.cards.length,0);
+
+  // GPA trend
+  const gpa = (() => {
+    const courses = ls("nv-gpa-courses", []);
+    if (!courses.length) return null;
+    const total = courses.reduce((s,c)=>s+(c.grade*c.units),0);
+    const units = courses.reduce((s,c)=>s+c.units,0);
+    return units ? (total/units).toFixed(2) : null;
+  })();
+
+  // Score trend (last 10 exams)
+  const scoreTrend = cbtResults.slice(-10).map((r,i) => ({ n:i+1, score: r.pct||r.score||0 }));
+
+  // Ring component
+  const Ring = ({pct,color,size=80,label}) => {
+    const r = (size/2)-8; const circ = 2*Math.PI*r;
+    const fill = (pct/100)*circ;
+    return (
+      <div className="prog-ring-wrap" style={{width:size,height:size}}>
+        <svg width={size} height={size} style={{transform:"rotate(-90deg)"}}>
+          <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="var(--bg3)" strokeWidth={7} />
+          <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={7} strokeDasharray={circ} strokeDashoffset={circ-fill} strokeLinecap="round" style={{transition:"stroke-dashoffset .8s"}} />
+        </svg>
+        <div style={{position:"absolute",textAlign:"center"}}>
+          <div style={{fontWeight:800,fontSize:size>70?16:13,color}}>{pct}%</div>
+          {label&&<div style={{fontSize:9,color:"var(--text3)",marginTop:1}}>{label}</div>}
+        </div>
+      </div>
+    );
+  };
+
+  const MiniBar = ({score}) => (
+    <div style={{display:"flex",alignItems:"center",gap:6}}>
+      <div style={{flex:1,background:"var(--bg3)",borderRadius:4,height:6,overflow:"hidden"}}>
+        <div style={{width:`${score}%`,height:"100%",borderRadius:4,background:score>=70?"var(--success)":score>=50?"var(--warn)":"var(--danger)",transition:"width .5s"}} />
+      </div>
+      <span style={{fontSize:11,fontWeight:700,color:"var(--text3)",minWidth:28}}>{score}%</span>
+    </div>
+  );
+
+  return (
+    <div style={{maxWidth:700,margin:"0 auto"}}>
+      <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:22,marginBottom:4}}>📈 My Progress</div>
+      <div style={{color:"var(--text3)",fontSize:13,marginBottom:20}}>A complete view of your academic journey</div>
+
+      {/* Top KPIs */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:12,marginBottom:20}}>
+        {[
+          {icon:"📝",label:"Exams Taken",val:cbtResults.length,color:"var(--accent)"},
+          {icon:"🎯",label:"Avg Score",val:avgScore+"%",color:avgScore>=70?"var(--success)":avgScore>=50?"var(--warn)":"var(--danger)"},
+          {icon:"⏱️",label:"Study Time",val:totalStudyMins+"m",color:"var(--accent2)"},
+          {icon:"🃏",label:"Flashcards",val:totalCards,color:"var(--purple)"},
+          ...(gpa?[{icon:"🎓",label:"GPA",val:gpa,color:"#f59e0b"}]:[]),
+        ].map(s=>(
+          <div key={s.label} style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:14,padding:"16px 14px",textAlign:"center"}}>
+            <div style={{fontSize:24,marginBottom:6}}>{s.icon}</div>
+            <div style={{fontWeight:800,fontSize:22,color:s.color}}>{s.val}</div>
+            <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Score gauge */}
+      {cbtResults.length > 0 && (
+        <div style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:16,padding:20,marginBottom:16,display:"flex",alignItems:"center",gap:24,flexWrap:"wrap"}}>
+          <Ring pct={avgScore} color={avgScore>=70?"var(--success)":avgScore>=50?"var(--warn)":"var(--danger)"} size={96} label="Avg" />
+          <div style={{flex:1,minWidth:180}}>
+            <div style={{fontWeight:800,fontSize:15,marginBottom:4}}>Exam Performance</div>
+            <div style={{fontSize:13,color:"var(--text3)",marginBottom:10}}>{cbtResults.length} exam{cbtResults.length!==1?"s":""} completed</div>
+            <div style={{display:"flex",gap:16,flexWrap:"wrap"}}>
+              {[["Best",Math.max(...cbtResults.map(r=>r.pct||0))+"%" ],["Worst",Math.min(...cbtResults.map(r=>r.pct||0))+"%"],["Latest",(cbtResults[cbtResults.length-1]?.pct||0)+"%"]].map(([l,v])=>(
+                <div key={l}><div style={{fontSize:10,color:"var(--text3)"}}>{l}</div><div style={{fontWeight:800,fontSize:16}}>{v}</div></div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Score trend */}
+      {scoreTrend.length > 1 && (
+        <div style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:16,padding:20,marginBottom:16}}>
+          <div style={{fontWeight:800,marginBottom:12}}>📊 Score Trend (last {scoreTrend.length} exams)</div>
+          {scoreTrend.map((r,i)=>(
+            <div key={i} style={{marginBottom:6}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+                <span style={{fontSize:11,color:"var(--text3)"}}>Exam #{r.n}</span>
+              </div>
+              <MiniBar score={r.score} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Recent results */}
+      {gpaResults.length > 0 && (
+        <div style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:16,padding:20,marginBottom:16}}>
+          <div style={{fontWeight:800,marginBottom:12}}>📋 Test Results</div>
+          {gpaResults.slice(-5).reverse().map((r,i)=>(
+            <div key={r.id||i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid var(--border)"}}>
+              <div>
+                <div style={{fontWeight:700,fontSize:13}}>{r.subject}</div>
+                <div style={{fontSize:11,color:"var(--text3)"}}>{r.type||"Test"} {r.date?`• ${r.date}`:""}</div>
+              </div>
+              <div style={{fontWeight:800,fontSize:16,color:r.pct>=70?"var(--success)":r.pct>=50?"var(--warn)":"var(--danger)"}}>{r.score}/{r.total||100}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {cbtResults.length===0&&gpaResults.length===0&&<div style={{textAlign:"center",padding:60,color:"var(--text3)"}}><div style={{fontSize:48,marginBottom:12}}>📈</div><div style={{fontWeight:700}}>No data yet</div><div style={{fontSize:13,marginTop:4}}>Take CBT exams and log results to see your progress here</div></div>}
+    </div>
+  );
+}
+
+
+
+// ════════════════════════════════════════════════════════════════════
+// LECTURER CONTROL PANEL
+// ════════════════════════════════════════════════════════════════════
+function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode, runSync, syncing, syncError }) {
+  const [activeTab, setActiveTab] = useState("dashboard");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  const allUsers  = ls("nv-users", []);
+  const me        = allUsers.find(u => u.username === currentUser) || {};
+  const [classes] = useSharedData("nv-classes", DEFAULT_CLASSES);
+  const [handouts]= useSharedData("nv-handouts", []);
+  const [assignments, setAssignments] = useState([]);
+  const [unreadNotifs, setUnreadNotifs] = useState(() => ls("nv-notifications",[]).filter(n=>!n.read).length);
+  const [unreadDM, setUnreadDM] = useState(0);
+  const [navHistory, setNavHistory] = useState([]);
+
+  // Load assignments for classes taught
+  useEffect(() => {
+    if (!_db) return;
+    // subscribe to all assignments
+    const unsub = _db.collection("assignments")
+      .orderBy("dueAt","asc")
+      .onSnapshot(snap => setAssignments(snap.docs.map(d=>({id:d.id,...d.data()}))), ()=>{});
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    const unsub = dmSubscribeInbox(currentUser, convs => {
+      setUnreadDM(convs.filter(c=>c["unread_"+_safeKey(currentUser)]).length);
+    });
+    return () => unsub();
+  }, [currentUser]);
+
+  const navigate = (tab) => {
+    setNavHistory(h => [...h, activeTab]);
+    setActiveTab(tab);
+    setSidebarOpen(false);
+  };
+  const goBack = () => {
+    if (!navHistory.length) return;
+    setActiveTab(navHistory[navHistory.length-1]);
+    setNavHistory(h => h.slice(0,-1));
+  };
+
+  // My handouts (uploaded under my name)
+  const myHandouts = handouts.filter(h =>
+    h.lecturerName === (me.displayName || currentUser.split("@")[0]) ||
+    h.uploadedBy === currentUser
+  );
+
+  // My assignments
+  const myAssignments = assignments.filter(a => a.createdBy === currentUser);
+
+  // Classes I can teach (all classes for now — admin assigns)
+  const myClasses = classes;
+
+  const name = me.displayName || currentUser.split("@")[0];
+  const avatarChar = (me.avatar || name[0] || "?").toUpperCase();
+
+  const NAV_SECTIONS = [
+    {
+      label: "Main",
+      items: [
+        { key:"dashboard",   icon:"⊞",  label:"Dashboard" },
+        { key:"handouts",    icon:"📄",  label:"Upload Handouts" },
+        { key:"assignments", icon:"📝",  label:"Assignments",  badge: myAssignments.filter(a=>Date.now()<a.dueAt).length || null },
+        { key:"attendance",  icon:"📋",  label:"Attendance" },
+        { key:"timetable",   icon:"📅",  label:"Timetable" },
+        { key:"cbt",         icon:"🧪",  label:"CBT Exams" },
+        { key:"essay",       icon:"✍️",  label:"Essay Exams" },
+      ]
+    },
+    {
+      label: "Communication",
+      items: [
+        { key:"messages",       icon:"💬", label:"Messages",      badge: unreadDM||null },
+        { key:"study-groups",   icon:"👥", label:"Study Groups" },
+        { key:"notifications",  icon:"🔔", label:"Notifications", badge: unreadNotifs||null },
+        { key:"announcements",  icon:"📢", label:"Announcements" },
+      ]
+    },
+    {
+      label: "Students",
+      items: [
+        { key:"students",    icon:"🎓", label:"My Students" },
+        { key:"grades",      icon:"📊", label:"Gradebook" },
+        { key:"violations",  icon:"🚨", label:"Exam Violations" },
+      ]
+    },
+    {
+      label: "Account",
+      items: [
+        { key:"profile",     icon:"👤", label:"My Profile" },
+      ]
+    }
+  ];
+
+  const renderTab = () => {
+    switch(activeTab) {
+      case "dashboard":    return <LecturerDashboard currentUser={currentUser} toast={toast} me={me} myHandouts={myHandouts} myAssignments={myAssignments} myClasses={myClasses} onNavigate={navigate} />;
+      case "handouts":     return <Handouts selectedClass={null} toast={toast} currentUser={currentUser} isLecturer={true} />;
+      case "assignments":  return <Assignments currentUser={currentUser} toast={toast} isLecturer={true} />;
+      case "attendance":   return <AttendanceView currentUser={currentUser} toast={toast} isLecturer={true} />;
+      case "timetable":    return <Timetable currentUser={currentUser} toast={toast} isLecturer={true} />;
+      case "cbt":          return <CbtExamManager toast={toast} currentUser={currentUser} />;
+      case "essay":        return <AdminEssayExams toast={toast} />;
+      case "messages":     return <Messages user={currentUser} toast={toast} onUnreadChange={setUnreadDM} />;
+      case "study-groups": return <StudyGroups currentUser={currentUser} toast={toast} />;
+      case "notifications":return <Notifications currentUser={currentUser} onRead={()=>setUnreadNotifs(0)} />;
+      case "announcements":return <LecturerAnnouncements toast={toast} currentUser={currentUser} />;
+      case "students":     return <LecturerStudents currentUser={currentUser} toast={toast} classes={myClasses} />;
+      case "grades":       return <LecturerGradebook currentUser={currentUser} toast={toast} />;
+      case "violations":   return <LecturerViolations currentUser={currentUser} toast={toast} />;
+      case "profile":      return <StudentProfile currentUser={currentUser} toast={toast} />;
+      default:             return <LecturerDashboard currentUser={currentUser} toast={toast} me={me} myHandouts={myHandouts} myAssignments={myAssignments} myClasses={myClasses} onNavigate={navigate} />;
+    }
+  };
+
+  const tabLabel = NAV_SECTIONS.flatMap(s=>s.items).find(i=>i.key===activeTab)?.label || "Dashboard";
+
+  return (
+    <>
+      <style>{CSS}</style>
+      <div className="app-shell">
+        {/* Overlay for mobile */}
+        <div className={`sidebar-overlay${sidebarOpen?" open":""}`} onClick={()=>setSidebarOpen(false)} />
+
+        {/* ── LECTURER SIDEBAR ── */}
+        <div className={`lp-sidebar${sidebarOpen?" open":""}`}>
+          <div className="lp-head">
+            <div className="lp-logo">
+              <div className="lp-logo-icon">👨🏫</div>
+              <div>
+                <div className="lp-logo-name">Lecturer Panel</div>
+                <div className="lp-logo-name" style={{fontSize:11,opacity:.6}}>Nursing Academic Hub</div>
+              </div>
+            </div>
+            <div className="lp-badge">👨🏫 Lecturer</div>
+          </div>
+
+          <div style={{flex:1,overflowY:"auto",paddingBottom:8}}>
+            {NAV_SECTIONS.map(section => (
+              <div key={section.label}>
+                <div className="lp-nav-sec">{section.label}</div>
+                {section.items.map(item => (
+                  <div key={item.key} className={`lp-nav-item${activeTab===item.key?" active":""}`} onClick={()=>navigate(item.key)}>
+                    <span className="lp-nav-icon">{item.icon}</span>
+                    <span style={{flex:1}}>{item.label}</span>
+                    {item.badge > 0 && (
+                      <span style={{background:"var(--danger)",color:"white",borderRadius:"50%",width:18,height:18,fontSize:10,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,flexShrink:0}}>{item.badge>9?"9+":item.badge}</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ))}
+
+            {/* Sign out */}
+            <div className="lp-nav-sec">Session</div>
+            <div className="lp-nav-item" style={{color:"#f87171"}} onClick={onSignOut}>
+              <span className="lp-nav-icon">🚪</span>Sign Out
+            </div>
+          </div>
+
+          {/* Profile card */}
+          <div className="lp-profile-card" onClick={()=>navigate("profile")}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <div style={{width:36,height:36,borderRadius:"50%",background:"linear-gradient(135deg,#d97706,#f59e0b)",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:16,color:"#fff",flexShrink:0}}>{avatarChar}</div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontWeight:700,fontSize:12,color:"#fff",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{name}</div>
+                <div style={{fontSize:10,color:"rgba(255,255,255,.5)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{currentUser}</div>
+              </div>
+              <span style={{fontSize:12,color:"rgba(255,255,255,.4)"}}>›</span>
+            </div>
+          </div>
+        </div>
+
+        {/* ── MAIN AREA ── */}
+        <div className="lp-main">
+          <div className="lp-topbar">
+            <button className="hamburger" onClick={()=>setSidebarOpen(o=>!o)} style={{marginRight:4}}>☰</button>
+            {navHistory.length > 0 && (
+              <button className="btn btn-sm" style={{padding:"5px 10px",fontSize:13}} onClick={goBack}>← Back</button>
+            )}
+            <div className="lp-topbar-title">{tabLabel}</div>
+            {/* ── Control icons moved here ── */}
+            <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+              <div className="theme-btn" onClick={()=>setThemeMode(m=>m==="light"?"dark":m==="dark"?"dim":"light")} title="Toggle theme">
+                {themeMode==="light"?"🌙":themeMode==="dark"?"💙":"☀️"}
+              </div>
+              <div className="icon-btn" title={syncError?"Sync error — tap to retry":"Sync"}
+                onClick={()=>runSync().then(ok=>ok?toast("✅ Synced!","success"):toast("❌ Sync failed","error"))}
+                style={{opacity:syncing?.5:1,cursor:syncing?"wait":"pointer",position:"relative"}}>
+                <span style={{display:"inline-block",animation:syncing?"spin 1s linear infinite":"none"}}>{syncError?"⚠️":"🔄"}</span>
+                {syncError&&<span style={{position:"absolute",top:-3,right:-3,width:8,height:8,borderRadius:"50%",background:"var(--danger)"}}/>}
+              </div>
+              <div className="icon-btn" style={{position:"relative"}} onClick={()=>navigate("notifications")}>
+                🔔
+                {unreadNotifs>0&&<span style={{position:"absolute",top:-4,right:-4,background:"var(--danger)",color:"white",borderRadius:"50%",width:16,height:16,fontSize:9,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700}}>{unreadNotifs>9?"9+":unreadNotifs}</span>}
+              </div>
+              <div className="icon-btn" style={{position:"relative"}} onClick={()=>navigate("messages")}>
+                💬
+                {unreadDM>0&&<span style={{position:"absolute",top:-4,right:-4,background:"var(--accent)",color:"white",borderRadius:"50%",width:16,height:16,fontSize:9,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700}}>{unreadDM>9?"9+":unreadDM}</span>}
+              </div>
+              <div onClick={()=>navigate("profile")} title="My Profile"
+                style={{width:34,height:34,borderRadius:"50%",background:"linear-gradient(135deg,#d97706,#f59e0b)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,cursor:"pointer",border:`2px solid ${activeTab==="profile"?"white":"transparent"}`,flexShrink:0,fontWeight:800,color:"#fff"}}>
+                {avatarChar}
+              </div>
+            </div>
+          </div>
+          <div className="lp-content">{renderTab()}</div>
+        </div>
+      </div>
+      <Toasts list={[]} />
+    </>
+  );
+}
+
+// ── Lecturer Dashboard ─────────────────────────────────────────────
+function LecturerDashboard({ currentUser, toast, me, myHandouts, myAssignments, myClasses, onNavigate }) {
+  const allUsers = ls("nv-users", []);
+  const [handouts] = useSharedData("nv-handouts", []);
+
+  const totalStudents = allUsers.filter(u => u.role !== "admin" && u.role !== "lecturer").length;
+  const pendingGrades = (() => {
+    // Count submissions without grades across all my assignments
+    return 0; // placeholder — real count would need async load
+  })();
+
+  const recentHandouts = myHandouts.slice(-5).reverse();
+  const activeAssignments = myAssignments.filter(a => Date.now() < a.dueAt);
+  const overdueAssignments = myAssignments.filter(a => Date.now() > a.dueAt);
+
+  const greeting = () => { const h=new Date().getHours(); return h<12?"Good morning":h<17?"Good afternoon":"Good evening"; };
+
+  return (
+    <div style={{maxWidth:900,margin:"0 auto"}}>
+      {/* Welcome */}
+      <div style={{background:"linear-gradient(135deg,#d97706,#b45309)",borderRadius:18,padding:"24px 28px",marginBottom:24,color:"#fff",position:"relative",overflow:"hidden"}}>
+        <div style={{position:"absolute",top:-20,right:-20,fontSize:100,opacity:.08}}>👨🏫</div>
+        <div style={{fontSize:13,opacity:.8,marginBottom:4}}>{greeting()}</div>
+        <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:24,marginBottom:6}}>{me.displayName||currentUser.split("@")[0]}</div>
+        <div style={{fontSize:13,opacity:.8}}>You have {activeAssignments.length} active assignment{activeAssignments.length!==1?"s":""} • {myHandouts.length} handouts uploaded</div>
+      </div>
+
+      {/* Stats */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:12,marginBottom:24}}>
+        {[
+          {icon:"📄",label:"My Handouts",val:myHandouts.length,color:"var(--accent)",key:"handouts"},
+          {icon:"📝",label:"Assignments",val:myAssignments.length,color:"#d97706",key:"assignments"},
+          {icon:"🎓",label:"Students",val:totalStudents,color:"var(--success)",key:"students"},
+          {icon:"🏫",label:"Classes",val:myClasses.length,color:"var(--purple)",key:null},
+          {icon:"✅",label:"Active Tasks",val:activeAssignments.length,color:"var(--accent2)",key:"assignments"},
+        ].map(s=>(
+          <div key={s.label} className="lp-stat" onClick={s.key?()=>onNavigate(s.key):null} style={{cursor:s.key?"pointer":"default"}}>
+            <div style={{fontSize:26,marginBottom:6}}>{s.icon}</div>
+            <div style={{fontWeight:800,fontSize:24,color:s.color}}>{s.val}</div>
+            <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Quick actions */}
+      <div style={{marginBottom:24}}>
+        <div style={{fontWeight:800,fontSize:15,marginBottom:12}}>⚡ Quick Actions</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:10}}>
+          {[
+            {icon:"📄",label:"Upload Handout",sub:"Add notes for your class",key:"handouts",color:"var(--accent)"},
+            {icon:"📝",label:"Post Assignment",sub:"Set work for students",key:"assignments",color:"#d97706"},
+            {icon:"📋",label:"Mark Attendance",sub:"Record today's attendance",key:"attendance",color:"var(--success)"},
+            {icon:"🧪",label:"Create CBT Exam",sub:"Build a new exam",key:"cbt",color:"var(--purple)"},
+            {icon:"💬",label:"Send Message",sub:"Chat with a student",key:"messages",color:"var(--accent2)"},
+            {icon:"📢",label:"Post Announcement",sub:"Notify your class",key:"announcements",color:"#f59e0b"},
+          ].map(a=>(
+            <button key={a.key+a.label} className="lp-quick-btn" onClick={()=>onNavigate(a.key)}>
+              <div style={{width:38,height:38,borderRadius:10,background:`${a.color}18`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{a.icon}</div>
+              <div>
+                <div style={{fontWeight:700,fontSize:13,color:"var(--text)"}}>{a.label}</div>
+                <div style={{fontSize:11,color:"var(--text3)",fontWeight:400}}>{a.sub}</div>
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,flexWrap:"wrap"}}>
+        {/* Recent handouts */}
+        <div className="lp-card">
+          <div style={{fontWeight:800,marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span>📄 Recent Handouts</span>
+            <span onClick={()=>onNavigate("handouts")} style={{fontSize:11,color:"var(--accent)",cursor:"pointer",fontWeight:700}}>View all →</span>
+          </div>
+          {recentHandouts.length===0
+            ? <div style={{textAlign:"center",padding:"20px 0",color:"var(--text3)",fontSize:13}}>No handouts yet</div>
+            : recentHandouts.map(h=>(
+              <div key={h.id} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 0",borderBottom:"1px solid var(--border)"}}>
+                <span style={{fontSize:20}}>📄</span>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:700,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{h.title}</div>
+                  <div style={{fontSize:11,color:"var(--text3)"}}>{h.course} • {h.classId}</div>
+                </div>
+              </div>
+            ))
+          }
+        </div>
+
+        {/* Active assignments */}
+        <div className="lp-card">
+          <div style={{fontWeight:800,marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span>📝 Active Assignments</span>
+            <span onClick={()=>onNavigate("assignments")} style={{fontSize:11,color:"var(--accent)",cursor:"pointer",fontWeight:700}}>View all →</span>
+          </div>
+          {activeAssignments.length===0
+            ? <div style={{textAlign:"center",padding:"20px 0",color:"var(--text3)",fontSize:13}}>No active assignments</div>
+            : activeAssignments.slice(0,4).map(a=>(
+              <div key={a.id} style={{padding:"8px 0",borderBottom:"1px solid var(--border)"}}>
+                <div style={{fontWeight:700,fontSize:13}}>{a.title}</div>
+                <div style={{fontSize:11,color:"var(--warn)"}}>Due: {new Date(a.dueAt).toLocaleDateString()}</div>
+              </div>
+            ))
+          }
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Lecturer Announcements ─────────────────────────────────────────
+function LecturerAnnouncements({ toast, currentUser }) {
+  const [items, setItems] = useSharedData("nv-announcements", []);
+  const [showModal, setShowModal] = useState(false);
+  const [form, setForm] = useState({title:"",body:"",pinned:false});
+
+  const save = () => {
+    if (!form.title.trim()||!form.body.trim()) return toast("Fill in title and message","error");
+    const item = {...form, id:Date.now(), date:new Date().toLocaleDateString(), from:currentUser};
+    const u = [...items, item]; setItems(u); saveShared("announcements",u);
+    toast("Announcement posted ✅","success");
+    setShowModal(false); setForm({title:"",body:"",pinned:false});
+  };
+  const del = (id) => { if(!confirm("Delete this announcement?"))return; const u=items.filter(a=>a.id!==id); setItems(u); saveShared("announcements",u); toast("Deleted","success"); };
+
+  return (
+    <div style={{maxWidth:700,margin:"0 auto"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+        <div><div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20}}>📢 Announcements</div>
+          <div style={{color:"var(--text3)",fontSize:13}}>Post notices visible to all students</div></div>
+        <button onClick={()=>setShowModal(true)} style={{padding:"9px 18px",borderRadius:10,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700}}>+ Post</button>
+      </div>
+      {showModal&&(
+        <div style={{background:"var(--card)",border:"1.5px solid var(--accent)",borderRadius:14,padding:20,marginBottom:20}}>
+          <div style={{fontWeight:800,marginBottom:12}}>New Announcement</div>
+          <label className="lbl">Title</label>
+          <input className="inp" value={form.title} onChange={e=>setForm({...form,title:e.target.value})} placeholder="e.g. Class postponed" />
+          <label className="lbl">Message</label>
+          <textarea className="inp" rows={3} value={form.body} onChange={e=>setForm({...form,body:e.target.value})} placeholder="Full announcement…" style={{resize:"vertical"}} />
+          <label style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,cursor:"pointer",fontSize:13,fontWeight:700}}>
+            <input type="checkbox" checked={form.pinned} onChange={e=>setForm({...form,pinned:e.target.checked})} />
+            📌 Pin to dashboard
+          </label>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={save} style={{flex:1,padding:10,borderRadius:10,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700}}>Post</button>
+            <button onClick={()=>setShowModal(false)} style={{padding:"10px 18px",borderRadius:10,background:"var(--bg4)",color:"var(--text)",border:"1px solid var(--border)",cursor:"pointer",fontWeight:700}}>Cancel</button>
+          </div>
+        </div>
+      )}
+      {items.length===0&&<div style={{textAlign:"center",padding:60,color:"var(--text3)"}}><div style={{fontSize:48,marginBottom:12}}>📢</div><div style={{fontWeight:700}}>No announcements yet</div></div>}
+      {[...items].reverse().map(a=>(
+        <div key={a.id} className="lp-card">
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+            <div style={{flex:1}}>
+              <div style={{fontWeight:800,fontSize:14,marginBottom:4}}>{a.pinned?"📌 ":""}{a.title}</div>
+              <div style={{fontSize:13,color:"var(--text2)",lineHeight:1.6,marginBottom:8}}>{a.body}</div>
+              <div style={{fontSize:11,color:"var(--text3)"}}>{a.date}{a.from&&` • by ${a.from.split("@")[0]}`}</div>
+            </div>
+            {a.from===currentUser&&<button onClick={()=>del(a.id)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--danger)",marginLeft:12,fontSize:16,flexShrink:0}}>🗑️</button>}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Lecturer Students View ─────────────────────────────────────────
+function LecturerStudents({ currentUser, toast, classes }) {
+  const allUsers = ls("nv-users", []);
+  const students = allUsers.filter(u => u.role !== "admin" && u.role !== "lecturer");
+  const [selClass, setSelClass] = useState("");
+  const [search, setSearch] = useState("");
+
+  const filtered = students.filter(u => {
+    if (selClass && u.class !== selClass) return false;
+    if (search && !u.username.toLowerCase().includes(search.toLowerCase()) && !(u.displayName||"").toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  });
+
+  return (
+    <div style={{maxWidth:800,margin:"0 auto"}}>
+      <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20,marginBottom:4}}>🎓 Students</div>
+      <div style={{color:"var(--text3)",fontSize:13,marginBottom:20}}>{students.length} registered students</div>
+      <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap"}}>
+        <input className="inp" style={{flex:1,minWidth:180,marginBottom:0}} placeholder="Search name or email…" value={search} onChange={e=>setSearch(e.target.value)} />
+        <select className="inp" style={{width:"auto",minWidth:160,marginBottom:0}} value={selClass} onChange={e=>setSelClass(e.target.value)}>
+          <option value="">All classes</option>
+          {classes.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
+        </select>
+      </div>
+      {filtered.length===0&&<div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>No students found</div>}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:12}}>
+        {filtered.map(u=>{
+          const cls = classes.find(c=>c.id===u.class);
+          return (
+            <div key={u.username} className="lp-card" style={{padding:16}}>
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+                <div style={{width:38,height:38,borderRadius:"50%",background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,color:"#fff",fontSize:16,flexShrink:0}}>
+                  {(u.avatar||(u.displayName||u.username)[0]||"?").toUpperCase()}
+                </div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:700,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{u.displayName||u.username.split("@")[0]}</div>
+                  <div style={{fontSize:10,color:"var(--text3)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{u.username}</div>
+                </div>
+              </div>
+              <div style={{fontSize:11,color:"var(--accent)",fontWeight:700}}>🏫 {cls?.label||"No class"}</div>
+              <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>Joined: {u.joined||"—"}</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── Lecturer Gradebook ─────────────────────────────────────────────
+function LecturerGradebook({ currentUser, toast }) {
+  const [assignments, setAssignments] = useState([]);
+  const [selAsgn, setSelAsgn] = useState(null);
+  const [submissions, setSubmissions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [grading, setGrading] = useState(null);
+  const [gradeForm, setGradeForm] = useState({grade:"",feedback:""});
+  const allUsers = ls("nv-users",[]);
+
+  useEffect(()=>{
+    if(!_db){setLoading(false);return;}
+    const unsub = _db.collection("assignments")
+      .where("createdBy","==",currentUser)
+      .orderBy("dueAt","desc")
+      .onSnapshot(snap=>{setAssignments(snap.docs.map(d=>({id:d.id,...d.data()})));setLoading(false);}
+      ,()=>setLoading(false));
+    return ()=>unsub();
+  },[currentUser]);
+
+  useEffect(()=>{
+    if(!selAsgn)return;
+    asgLoadSubmissions(selAsgn.id).then(setSubmissions);
+  },[selAsgn?.id]);
+
+  const saveGrade = async () => {
+    if(!gradeForm.grade) return toast("Enter a grade","error");
+    const ok = await asgGrade(selAsgn.id, grading, +gradeForm.grade, gradeForm.feedback);
+    if(ok){toast("Graded ✅","success");asgLoadSubmissions(selAsgn.id).then(setSubmissions);setGrading(null);}
+    else toast("Failed","error");
+  };
+
+  if(loading) return <div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>Loading…</div>;
+
+  if(selAsgn) return (
+    <div style={{maxWidth:700,margin:"0 auto"}}>
+      <button onClick={()=>{setSelAsgn(null);setSubmissions([]);}} style={{background:"none",border:"none",cursor:"pointer",color:"var(--text3)",marginBottom:16,fontSize:13}}>← Back</button>
+      <div className="lp-card">
+        <div style={{fontWeight:800,fontSize:16,marginBottom:4}}>{selAsgn.title}</div>
+        <div style={{fontSize:12,color:"var(--text3)"}}>Due: {new Date(selAsgn.dueAt).toLocaleString()} • Max: {selAsgn.maxScore} pts • {submissions.length} submission{submissions.length!==1?"s":""}</div>
+      </div>
+      {submissions.length===0&&<div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>No submissions yet</div>}
+      {submissions.map(sub=>{
+        const u = allUsers.find(x=>x.username===sub.student);
+        return (
+          <div key={sub.student} className="lp-card">
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <div style={{fontWeight:700}}>{u?.displayName||sub.student.split("@")[0]}</div>
+              <div style={{fontSize:11,color:"var(--text3)"}}>{new Date(sub.submittedAt).toLocaleString()}</div>
+            </div>
+            <div style={{fontSize:12,color:"var(--text3)",marginBottom:8}}>📎 {sub.fileName}</div>
+            {sub.fileData&&<a href={sub.fileData} download={sub.fileName} style={{fontSize:12,color:"var(--accent)",textDecoration:"none",marginBottom:8,display:"inline-block"}}>⬇ Download</a>}
+            {sub.grade!=null
+              ? <div style={{background:"rgba(34,197,94,.1)",borderRadius:8,padding:"8px 12px",fontSize:13,fontWeight:700}}>✅ Graded: {sub.grade}/{selAsgn.maxScore}{sub.feedback&&` • ${sub.feedback}`}</div>
+              : grading===sub.student
+                ? <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:8}}>
+                    <input type="number" className="inp" style={{width:80,marginBottom:0}} placeholder="Score" value={gradeForm.grade} onChange={e=>setGradeForm({...gradeForm,grade:e.target.value})} />
+                    <input className="inp" style={{flex:1,marginBottom:0,minWidth:120}} placeholder="Feedback" value={gradeForm.feedback} onChange={e=>setGradeForm({...gradeForm,feedback:e.target.value})} />
+                    <button onClick={saveGrade} style={{padding:"9px 16px",borderRadius:9,background:"var(--success)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700}}>Save</button>
+                    <button onClick={()=>setGrading(null)} style={{padding:"9px 14px",borderRadius:9,background:"var(--bg4)",color:"var(--text)",border:"1px solid var(--border)",cursor:"pointer"}}>✕</button>
+                  </div>
+                : <button onClick={()=>{setGrading(sub.student);setGradeForm({grade:"",feedback:""}); }} style={{padding:"7px 14px",borderRadius:9,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700,fontSize:12}}>Grade</button>
+            }
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  return (
+    <div style={{maxWidth:700,margin:"0 auto"}}>
+      <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20,marginBottom:4}}>📊 Gradebook</div>
+      <div style={{color:"var(--text3)",fontSize:13,marginBottom:20}}>Click an assignment to grade submissions</div>
+      {assignments.length===0&&<div style={{textAlign:"center",padding:60,color:"var(--text3)"}}><div style={{fontSize:48,marginBottom:12}}>📊</div><div style={{fontWeight:700}}>No assignments posted yet</div></div>}
+      {assignments.map(a=>{
+        const overdue = Date.now()>a.dueAt;
+        return (
+          <div key={a.id} className="lp-card" style={{cursor:"pointer"}} onClick={()=>setSelAsgn(a)}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+              <div style={{fontWeight:800,fontSize:14,flex:1}}>{a.title}</div>
+              <span style={{fontSize:11,fontWeight:700,padding:"3px 8px",borderRadius:12,background:overdue?"rgba(239,68,68,.1)":"rgba(34,197,94,.1)",color:overdue?"var(--danger)":"var(--success)",flexShrink:0,marginLeft:10}}>{overdue?"Closed":"Open"}</span>
+            </div>
+            <div style={{fontSize:12,color:"var(--text3)",marginTop:4}}>Due: {new Date(a.dueAt).toLocaleString()} • Max: {a.maxScore} pts</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Lecturer Violations View ───────────────────────────────────────
+function LecturerViolations({ currentUser, toast }) {
+  const [violations, setViolations] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const allUsers = ls("nv-users",[]);
+
+  useEffect(()=>{ cbtViolationsGet().then(v=>{ setViolations(v||[]); setLoading(false); }).catch(()=>setLoading(false)); },[]);
+
+  const clearOne = async (examId,student) => {
+    if(!confirm("Clear this violation record?"))return;
+    const updated = violations.filter(v=>!(v.examId===examId&&v.student===student));
+    await cbtViolationsSave(updated);
+    setViolations(updated);
+    toast("Cleared","success");
+  };
+
+  if(loading) return <div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>Loading…</div>;
+
+  return (
+    <div style={{maxWidth:700,margin:"0 auto"}}>
+      <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20,marginBottom:4}}>🚨 Exam Violations</div>
+      <div style={{color:"var(--text3)",fontSize:13,marginBottom:20}}>Students flagged during CBT exams</div>
+      {violations.length===0&&<div style={{textAlign:"center",padding:60,color:"var(--text3)"}}><div style={{fontSize:48,marginBottom:12}}>✅</div><div style={{fontWeight:700}}>No violations recorded</div></div>}
+      {violations.map((v,i)=>{
+        const u = allUsers.find(x=>x.username===v.student);
+        return (
+          <div key={i} className="lp-card" style={{borderColor:"rgba(239,68,68,.3)"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+              <div>
+                <div style={{fontWeight:800,fontSize:14,marginBottom:4,color:"var(--danger)"}}>🚨 {u?.displayName||v.student?.split("@")[0]||v.student}</div>
+                <div style={{fontSize:12,color:"var(--text3)",marginBottom:4}}>Exam: {v.examTitle||v.examId}</div>
+                {v.tabSwitches>0&&<div style={{fontSize:12,color:"var(--warn)"}}>⚠️ Tab switches: {v.tabSwitches}</div>}
+                {v.fullscreenExits>0&&<div style={{fontSize:12,color:"var(--warn)"}}>⚠️ Fullscreen exits: {v.fullscreenExits}</div>}
+                <div style={{fontSize:11,color:"var(--text3)",marginTop:4}}>{v.flaggedAt?new Date(v.flaggedAt).toLocaleString():""}</div>
+              </div>
+              <button onClick={()=>clearOne(v.examId,v.student)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--danger)",fontSize:16,flexShrink:0}}>🗑️</button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+
 export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState(false); // true if storage unavailable
@@ -11439,8 +13487,8 @@ export default function App() {
     // ── PWA: register service worker (with push notification support) ──
     if ("serviceWorker" in navigator) {
       const swCode = `
-const CACHE='nursing-hub-v2';
-const URLS=['/'];
+const CACHE='nursing-hub-v3';
+const URLS=['/','/?offline=1'];
 self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(URLS).catch(()=>{}))));
 self.addEventListener('fetch',e=>{
   if(e.request.method!=='GET')return;
@@ -11498,7 +13546,7 @@ self.addEventListener('notificationclick',e=>{
   const [authTab, setAuthTab] = useState("signin");
   const [loginType, setLoginType] = useState("student"); // "student" | "admin"
   const [username, setUsername] = useState(""); const [password, setPassword] = useState(""); const [showPw, setShowPw] = useState(false);
-  const [regUser, setRegUser] = useState(""); const [regPw, setRegPw] = useState(""); const [regClass, setRegClass] = useState("");
+  const [regUser, setRegUser] = useState(""); const [regPw, setRegPw] = useState(""); const [regClass, setRegClass] = useState(""); const [regName, setRegName] = useState(""); const [regMatric, setRegMatric] = useState("");
   const [activeNav, setActiveNav] = useState("dashboard"); const [activeTool, setActiveTool] = useState(null);
   const [themeMode, setThemeMode] = useState("light"); const [sidebarOpen, setSidebarOpen] = useState(false);
   const [toasts, setToasts] = useState([]); const [currentUser, setCurrentUser] = useState(""); const [isAdmin, setIsAdmin] = useState(false);
@@ -11674,6 +13722,7 @@ self.addEventListener('notificationclick',e=>{
     if (localUser) {
       // Instant login from cache
       if (loginType === "admin" && localUser.role !== "admin") return toast("Not an admin account", "error");
+    window.__currentUser = localUser.username;
       setCurrentUserRef(username); setCurrentUser(username);
       setIsAdmin(localUser.role === "admin"); setIsLecturer(localUser.role === "lecturer");
       setPage("app");
@@ -11711,17 +13760,19 @@ self.addEventListener('notificationclick',e=>{
   };
 
   const register = () => {
+    if (!regName.trim()) return toast("Enter your full name", "error");
     if (!regUser || !regPw) return toast("Fill in all fields", "error");
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(regUser)) return toast("Enter a valid email address", "error");
+    if (!regMatric.trim()) return toast("Enter your matric number", "error");
     const users = ls("nv-users", []);
     if (users.find(u => u.username === regUser)) return toast("Email already registered", "error");
-    const displayName = regUser.split("@")[0];
-    const newUsers = [...users, { username: regUser, password: regPw, role: "student", class: regClass, displayName, joined: new Date().toLocaleDateString() }];
+    if (users.find(u => u.matricNumber && u.matricNumber.toLowerCase() === regMatric.trim().toLowerCase())) return toast("Matric number already registered", "error");
+    const newUsers = [...users, { username: regUser, password: regPw, role: "student", class: regClass, displayName: regName.trim(), matricNumber: regMatric.trim().toUpperCase(), joined: new Date().toLocaleDateString() }];
     saveShared("users", newUsers);
     setCurrentUserRef(regUser); setCurrentUser(regUser);
     setIsAdmin(false); setIsLecturer(false);
     setPage("app");
-    toast(`Welcome! 🎉`, "success");
+    toast(`Welcome, ${regName.trim().split(" ")[0]}! 🎉`, "success");
     saveCredential(regUser, regPw);
   };
 
@@ -11771,6 +13822,12 @@ self.addEventListener('notificationclick',e=>{
       case "study-timer": return <StudyTimer />;
       case "analytics": return <PerformanceAnalytics currentUser={currentUser} />;
       case "flashcards": return <FlashcardSystem currentUser={currentUser} />;
+      case "study-groups": return <StudyGroups currentUser={currentUser} toast={toast} />;
+      case "timetable": return <Timetable currentUser={currentUser} toast={toast} isLecturer={isLecturer||isAdmin} />;
+      case "assignments": return <Assignments currentUser={currentUser} toast={toast} isLecturer={isLecturer||isAdmin} />;
+      case "attendance": return <AttendanceView currentUser={currentUser} toast={toast} isLecturer={isLecturer||isAdmin} />;
+      case "leaderboard": return <LeaderboardStreaks currentUser={currentUser} />;
+      case "progress": return <ProgressDashboard currentUser={currentUser} />;
       default: return <Dashboard user={currentUser} onNavigate={navigate} />;
     }
   };
@@ -11783,11 +13840,17 @@ self.addEventListener('notificationclick',e=>{
     { icon:"🏫", label:"School Past Questions", key:"questions" },
     { icon:"🔔", label:"Notifications", key:"notifications" },
     { icon:"💬", label:"Messages", key:"messages" },
+    { icon:"👥", label:"Study Groups", key:"study-groups" },
+    { icon:"📅", label:"Timetable", key:"timetable" },
+    { icon:"📝", label:"Assignments", key:"assignments" },
+    { icon:"📋", label:"Attendance", key:"attendance" },
     { icon:"👤", label:"My Profile", key:"profile" },
   ];
   const STUDY_TOOLS = [
     { icon:"⏱️", label:"Study Timer", key:"study-timer" },
+    { icon:"📈", label:"My Progress", key:"progress" },
     { icon:"📊", label:"My Analytics", key:"analytics" },
+    { icon:"🏆", label:"Leaderboard", key:"leaderboard" },
     { icon:"🃏", label:"Flashcards", key:"flashcards" },
     { icon:"💳", label:"Payment History", key:"payment-history" },
   ];
@@ -11894,6 +13957,10 @@ self.addEventListener('notificationclick',e=>{
                   </>
                 ) : (
                   <>
+                    <label className="lbl">Full Name</label>
+                    <input className="inp" type="text" placeholder="e.g. Adaeze Okonkwo" value={regName} onChange={e=>setRegName(e.target.value)} />
+                    <label className="lbl">Matric Number</label>
+                    <input className="inp" type="text" placeholder="e.g. NRS/2021/001" value={regMatric} onChange={e=>setRegMatric(e.target.value.toUpperCase())} />
                     <label className="lbl">Email</label>
                     <input className="inp" type="email" placeholder="Enter your email" value={regUser} onChange={e=>setRegUser(e.target.value)} />
                     <label className="lbl">Password</label>
@@ -11924,6 +13991,22 @@ self.addEventListener('notificationclick',e=>{
     />;
   }
 
+  // ── LECTURER gets their own dedicated panel ──
+  if (page === "app" && isLecturer && !isAdmin) {
+    return (
+      <LecturerPanel
+        currentUser={currentUser}
+        toast={toast}
+        themeMode={themeMode}
+        setThemeMode={setThemeMode}
+        runSync={runSync}
+        syncing={syncing}
+        syncError={syncError}
+        onSignOut={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);}}
+      />
+    );
+  }
+
   return (
     <>
       <style>{CSS}</style>
@@ -11934,6 +14017,7 @@ self.addEventListener('notificationclick',e=>{
             <div className="sidebar-logo-icon">🏥</div>
             <div className="sidebar-logo-name">Nursing Academic Hub</div>
             {isAdmin&&<span className="admin-badge-side">🛡️ Admin</span>}
+          {isLecturer&&!isAdmin&&<span className="admin-badge-side" style={{background:"rgba(217,119,6,.25)",border:"1px solid rgba(217,119,6,.5)",color:"#fbbf24"}}>👨🏫 Lecturer</span>}
           </div>
 
           {isAdmin&&(
@@ -12052,7 +14136,7 @@ self.addEventListener('notificationclick',e=>{
                     {currentUser}
                   </div>
                   <div style={{fontSize:10,marginTop:2,color:"var(--accent)",fontWeight:700}}>
-                    {(()=>{const me=ls("nv-users",[]).find(u=>u.username===currentUser);const cls=ls("nv-classes",DEFAULT_CLASSES).find(c=>c.id===me?.class);return cls?`🏫 ${cls.label}`:isAdmin?"🛡️ Admin":isLecturer?"👨‍🏫 Lecturer":"🎓 Student";})()}
+                    {(()=>{const me=ls("nv-users",[]).find(u=>u.username===currentUser);const cls=ls("nv-classes",DEFAULT_CLASSES).find(c=>c.id===me?.class);return isAdmin?"🛡️ Admin":isLecturer?"👨🏫 Lecturer — All Classes":cls?`🏫 ${cls.label}`:"🎓 Student";})()}
                   </div>
                 </div>
                 <div style={{fontSize:14,color:"var(--text3)",flexShrink:0}}>›</div>
@@ -12074,7 +14158,7 @@ self.addEventListener('notificationclick',e=>{
                 {activeNav!=="admin"&&" 👋"}
               </div>
               {isAdmin&&activeNav!=="admin"&&<span className="tag tag-purple" style={{fontSize:10}}>🛡️ Admin</span>}
-              {isLecturer&&!isAdmin&&<span className="tag" style={{fontSize:10,borderColor:"var(--accent2)",color:"var(--accent2)"}}>👨‍🏫 Lecturer</span>}
+              {isLecturer&&!isAdmin&&<span className="tag" style={{fontSize:10,borderColor:"var(--accent2)",color:"var(--accent2)"}}>👨🏫 Lecturer</span>}
             </div>
             <div className="topbar-right">
               <button className="nc-toggle-btn" onClick={switchToNursing} title="Switch to Nursing Council Exam Site">
@@ -12104,3 +14188,4 @@ self.addEventListener('notificationclick',e=>{
     </>
   );
 }
+
