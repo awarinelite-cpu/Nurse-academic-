@@ -3313,6 +3313,7 @@ function HandoutViewModal({ item, onClose }) {
           {item.course&&<span className="tag tag-accent">{item.course}</span>}
           {item.lecturerName&&<span className="tag" style={{borderColor:"var(--purple)",color:"var(--purple)"}}>{item.lecturerName}</span>}
           {(item.pdfName||item.hasPdf)&&<span className="tag" style={{borderColor:"var(--danger)",color:"var(--danger)"}}>PDF</span>}
+          {item.hasDriveLink&&<span className="tag" style={{borderColor:"#1a73e8",color:"#1a73e8"}}>📂 Google Drive</span>}
           <div style={{fontSize:10,color:"var(--text3)",fontFamily:"monospace",marginLeft:"auto"}}>
             Added {item.date}{item.uploadedBy&&` by ${item.uploadedBy.split("@")[0]}`}
           </div>
@@ -3337,6 +3338,19 @@ function HandoutViewModal({ item, onClose }) {
               Could not load PDF. It may not have synced yet — try refreshing.
             </div>
           )
+        ) : item.hasDriveLink ? (
+          <div style={{textAlign:"center",padding:"30px 20px"}}>
+            <div style={{fontSize:40,marginBottom:12}}>📂</div>
+            <div style={{fontWeight:800,fontSize:16,marginBottom:6,color:"var(--text)"}}>Files on Google Drive</div>
+            <div style={{color:"var(--text3)",fontSize:13,marginBottom:20}}>Click the button below to open and view all handout files.</div>
+            <a href={item.driveLink} target="_blank" rel="noopener noreferrer"
+              style={{display:"inline-flex",alignItems:"center",gap:10,padding:"12px 24px",background:"#1a73e8",color:"#fff",borderRadius:10,fontWeight:800,fontSize:14,textDecoration:"none",boxShadow:"0 3px 12px rgba(26,115,232,.4)",transition:"opacity .2s"}}
+              onMouseEnter={e=>e.currentTarget.style.opacity=".85"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}
+              onClick={e=>e.stopPropagation()}>
+              <svg width="20" height="20" viewBox="0 0 87.3 78" xmlns="http://www.w3.org/2000/svg"><path d="m6.6 66.85 3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8h-27.5c0 1.55.4 3.1 1.2 4.5z" fill="#0066da"/><path d="m43.65 25-13.75-23.8c-1.35.8-2.5 1.9-3.3 3.3l-25.4 44a9.06 9.06 0 0 0 -1.2 4.5h27.5z" fill="#00ac47"/><path d="m73.55 76.8c1.35-.8 2.5-1.9 3.3-3.3l1.6-2.75 7.65-13.25c.8-1.4 1.2-2.95 1.2-4.5h-27.502l5.852 11.5z" fill="#ea4335"/><path d="m43.65 25 13.75-23.8c-1.35-.8-2.9-1.2-4.5-1.2h-18.5c-1.6 0-3.15.45-4.5 1.2z" fill="#00832d"/><path d="m59.8 53h-32.3l-13.75 23.8c1.35.8 2.9 1.2 4.5 1.2h50.8c1.6 0 3.15-.45 4.5-1.2z" fill="#2684fc"/><path d="m73.4 26.5-12.7-22c-.8-1.4-1.95-2.5-3.3-3.3l-13.75 23.8 16.15 28h27.45c0-1.55-.4-3.1-1.2-4.5z" fill="#ffba00"/></svg>
+              Open in Google Drive
+            </a>
+          </div>
         ) : (
           <div style={{maxHeight:"65vh",overflowY:"auto",padding:"4px 0"}}>
             <div style={{fontSize:14,lineHeight:1.9,color:"var(--text2)",whiteSpace:"pre-wrap"}}>{item.note||"No content."}</div>
@@ -3457,7 +3471,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
     const notif = {
       id: Date.now(), type:"handout",
       title:`New handout: ${item.title}`,
-      body:`${item.lecturerName||currentUser.split("@")[0]} uploaded ${item.pdfName?"a PDF ":"notes "}for ${item.course||"your class"}`,
+      body:`${item.lecturerName||currentUser.split("@")[0]} uploaded ${item.hasDriveLink?"Google Drive files ":item.pdfName?"a PDF ":"notes "}for ${item.course||"your class"}`,
       from: currentUser, date: new Date().toLocaleDateString(),
       time: new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),
       read: false, handoutId: item.id,
@@ -3481,6 +3495,8 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
     if (!form.course) return toast("Select a course","error");
     if (!form.lecturerName.trim()) return toast("Enter lecturer name","error");
     if (form.uploadType==="pdf" && !pdfFile) return toast("Select a PDF file","error");
+    if (form.uploadType==="drive" && !form.driveLink?.trim()) return toast("Paste a Google Drive link","error");
+    if (form.uploadType==="drive" && !form.driveLink.includes("drive.google.com")) return toast("That doesn't look like a Google Drive link","error");
 
     const itemId = Date.now();
     // Store PDF data SEPARATELY under its own key (not in the handouts array)
@@ -3497,7 +3513,8 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
       classId: form.classId, course: form.course, lecturerName: form.lecturerName,
       date: new Date().toLocaleDateString(), uploadedBy: currentUser,
       // Only store filename in the array, not the full base64 data
-      ...(form.uploadType==="pdf" ? {hasPdf:true, pdfName, pdfKey:`handout-pdf:${itemId}`} : {})
+      ...(form.uploadType==="pdf" ? {hasPdf:true, pdfName, pdfKey:`handout-pdf:${itemId}`} : {}),
+      ...(form.uploadType==="drive" ? {hasDriveLink:true, driveLink:form.driveLink.trim()} : {})
     };
     const u=[...handouts,item]; setHandouts(u);
     const ok = await saveShared("handouts", u);
@@ -3507,7 +3524,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
       toast("Handout published! Students notified. ✅","success");
     }
     pushNotification(item);
-    setForm({title:"",note:"",classId:drillClass||"",course:drillCourse||"",lecturerName:"",uploadType:"text"});
+    setForm({title:"",note:"",classId:drillClass||"",course:drillCourse||"",lecturerName:"",uploadType:"text",driveLink:""});
     setPdfFile(null); setPdfName(""); setShowAdd(false);
     if (!drillClass) setDrillClass(item.classId);
   };
@@ -3618,10 +3635,10 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
             </div>
           </div>
           {/* Content type */}
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
-            {["text","pdf"].map(t=>(
-              <div key={t} onClick={()=>setForm({...form,uploadType:t})} style={{padding:"10px",border:`1px solid ${form.uploadType===t?"var(--accent)":"var(--border)"}`,borderRadius:9,cursor:"pointer",textAlign:"center",background:form.uploadType===t?"rgba(0,119,182,.10)":"transparent",fontSize:13,color:form.uploadType===t?"var(--accent)":"var(--text3)",transition:"all .2s"}}>
-                {t==="text"?"📝 Text Notes":"📄 PDF File"}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:12}}>
+            {["text","pdf","drive"].map(t=>(
+              <div key={t} onClick={()=>setForm({...form,uploadType:t})} style={{padding:"10px",border:`1px solid ${form.uploadType===t?(t==="drive"?"#1a73e8":"var(--accent)"):"var(--border)"}`,borderRadius:9,cursor:"pointer",textAlign:"center",background:form.uploadType===t?(t==="drive"?"rgba(26,115,232,.10)":"rgba(0,119,182,.10)"):"transparent",fontSize:13,color:form.uploadType===t?(t==="drive"?"#1a73e8":"var(--accent)"):"var(--text3)",transition:"all .2s"}}>
+                {t==="text"?"📝 Text Notes":t==="pdf"?"📄 PDF File":"🔗 Google Drive"}
               </div>
             ))}
           </div>
@@ -3630,7 +3647,7 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
               <label className="lbl">Content</label>
               <textarea className="inp" rows={4} style={{resize:"vertical",marginBottom:0}} placeholder="Paste or type notes..." value={form.note} onChange={e=>setForm({...form,note:e.target.value})} />
             </div>
-          ) : (
+          ) : form.uploadType==="pdf" ? (
             <div style={{marginBottom:12}}>
               <label className="lbl">PDF File (max 10MB)</label>
               <label style={{display:"flex",alignItems:"center",gap:10,padding:"12px 14px",border:"2px dashed var(--border2)",borderRadius:10,cursor:"pointer",background:"var(--bg4)"}}>
@@ -3639,10 +3656,32 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
                 <input type="file" accept=".pdf" style={{display:"none"}} onChange={handlePdfChange} />
               </label>
             </div>
+          ) : (
+            /* ── Google Drive Panel ── */
+            <div style={{marginBottom:12}}>
+              <label className="lbl">Google Drive Link</label>
+              <input className="inp" style={{marginBottom:8}} placeholder="Paste Google Drive folder or file link here..."
+                value={form.driveLink||""} onChange={e=>setForm({...form,driveLink:e.target.value})} />
+              <a href="https://drive.google.com" target="_blank" rel="noopener noreferrer"
+                style={{display:"inline-flex",alignItems:"center",gap:8,padding:"9px 16px",background:"#1a73e8",color:"#fff",borderRadius:9,fontWeight:700,fontSize:13,textDecoration:"none",marginBottom:12,boxShadow:"0 2px 8px rgba(26,115,232,.35)",transition:"opacity .2s"}}
+                onMouseEnter={e=>e.currentTarget.style.opacity=".85"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>
+                <svg width="18" height="18" viewBox="0 0 87.3 78" xmlns="http://www.w3.org/2000/svg"><path d="m6.6 66.85 3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8h-27.5c0 1.55.4 3.1 1.2 4.5z" fill="#0066da"/><path d="m43.65 25-13.75-23.8c-1.35.8-2.5 1.9-3.3 3.3l-25.4 44a9.06 9.06 0 0 0 -1.2 4.5h27.5z" fill="#00ac47"/><path d="m73.55 76.8c1.35-.8 2.5-1.9 3.3-3.3l1.6-2.75 7.65-13.25c.8-1.4 1.2-2.95 1.2-4.5h-27.502l5.852 11.5z" fill="#ea4335"/><path d="m43.65 25 13.75-23.8c-1.35-.8-2.9-1.2-4.5-1.2h-18.5c-1.6 0-3.15.45-4.5 1.2z" fill="#00832d"/><path d="m59.8 53h-32.3l-13.75 23.8c1.35.8 2.9 1.2 4.5 1.2h50.8c1.6 0 3.15-.45 4.5-1.2z" fill="#2684fc"/><path d="m73.4 26.5-12.7-22c-.8-1.4-1.95-2.5-3.3-3.3l-13.75 23.8 16.15 28h27.45c0-1.55-.4-3.1-1.2-4.5z" fill="#ffba00"/></svg>
+                Open Google Drive
+              </a>
+              <div style={{background:"rgba(26,115,232,.07)",border:"1px solid rgba(26,115,232,.2)",borderRadius:10,padding:"12px 14px",fontSize:12,color:"var(--text2)",lineHeight:1.7}}>
+                <div style={{fontWeight:800,fontSize:13,color:"#1a73e8",marginBottom:6}}>📋 How to add handouts from Google Drive</div>
+                <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                  <div><b>📁 Add a whole folder:</b> Open the folder in Drive → right-click → <i>Share</i> → set to <i>"Anyone with the link"</i> → copy &amp; paste the link above.</div>
+                  <div><b>📄 Add a single file:</b> Right-click the file in Drive → <i>Share</i> → <i>"Anyone with the link"</i> → copy &amp; paste the link above.</div>
+                  <div><b>🗂️ Add multiple files:</b> Select files in Drive holding <b>Ctrl/⌘</b> → right-click → <i>Share</i> → or move them into one folder first and share that folder.</div>
+                  <div style={{marginTop:4,color:"var(--text3)"}}>💡 <i>Tip: Create one Drive folder per course — paste that folder link so students always see your latest files automatically.</i></div>
+                </div>
+              </div>
+            </div>
           )}
           <div style={{display:"flex",gap:8}}>
             <button className="btn btn-accent" onClick={save}>📤 Publish & Notify Students</button>
-            <button className="btn" onClick={()=>{setShowAdd(false);setForm({title:"",note:"",classId:drillClass||"",course:drillCourse||"",lecturerName:"",uploadType:"text"});setPdfFile(null);setPdfName("");}}>Cancel</button>
+            <button className="btn" onClick={()=>{setShowAdd(false);setForm({title:"",note:"",classId:drillClass||"",course:drillCourse||"",lecturerName:"",uploadType:"text",driveLink:""});setPdfFile(null);setPdfName("");}}>Cancel</button>
           </div>
         </div>
       )}
