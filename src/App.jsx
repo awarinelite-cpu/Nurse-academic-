@@ -12776,6 +12776,50 @@ function ResearchRequestPage({ currentUser, toast }) {
           {(() => {
             // Always pull live data so admin quote shows up immediately
             const live = requests.find(r => r.id === selected.id) || selected;
+
+            const payWithPaystack = async () => {
+              try {
+                await loadPaystack();
+                const amountKobo = Math.round(Number(live.price) * 100);
+                const handler = window.PaystackPop.setup({
+                  key:      PAYSTACK_PUBLIC_KEY,
+                  email:    currentUser,
+                  amount:   amountKobo,
+                  currency: "NGN",
+                  ref:      `RR-${live.id}-${Date.now()}`,
+                  metadata: {
+                    name: me.displayName || currentUser.split("@")[0],
+                    custom_fields:[
+                      {display_name:"Research Topic", variable_name:"topic", value:live.topic},
+                      {display_name:"Student", variable_name:"student", value:live.studentName||currentUser},
+                    ]
+                  },
+                  onClose: () => {},
+                  callback: async (response) => {
+                    // Payment successful — mark as paid + accepted
+                    const updated = {
+                      ...live,
+                      status: "accepted",
+                      paid: true,
+                      paymentRef: response.reference,
+                      paymentAmount: Number(live.price),
+                      paidAt: Date.now(),
+                      acceptedAt: Date.now(),
+                    };
+                    const ok = await rrSave(updated);
+                    if (ok) {
+                      toast("🎉 Payment successful! Admin will begin your project.", "success");
+                    } else {
+                      toast("Payment received but status update failed — contact admin with ref: " + response.reference, "warning");
+                    }
+                  },
+                });
+                handler.openIframe();
+              } catch(e) {
+                toast("Payment error: " + (e?.message || "Unknown error"), "error");
+              }
+            };
+
             return (<>
               {/* Quote section — shown as soon as admin sets a price */}
               {live.price ? (
@@ -12796,17 +12840,41 @@ function ResearchRequestPage({ currentUser, toast }) {
                       💬 <b>Message from Admin:</b> {live.adminNote}
                     </div>
                   )}
+                  {/* Payment status badge if already paid */}
+                  {live.paid && (
+                    <div style={{
+                      background:"rgba(34,197,94,.1)",border:"1px solid rgba(34,197,94,.3)",
+                      borderRadius:10,padding:"8px 14px",marginBottom:10,
+                      fontSize:12,color:"var(--success)",fontWeight:700,
+                      display:"flex",alignItems:"center",gap:6
+                    }}>
+                      ✅ Payment confirmed · Ref: {live.paymentRef}
+                    </div>
+                  )}
                   {live.status === "quoted" && (
-                    <div style={{display:"flex",gap:10,marginTop:14,flexWrap:"wrap"}}>
-                      <button
-                        onClick={()=>acceptQuote(live)}
-                        disabled={accepting}
-                        style={{flex:1,padding:"12px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14}}
-                      >{accepting?"⏳ Accepting…":"✅ Accept Quote"}</button>
+                    <div style={{display:"flex",flexDirection:"column",gap:10,marginTop:14}}>
+                      {/* Paystack pay button */}
+                      <div
+                        onClick={payWithPaystack}
+                        style={{
+                          display:"flex",alignItems:"center",justifyContent:"center",gap:12,
+                          padding:"14px 20px",borderRadius:12,cursor:"pointer",
+                          background:"linear-gradient(135deg,#0ba4db,#0077a8)",
+                          boxShadow:"0 2px 8px rgba(11,164,219,.25)",transition:"transform .15s,box-shadow .15s"
+                        }}
+                        onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 6px 18px rgba(11,164,219,.35)";}}
+                        onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 2px 8px rgba(11,164,219,.25)";}}>
+                        <div style={{width:38,height:38,borderRadius:"50%",background:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:10,color:"#0ba4db",flexShrink:0}}>PSK</div>
+                        <div>
+                          <div style={{color:"white",fontWeight:800,fontSize:14}}>Pay ₦{Number(live.price).toLocaleString()} with Paystack</div>
+                          <div style={{color:"rgba(255,255,255,.8)",fontSize:11}}>Secure card payment · Instant confirmation</div>
+                        </div>
+                      </div>
+                      {/* Decline */}
                       <button
                         onClick={()=>declineQuote(live)}
-                        style={{padding:"12px 20px",borderRadius:10,background:"rgba(239,68,68,.1)",color:"var(--danger)",border:"1px solid rgba(239,68,68,.3)",cursor:"pointer",fontWeight:700}}
-                      >❌ Decline</button>
+                        style={{width:"100%",padding:"11px",borderRadius:10,background:"rgba(239,68,68,.07)",color:"var(--danger)",border:"1px solid rgba(239,68,68,.25)",cursor:"pointer",fontWeight:700,fontSize:13}}
+                      >❌ Decline Request</button>
                     </div>
                   )}
                 </div>
@@ -12961,11 +13029,12 @@ function ResearchRequestPage({ currentUser, toast }) {
                   <span style={{fontSize:11,color:"var(--text3)"}}>{new Date(req.createdAt).toLocaleDateString()}</span>
                   {req.deadline&&<span style={{fontSize:11,color:"var(--text3)"}}>· Due {new Date(req.deadline).toLocaleDateString()}</span>}
                   {req.price&&<span style={{fontSize:12,fontWeight:800,color:"#f59e0b"}}>₦{Number(req.price).toLocaleString()}</span>}
+                  {req.paid&&<span style={{fontSize:11,fontWeight:800,color:"var(--success)"}}>💳 Paid</span>}
                 </div>
               </div>
               <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:6}}>
                 <span style={{background:s.bg,color:s.color,border:`1px solid ${s.color}44`,borderRadius:20,padding:"3px 10px",fontSize:11,fontWeight:800}}>{s.icon} {s.label}</span>
-                {req.status==="quoted"&&<span style={{fontSize:11,color:"#3b82f6",fontWeight:700}}>Tap to review quote →</span>}
+                {req.status==="quoted"&&!req.paid&&<span style={{fontSize:11,color:"#0ba4db",fontWeight:700}}>💳 Tap to pay →</span>}
                 {req.status==="completed"&&req.projectFile&&<span style={{fontSize:11,color:"var(--success)",fontWeight:700}}>📥 Ready to download</span>}
               </div>
             </div>
@@ -13091,6 +13160,24 @@ function AdminResearchRequests({ toast }) {
             )}
           </div>
 
+          {/* Payment status — shown to admin */}
+          {live.paid && (
+            <div style={{
+              background:"rgba(34,197,94,.08)",border:"1.5px solid rgba(34,197,94,.3)",
+              borderRadius:12,padding:"12px 16px",marginBottom:16,
+              display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"
+            }}>
+              <div style={{fontSize:20}}>💳</div>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:800,fontSize:13,color:"var(--success)"}}>Payment Confirmed via Paystack</div>
+                <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>
+                  ₦{Number(live.paymentAmount||live.price).toLocaleString()} · Ref: <b style={{color:"var(--text)"}}>{live.paymentRef}</b> · {live.paidAt?new Date(live.paidAt).toLocaleString():""}
+                </div>
+              </div>
+              <span style={{background:"rgba(34,197,94,.15)",color:"var(--success)",borderRadius:20,padding:"3px 10px",fontSize:11,fontWeight:800}}>✅ PAID</span>
+            </div>
+          )}
+
           {/* Quote form — show if still pending */}
           {(live.status==="pending"||live.status==="quoted") && (
             <div style={{background:"rgba(245,158,11,.06)",border:"1.5px solid rgba(245,158,11,.3)",borderRadius:14,padding:"16px 18px",marginBottom:16}}>
@@ -13210,6 +13297,7 @@ function AdminResearchRequests({ toast }) {
                   {req.deadline&&<span style={{fontSize:11,color:"var(--warn)"}}>⏰ Due {new Date(req.deadline).toLocaleDateString()}</span>}
                   {req.phone&&<span style={{fontSize:11,color:"var(--text3)"}}>📞 {req.phone}</span>}
                   {req.price&&<span style={{fontSize:12,fontWeight:800,color:"#f59e0b"}}>₦{Number(req.price).toLocaleString()}</span>}
+                  {req.paid&&<span style={{fontSize:11,fontWeight:800,color:"var(--success)"}}>💳 PAID</span>}
                 </div>
               </div>
               <span style={{background:s.bg,color:s.color,border:`1px solid ${s.color}44`,borderRadius:20,padding:"3px 10px",fontSize:11,fontWeight:800,flexShrink:0}}>{s.icon} {s.label}</span>
