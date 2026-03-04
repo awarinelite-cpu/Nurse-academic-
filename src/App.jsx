@@ -315,6 +315,25 @@ const _setDocFields = async (docId, fields) => {
   } catch (e) { console.error("[Firebase] setDocFields failed:", docId, e.message); return false; }
 };
 
+// ── Direct folder overwrite (bypasses merge — ensures deleted keys are gone) ─
+// Uses Firestore .update() so only the "folders" field is touched, and the
+// exact JS object (with removed keys) becomes the new Firestore value.
+const saveFoldersToBackend = async (foldersObj) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    // .update() replaces the field value exactly — no merge, no phantom keys.
+    await _db.collection("nv").doc(_DOC_SHARED).update({ folders: foldersObj });
+    // Keep cache in sync
+    if (!_cache[_DOC_SHARED]) _cache[_DOC_SHARED] = {};
+    _cache[_DOC_SHARED].folders = foldersObj;
+    _cacheTime[_DOC_SHARED] = Date.now();
+    return true;
+  } catch (e) {
+    console.error("[saveFoldersToBackend] failed:", e.message);
+    return false;
+  }
+};
+
 // ── Shared data read/write ────────────────────────────────────────────
 const bsGet = async (key) => {
   const doc = await _getDoc(_DOC_SHARED);
@@ -985,6 +1004,10 @@ const subscribeSharedDoc = (onUpdate) =>
     db.collection("nv").doc(_DOC_SHARED).onSnapshot(snap => {
       if (!snap.exists) return;
       const doc = snap.data();
+      // If this snapshot is a local echo of our own pending write, skip updating
+      // folders/handouts — our in-memory state is already correct (post-deletion)
+      // and we don't want the pre-deletion echo to revert it.
+      const isPending = snap.metadata && snap.metadata.hasPendingWrites;
       const defaults = {
         users:         [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}],
         classes:       DEFAULT_CLASSES, drugs: DEFAULT_DRUGS, labs: DEFAULT_LABS,
@@ -994,6 +1017,9 @@ const subscribeSharedDoc = (onUpdate) =>
       };
       Object.entries(SK).forEach(([key, [lsKey, bk]]) => {
         if (["dailyMock","nursingExams","ncArchive"].includes(key)) return;
+        // Skip folders & handouts when this is a local pending-write echo to
+        // prevent the pre-deletion value from overwriting the deleted state.
+        if (isPending && (key === "folders" || key === "handouts")) return;
         const remote = doc[bk];
         if (remote !== undefined && remote !== null) lsSet(lsKey, remote);
         else if (!ls(lsKey, null)) lsSet(lsKey, defaults[key] || []);
@@ -3055,7 +3081,12 @@ function AdminHandouts({ toast }) {
   // ── Standard single-item helpers ────────────────────────────────
   const del = (id) => { const u=handouts.filter(h=>h.id!==id); setHandouts(u); saveShared("handouts",u); toast("Deleted","success"); };
   const clearAll = () => { if(!confirm("Delete ALL handouts?"))return; setHandouts([]); saveShared("handouts",[]); toast("All handouts cleared","warn"); };
-  const saveFolders = (f) => { setFolders(f); saveShared("folders", f); };
+  const saveFolders = (f) => {
+    lsSet("nv-folders", f);    // update localStorage immediately
+    setFolders(f);              // update React state immediately
+    dispatchSync();             // notify all useSharedData hooks
+    saveFoldersToBackend(f);    // write to Firestore, bypassing merge
+  };
 
   const deleteCourseFolder = (classId, course) => {
     if(!confirm(`Delete course folder "${course}" and all handouts inside it?`)) return;
@@ -3621,7 +3652,12 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
   const [filter, setFilter] = useState("");
 
   // Save folders helper
-  const saveFolders = (f) => { setFolders(f); saveShared("folders", f); };
+  const saveFolders = (f) => {
+    lsSet("nv-folders", f);    // update localStorage immediately
+    setFolders(f);              // update React state immediately
+    dispatchSync();             // notify all useSharedData hooks
+    saveFoldersToBackend(f);    // write to Firestore, bypassing merge
+  };
 
   // Ensure course folders include both handout-derived courses AND manually created ones
   const getCoursesForClass = (classId) => {
