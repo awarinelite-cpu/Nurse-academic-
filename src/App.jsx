@@ -436,6 +436,42 @@ const gcTestWrite = async (classId) => {
   }
 };
 
+// ── Admin: clear ALL messages in a group chat room ───────────────────
+const gcClearAllMsgs = async (classId) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    const snap = await _db.collection("class_chats").doc(classId).collection("msgs").get();
+    if (snap.empty) return true;
+    const BATCH = 400;
+    for (let i = 0; i < snap.docs.length; i += BATCH) {
+      const batch = _db.batch();
+      snap.docs.slice(i, i + BATCH).forEach(d => batch.delete(d.ref));
+      await batch.commit();
+    }
+    await _db.collection("class_chats").doc(classId).set({ lastMsg: "", lastFrom: "", lastAt: 0 }, { merge: true });
+    return true;
+  } catch(e) { console.error("[GC] clearAllMsgs failed:", e.message); return false; }
+};
+
+// ── Admin: clear ALL messages in a DM conversation ───────────────────
+const dmClearAllMsgs = async (userA, userB) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    const cid = _convId(userA, userB);
+    const snap = await _db.collection("dm_convs").doc(cid).collection("msgs").get();
+    if (!snap.empty) {
+      const BATCH = 400;
+      for (let i = 0; i < snap.docs.length; i += BATCH) {
+        const batch = _db.batch();
+        snap.docs.slice(i, i + BATCH).forEach(d => batch.delete(d.ref));
+        await batch.commit();
+      }
+    }
+    await _db.collection("dm_convs").doc(cid).set({ lastMsg: "", lastFrom: "", lastAt: 0 }, { merge: true });
+    return true;
+  } catch(e) { console.error("[DM] clearAllMsgs failed:", e.message); return false; }
+};
+
 const dmMarkRead = async (me, other) => {
   const ready = await _loadFirebase(); if (!ready) return;
   try {
@@ -574,6 +610,24 @@ const rcGetMembers = async () => {
   return doc ? (doc.researchMembers || []) : [];
 };
 const rcSaveMembers = async (list) => _setDocField(_DOC_SHARED, "researchMembers", list);
+
+// ── Admin: clear ALL messages in the Research Club chat ───────────────
+const rcClearAllMsgs = async () => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    const snap = await _db.collection("research_club").doc("main").collection("msgs").get();
+    if (!snap.empty) {
+      const BATCH = 400;
+      for (let i = 0; i < snap.docs.length; i += BATCH) {
+        const batch = _db.batch();
+        snap.docs.slice(i, i + BATCH).forEach(d => batch.delete(d.ref));
+        await batch.commit();
+      }
+    }
+    await _db.collection("research_club").doc("main").set({ lastMsg: "", lastFrom: "", lastAt: 0 }, { merge: true });
+    return true;
+  } catch(e) { console.error("[RC] clearAllMsgs failed:", e.message); return false; }
+};
 
 // ── RESEARCH REQUEST HELPERS ──────────────────────────────────────────
 // Requests stored in Firestore: collection("research_requests")/{requestId}
@@ -8659,7 +8713,7 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
   );
 }
 
-function Messages({ user, toast, onUnreadChange }) {
+function Messages({ user, isAdmin, toast, onUnreadChange }) {
   const allUsers  = ls("nv-users", []);
   const allClasses = ls("nv-classes", DEFAULT_CLASSES);
   const me = allUsers.find(u => u.username === user);
@@ -9204,10 +9258,23 @@ function Messages({ user, toast, onUnreadChange }) {
                     {/* Header */}
                     <div style={{ padding:"10px 16px", borderBottom:"1.5px solid var(--border)", background:"var(--bg4)", display:"flex", alignItems:"center", gap:10 }}>
                       <div style={{ width:32, height:32, borderRadius:9, background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🏫</div>
-                      <div>
+                      <div style={{ flex:1 }}>
                         <div style={{ fontWeight:800, fontSize:14, color:"var(--text)" }}>{allClasses.find(c=>c.id===broadcastClass)?.label}</div>
                         <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===broadcastClass).length} students · Group chat</div>
                       </div>
+                      {isAdmin && (
+                        <button
+                          className="btn btn-danger btn-sm"
+                          style={{ fontSize:11, padding:"5px 12px", flexShrink:0 }}
+                          onClick={async () => {
+                            if (!confirm(`Clear ALL messages in "${allClasses.find(c=>c.id===broadcastClass)?.label}"? This cannot be undone.`)) return;
+                            const ok = await gcClearAllMsgs(broadcastClass);
+                            if (ok) { setGcMsgs([]); toast("🗑️ Group chat cleared", "warn"); }
+                            else toast("❌ Failed to clear messages", "error");
+                          }}
+                          title="Admin: clear all messages in this group chat"
+                        >🗑️ Clear Messages</button>
+                      )}
                     </div>
 
                     {/* Messages */}
@@ -9285,10 +9352,24 @@ function Messages({ user, toast, onUnreadChange }) {
               {(() => { if (!broadcastClass && myClassId) setTimeout(()=>setBroadcastClass(myClassId),0); return null; })()}
               <div style={{ padding:"10px 16px", borderBottom:"1.5px solid var(--border)", background:"var(--bg4)", display:"flex", alignItems:"center", gap:10 }}>
                 <div style={{ width:32, height:32, borderRadius:9, background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🏫</div>
-                <div>
+                <div style={{ flex:1 }}>
                   <div style={{ fontWeight:800, fontSize:14, color:"var(--text)" }}>{allClasses.find(c=>c.id===myClassId)?.label || "Class Group Chat"}</div>
                   <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===myClassId).length + 1} members · Group chat</div>
                 </div>
+                {isAdmin && (
+                  <button
+                    className="btn btn-danger btn-sm"
+                    style={{ fontSize:11, padding:"5px 12px", flexShrink:0 }}
+                    onClick={async () => {
+                      const className = allClasses.find(c=>c.id===myClassId)?.label || myClassId;
+                      if (!confirm(`Clear ALL messages in "${className}"? This cannot be undone.`)) return;
+                      const ok = await gcClearAllMsgs(myClassId);
+                      if (ok) { setGcMsgs([]); toast("🗑️ Group chat cleared", "warn"); }
+                      else toast("❌ Failed to clear messages", "error");
+                    }}
+                    title="Admin: clear all messages in this group chat"
+                  >🗑️ Clear Messages</button>
+                )}
               </div>
               {/* Messages */}
               <div style={{ flex:1, overflowY:"auto", padding:"16px 20px", display:"flex", flexDirection:"column", gap:10 }}>
@@ -9448,6 +9529,20 @@ function Messages({ user, toast, onUnreadChange }) {
           {/* Clear / close */}
           {activeUser && (
             <button className="btn btn-sm" style={{ flexShrink:0 }} onClick={() => { setActiveUser(null); setMsgs([]); }}>✕</button>
+          )}
+          {/* Admin: clear this DM conversation */}
+          {isAdmin && activeUser && (
+            <button
+              className="btn btn-danger btn-sm"
+              style={{ fontSize:11, padding:"5px 12px", flexShrink:0 }}
+              onClick={async () => {
+                if (!confirm(`Clear ALL messages between you and ${displayName(activeUser)}? This cannot be undone.`)) return;
+                const ok = await dmClearAllMsgs(user, activeUser);
+                if (ok) { setMsgs([]); toast("🗑️ Conversation cleared", "warn"); }
+                else toast("❌ Failed to clear messages", "error");
+              }}
+              title="Admin: clear all messages in this conversation"
+            >🗑️ Clear</button>
           )}
           {/* Voice call button */}
           {activeUser && (
@@ -13659,6 +13754,19 @@ function ResearchClub({ currentUser, toast, isLecturer, isAdmin }) {
             disabled={!dmTarget}
             style={{padding:"7px 14px",borderRadius:9,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700,fontSize:12,opacity:!dmTarget?.5:1}}
           >Open DM</button>
+          {isAdmin && (
+            <button
+              className="btn btn-danger btn-sm"
+              style={{fontSize:11,padding:"5px 12px",flexShrink:0}}
+              onClick={async () => {
+                if (!confirm("Clear ALL messages in the Research Club chat? This cannot be undone.")) return;
+                const ok = await rcClearAllMsgs();
+                if (ok) { setMsgs([]); toast("🗑️ Research Club chat cleared", "warn"); }
+                else toast("❌ Failed to clear messages", "error");
+              }}
+              title="Admin: clear all Research Club messages"
+            >🗑️ Clear Messages</button>
+          )}
         </div>
       </div>
 
@@ -14735,7 +14843,7 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
       case "timetable":    return <Timetable currentUser={currentUser} toast={toast} isLecturer={true} />;
       case "cbt":          return <CbtExamManager toast={toast} currentUser={currentUser} />;
       case "essay":        return <AdminEssayExams toast={toast} />;
-      case "messages":     return <Messages user={currentUser} toast={toast} onUnreadChange={setUnreadDM} />;
+      case "messages":     return <Messages user={currentUser} isAdmin={isAdmin} toast={toast} onUnreadChange={setUnreadDM} />;
       case "research-club": return <ResearchClub currentUser={currentUser} toast={toast} isLecturer={true} isAdmin={false} />;
       case "study-groups": return <StudyGroups currentUser={currentUser} toast={toast} />;
       case "notifications":return <Notifications currentUser={currentUser} onRead={()=>setUnreadNotifs(0)} />;
@@ -15707,7 +15815,7 @@ self.addEventListener('notificationclick', e => {
         : <CbtStudentView toast={toast} currentUser={currentUser} />;
       case "questions": return <SchoolOnlyPastQuestionsView toast={toast} currentUser={currentUser} />;
       case "nursingexams": return <NursingExamsStandaloneView toast={toast} currentUser={currentUser} initialExam={selectedExamType} />;
-      case "messages": return <Messages user={currentUser} toast={toast} onUnreadChange={setUnreadDM} />;
+      case "messages": return <Messages user={currentUser} isAdmin={isAdmin} toast={toast} onUnreadChange={setUnreadDM} />;
       case "research-club": return <ResearchClub currentUser={currentUser} toast={toast} isLecturer={isLecturer} isAdmin={isAdmin} />;
       case "research-request": return <ResearchRequestPage currentUser={currentUser} toast={toast} />;
       case "notifications": return <Notifications currentUser={currentUser} onRead={()=>setUnreadNotifs(0)} />;
