@@ -600,13 +600,21 @@ const rrGetMine = async (username) => {
 };
 const rrSubscribeAll = (onData) => {
   if (!_db) return ()=>{};
-  return _db.collection("research_requests").orderBy("createdAt","desc")
-    .onSnapshot(snap => onData(snap.docs.map(d=>d.data())), ()=>{});
+  // Sort client-side to avoid needing a Firestore index
+  return _db.collection("research_requests")
+    .onSnapshot(
+      snap => onData(snap.docs.map(d=>d.data()).sort((a,b)=>b.createdAt-a.createdAt)),
+      err => { console.warn("[RR]",err.message); rrGetAll().then(onData); }
+    );
 };
 const rrSubscribeMine = (username, onData) => {
   if (!_db) return ()=>{};
-  return _db.collection("research_requests").where("student","==",username).orderBy("createdAt","desc")
-    .onSnapshot(snap => onData(snap.docs.map(d=>d.data())), ()=>{});
+  // No orderBy to avoid composite index requirement — sort client-side
+  return _db.collection("research_requests").where("student","==",username)
+    .onSnapshot(
+      snap => onData(snap.docs.map(d=>d.data()).sort((a,b)=>b.createdAt-a.createdAt)),
+      err => { console.warn("[RR]",err.message); rrGetMine(username).then(onData); }
+    );
 };
 
 // ── TIMETABLE HELPERS ──────────────────────────────────────────────────
@@ -12656,10 +12664,14 @@ function ResearchRequestPage({ currentUser, toast }) {
   const [form, setForm] = useState(blank);
 
   useEffect(() => {
-    const unsub = rrSubscribeMine(currentUser, data => {
-      setRequests(data);
-      setLoading(false);
-    });
+    let unsub = () => {};
+    // Wait for Firebase to be ready before subscribing
+    _loadFirebase().then(() => {
+      unsub = rrSubscribeMine(currentUser, data => {
+        setRequests(data);
+        setLoading(false);
+      });
+    }).catch(() => setLoading(false));
     return () => unsub();
   }, [currentUser]);
 
@@ -12977,7 +12989,10 @@ function AdminResearchRequests({ toast }) {
   const fileRef = useRef(null);
 
   useEffect(() => {
-    const unsub = rrSubscribeAll(data => { setRequests(data); setLoading(false); });
+    let unsub = () => {};
+    _loadFirebase().then(() => {
+      unsub = rrSubscribeAll(data => { setRequests(data); setLoading(false); });
+    }).catch(() => setLoading(false));
     return () => unsub();
   }, []);
 
@@ -12987,8 +13002,11 @@ function AdminResearchRequests({ toast }) {
     const updated = { ...selected, status:"quoted", price: quoteForm.price, adminNote: quoteForm.adminNote, quotedAt: Date.now() };
     const ok = await rrSave(updated);
     setSaving(false);
-    if (ok) { toast("✅ Quote sent to student!","success"); setSelected(updated); }
-    else toast("Failed to send quote","error");
+    if (ok) {
+      toast("✅ Quote sent to student!","success");
+      // Firestore subscription will auto-update requests list
+      setSelected(updated);
+    } else toast("Failed to send quote","error");
   };
 
   const markInProgress = async () => {
