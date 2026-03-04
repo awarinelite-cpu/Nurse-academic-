@@ -12840,36 +12840,23 @@ function ResearchRequestPage({ currentUser, toast }) {
                       💬 <b>Message from Admin:</b> {live.adminNote}
                     </div>
                   )}
-                  {/* Payment status badge if already paid */}
-                  {live.paid && (
-                    <div style={{
-                      background:"rgba(34,197,94,.1)",border:"1px solid rgba(34,197,94,.3)",
-                      borderRadius:10,padding:"8px 14px",marginBottom:10,
-                      fontSize:12,color:"var(--success)",fontWeight:700,
-                      display:"flex",alignItems:"center",gap:6
-                    }}>
-                      ✅ Payment confirmed · Ref: {live.paymentRef}
-                    </div>
-                  )}
+                  {/* Info: payment happens at download stage */}
+                  <div style={{
+                    background:"rgba(245,158,11,.08)",borderRadius:10,
+                    padding:"9px 14px",marginBottom:10,marginTop:6,
+                    fontSize:12,color:"#b45309",fontWeight:600,
+                    borderLeft:"3px solid #f59e0b"
+                  }}>
+                    💡 Payment will be required when you download the completed project.
+                  </div>
                   {live.status === "quoted" && (
                     <div style={{display:"flex",flexDirection:"column",gap:10,marginTop:14}}>
-                      {/* Paystack pay button */}
-                      <div
-                        onClick={payWithPaystack}
-                        style={{
-                          display:"flex",alignItems:"center",justifyContent:"center",gap:12,
-                          padding:"14px 20px",borderRadius:12,cursor:"pointer",
-                          background:"linear-gradient(135deg,#0ba4db,#0077a8)",
-                          boxShadow:"0 2px 8px rgba(11,164,219,.25)",transition:"transform .15s,box-shadow .15s"
-                        }}
-                        onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 6px 18px rgba(11,164,219,.35)";}}
-                        onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 2px 8px rgba(11,164,219,.25)";}}>
-                        <div style={{width:38,height:38,borderRadius:"50%",background:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:10,color:"#0ba4db",flexShrink:0}}>PSK</div>
-                        <div>
-                          <div style={{color:"white",fontWeight:800,fontSize:14}}>Pay ₦{Number(live.price).toLocaleString()} with Paystack</div>
-                          <div style={{color:"rgba(255,255,255,.8)",fontSize:11}}>Secure card payment · Instant confirmation</div>
-                        </div>
-                      </div>
+                      {/* Accept quote */}
+                      <button
+                        onClick={()=>acceptQuote(live)}
+                        disabled={accepting}
+                        style={{width:"100%",padding:"13px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14,opacity:accepting?0.7:1}}
+                      >{accepting?"⏳ Accepting…":"✅ Accept Quote"}</button>
                       {/* Decline */}
                       <button
                         onClick={()=>declineQuote(live)}
@@ -12889,21 +12876,124 @@ function ResearchRequestPage({ currentUser, toast }) {
                 </div>
               )}
 
-              {/* Completed — download project */}
-              {live.status === "completed" && live.projectFile && (
-                <div style={{
-                  background:"rgba(34,197,94,.08)",border:"1.5px solid rgba(34,197,94,.3)",
-                  borderRadius:14,padding:"16px 18px",marginBottom:16,textAlign:"center"
-                }}>
-                  <div style={{fontSize:32,marginBottom:6}}>🎉</div>
-                  <div style={{fontWeight:900,fontSize:15,color:"var(--success)",marginBottom:4}}>Your project is ready!</div>
-                  <a
-                    href={live.projectFile}
-                    download={`${live.topic.slice(0,30)}.pdf`}
-                    style={{display:"inline-block",padding:"12px 28px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",fontWeight:800,fontSize:14,textDecoration:"none",marginTop:8}}
-                  >📥 Download Project</a>
-                </div>
-              )}
+              {/* Completed — payment-gated download */}
+              {live.status === "completed" && live.projectFile && (() => {
+                const payAndDownload = async () => {
+                  try {
+                    await loadPaystack();
+                    const amountKobo = Math.round(Number(live.price) * 100);
+                    const handler = window.PaystackPop.setup({
+                      key:      PAYSTACK_PUBLIC_KEY,
+                      email:    currentUser,
+                      amount:   amountKobo,
+                      currency: "NGN",
+                      ref:      `RR-DL-${live.id}-${Date.now()}`,
+                      metadata: {
+                        name: me.displayName || currentUser.split("@")[0],
+                        custom_fields:[
+                          {display_name:"Research Topic", variable_name:"topic", value:live.topic},
+                          {display_name:"Type", variable_name:"type", value:"Research Project Download"},
+                        ]
+                      },
+                      onClose: () => {},
+                      callback: async (response) => {
+                        // Save payment then trigger download
+                        const updated = {
+                          ...live,
+                          paid: true,
+                          paymentRef: response.reference,
+                          paymentAmount: Number(live.price),
+                          paidAt: Date.now(),
+                        };
+                        await rrSave(updated);
+                        toast("✅ Payment confirmed! Downloading your project…", "success");
+                        // Trigger download
+                        const a = document.createElement("a");
+                        a.href = live.projectFile;
+                        a.download = `${live.topic.slice(0,40)}.pdf`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                      },
+                    });
+                    handler.openIframe();
+                  } catch(e) {
+                    toast("Payment error: " + (e?.message || "Unknown error"), "error");
+                  }
+                };
+
+                return (
+                  <div style={{
+                    background:"rgba(34,197,94,.08)",border:"1.5px solid rgba(34,197,94,.3)",
+                    borderRadius:14,padding:"20px 18px",marginBottom:16,textAlign:"center"
+                  }}>
+                    <div style={{fontSize:36,marginBottom:8}}>🎉</div>
+                    <div style={{fontWeight:900,fontSize:16,color:"var(--success)",marginBottom:4}}>Your project is ready!</div>
+                    <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>
+                      Complete payment to unlock and download your research project.
+                    </div>
+
+                    {live.paid ? (
+                      /* Already paid — show direct download */
+                      <>
+                        <div style={{
+                          background:"rgba(34,197,94,.12)",border:"1px solid rgba(34,197,94,.3)",
+                          borderRadius:10,padding:"8px 14px",marginBottom:12,
+                          fontSize:12,color:"var(--success)",fontWeight:700,display:"inline-flex",alignItems:"center",gap:6
+                        }}>
+                          ✅ Payment confirmed · Ref: {live.paymentRef}
+                        </div>
+                        <br/>
+                        <a
+                          href={live.projectFile}
+                          download={`${live.topic.slice(0,40)}.pdf`}
+                          style={{
+                            display:"inline-flex",alignItems:"center",gap:10,
+                            padding:"14px 32px",borderRadius:12,
+                            background:"linear-gradient(135deg,#22c55e,#16a34a)",
+                            color:"#fff",fontWeight:800,fontSize:15,textDecoration:"none",
+                            boxShadow:"0 4px 16px rgba(34,197,94,.35)"
+                          }}
+                        >📥 Download Project</a>
+                      </>
+                    ) : (
+                      /* Not yet paid — show locked download + pay button */
+                      <>
+                        {/* Locked download button */}
+                        <div style={{
+                          display:"inline-flex",alignItems:"center",gap:10,
+                          padding:"14px 32px",borderRadius:12,marginBottom:12,
+                          background:"rgba(0,0,0,.06)",border:"2px dashed rgba(0,0,0,.15)",
+                          color:"var(--text3)",fontWeight:800,fontSize:15,cursor:"not-allowed"
+                        }}>
+                          🔒 Download Locked
+                        </div>
+                        <div style={{fontSize:11,color:"var(--text3)",marginBottom:14}}>
+                          Pay ₦{Number(live.price).toLocaleString()} to unlock your download
+                        </div>
+                        {/* Paystack pay & download button */}
+                        <div
+                          onClick={payAndDownload}
+                          style={{
+                            display:"flex",alignItems:"center",justifyContent:"center",gap:12,
+                            padding:"15px 24px",borderRadius:12,cursor:"pointer",
+                            background:"linear-gradient(135deg,#0ba4db,#0077a8)",
+                            boxShadow:"0 4px 16px rgba(11,164,219,.3)",
+                            transition:"transform .15s,box-shadow .15s",
+                          }}
+                          onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 8px 24px rgba(11,164,219,.4)";}}
+                          onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 4px 16px rgba(11,164,219,.3)";}}>
+                          <div style={{width:40,height:40,borderRadius:"50%",background:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:10,color:"#0ba4db",flexShrink:0}}>PSK</div>
+                          <div style={{textAlign:"left"}}>
+                            <div style={{color:"white",fontWeight:900,fontSize:15}}>Pay ₦{Number(live.price).toLocaleString()} & Download</div>
+                            <div style={{color:"rgba(255,255,255,.8)",fontSize:11}}>Secure Paystack payment · Instant download after payment</div>
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                );
+              })()}
 
               {/* Status timeline */}
               <div style={{marginTop:16}}>
@@ -13034,8 +13124,9 @@ function ResearchRequestPage({ currentUser, toast }) {
               </div>
               <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:6}}>
                 <span style={{background:s.bg,color:s.color,border:`1px solid ${s.color}44`,borderRadius:20,padding:"3px 10px",fontSize:11,fontWeight:800}}>{s.icon} {s.label}</span>
-                {req.status==="quoted"&&!req.paid&&<span style={{fontSize:11,color:"#0ba4db",fontWeight:700}}>💳 Tap to pay →</span>}
-                {req.status==="completed"&&req.projectFile&&<span style={{fontSize:11,color:"var(--success)",fontWeight:700}}>📥 Ready to download</span>}
+                {req.status==="quoted"&&<span style={{fontSize:11,color:"#3b82f6",fontWeight:700}}>Tap to review →</span>}
+                {req.status==="completed"&&req.projectFile&&!req.paid&&<span style={{fontSize:11,color:"#0ba4db",fontWeight:700}}>💳 Pay to download</span>}
+                {req.status==="completed"&&req.paid&&<span style={{fontSize:11,color:"var(--success)",fontWeight:700}}>📥 Ready to download</span>}
               </div>
             </div>
           </div>
