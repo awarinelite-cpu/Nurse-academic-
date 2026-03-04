@@ -4,14 +4,6 @@ import React, { useState, useEffect, useCallback, useRef, Fragment } from "react
 // ─── EMAILJS CONFIG ──────────────────────────────────────────────────
 // EmailJS free tier: 200 emails/month — sign up at https://www.emailjs.com
 // Fill in your own IDs below after creating a free account:
-// ── PWA: capture install prompt as early as possible ──
-let _pwaPrompt = null;
-window.addEventListener("beforeinstallprompt", (e) => {
-  e.preventDefault();
-  _pwaPrompt = e;
-  window.dispatchEvent(new Event("pwa-prompt-ready"));
-});
-
 const EMAILJS_PUBLIC_KEY  = "PDEu7sKFo4tLDnn0x";
 const EMAILJS_SERVICE_ID  = "service_jqh2a8i";
 const EMAILJS_TEMPLATE_ID = "template_60264xt";
@@ -556,6 +548,65 @@ const sgSubscribeGroups = (classId, onGroups) => {
     .where("classId","==",classId)
     .orderBy("lastAt","desc")
     .onSnapshot(snap => onGroups(snap.docs.map(d=>({id:d.id,...d.data()}))), ()=>{});
+};
+
+// ── RESEARCH CLUB HELPERS ─────────────────────────────────────────────
+// Members stored in Firestore: nv/shared researchMembers: [username,...]
+// Chat: collection "research_club/main/msgs/{id}"
+const rcSend = async (from, payload) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    const msgId = "rc_" + Date.now() + "_" + Math.random().toString(36).slice(2,6);
+    const msg = { id:msgId, from, sentAt:Date.now(), ...payload };
+    await _db.collection("research_club").doc("main").collection("msgs").doc(msgId).set(msg);
+    await _db.collection("research_club").doc("main").set({ lastMsg: (payload.text||"📎 File").slice(0,80), lastFrom: from, lastAt: Date.now() }, { merge:true });
+    return true;
+  } catch(e) { return false; }
+};
+const rcSubscribe = (onMsgs) => {
+  if (!_db) return ()=>{};
+  return _db.collection("research_club").doc("main").collection("msgs")
+    .orderBy("sentAt","asc")
+    .onSnapshot(snap => onMsgs(snap.docs.map(d=>d.data())), ()=>{});
+};
+const rcGetMembers = async () => {
+  const doc = await _getDoc(_DOC_SHARED);
+  return doc ? (doc.researchMembers || []) : [];
+};
+const rcSaveMembers = async (list) => _setDocField(_DOC_SHARED, "researchMembers", list);
+
+// ── RESEARCH REQUEST HELPERS ──────────────────────────────────────────
+// Requests stored in Firestore: collection("research_requests")/{requestId}
+const rrSave = async (req) => {
+  const ready = await _loadFirebase(); if (!ready) return false;
+  try {
+    await _db.collection("research_requests").doc(req.id).set(req, { merge:true });
+    return true;
+  } catch(e) { console.error("[RR] save failed:", e.message); return false; }
+};
+const rrGetAll = async () => {
+  const ready = await _loadFirebase(); if (!ready) return [];
+  try {
+    const snap = await _db.collection("research_requests").orderBy("createdAt","desc").get();
+    return snap.docs.map(d => d.data());
+  } catch(e) { return []; }
+};
+const rrGetMine = async (username) => {
+  const ready = await _loadFirebase(); if (!ready) return [];
+  try {
+    const snap = await _db.collection("research_requests").where("student","==",username).orderBy("createdAt","desc").get();
+    return snap.docs.map(d => d.data());
+  } catch(e) { return []; }
+};
+const rrSubscribeAll = (onData) => {
+  if (!_db) return ()=>{};
+  return _db.collection("research_requests").orderBy("createdAt","desc")
+    .onSnapshot(snap => onData(snap.docs.map(d=>d.data())), ()=>{});
+};
+const rrSubscribeMine = (username, onData) => {
+  if (!_db) return ()=>{};
+  return _db.collection("research_requests").where("student","==",username).orderBy("createdAt","desc")
+    .onSnapshot(snap => onData(snap.docs.map(d=>d.data())), ()=>{});
 };
 
 // ── TIMETABLE HELPERS ──────────────────────────────────────────────────
@@ -1411,6 +1462,7 @@ function AdminPanel({ toast, currentUser }) {
     { key:"nccodes", label:"🔑 NC Access Codes" },
     { key:"payments", label:"💰 Payment Dashboard" },
     { key:"pushnotifs", label:"📢 Push Notifications" },
+    { key:"researchreqs", label:"📜 Research Requests" },
   ];
 
   return (
@@ -1441,6 +1493,7 @@ function AdminPanel({ toast, currentUser }) {
       {tab==="nccodes" && <AdminNcCodes toast={toast} />}
       {tab==="payments" && <AdminPaymentDashboard toast={toast} />}
       {tab==="pushnotifs" && <AdminPushNotifications toast={toast} />}
+      {tab==="researchreqs" && <AdminResearchRequests toast={toast} />}
     </div>
   );
 }
@@ -3118,6 +3171,10 @@ function Dashboard({ user, onNavigate }) {
   const [_announcements] = useSharedData("nv-announcements", []);
   const announcements = _announcements.filter(a=>a.pinned);
   const [openGroup, setOpenGroup] = useState(null);
+  const [rcMemberCount, setRcMemberCount] = useState(null);
+  const isResearcher = (() => { try{ return localStorage.getItem("rc-member-"+user.replace(/[^a-z0-9]/gi,"_"))==="1"; }catch{return false;} })();
+
+  useEffect(() => { rcGetMembers().then(list => setRcMemberCount(list.length)); }, []);
 
   const groups = [
     { key:"bnsc", label:"BNSc", icon:"🎓", color:"#a78bfa", match: c => c.id?.startsWith("bnsc") || c.label?.toLowerCase().includes("bnsc") },
@@ -3140,6 +3197,47 @@ function Dashboard({ user, onNavigate }) {
         </div>
       ))}
       <div className="search-wrap"><span className="search-ico">🔍</span><input placeholder="Search handouts, courses, tools..." /></div>
+
+      {/* ── Research Club Banner ── */}
+      <div
+        onClick={()=>onNavigate("research-club")}
+        style={{
+          background: isResearcher
+            ? "linear-gradient(135deg,rgba(124,58,237,.18),rgba(180,83,9,.18))"
+            : "linear-gradient(135deg,rgba(124,58,237,.12),rgba(180,83,9,.12))",
+          border: isResearcher ? "2px solid rgba(251,191,36,.5)" : "1.5px solid rgba(124,58,237,.25)",
+          borderRadius:14, padding:"14px 18px", marginBottom:20,
+          display:"flex", alignItems:"center", gap:14, cursor:"pointer",
+          transition:"all .2s", position:"relative", overflow:"hidden"
+        }}
+        onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-1px)";e.currentTarget.style.boxShadow="0 8px 24px rgba(124,58,237,.2)";}}
+        onMouseLeave={e=>{e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="none";}}
+      >
+        <div style={{position:"absolute",right:-10,top:-10,fontSize:80,opacity:.06}}>🔬</div>
+        <div style={{
+          width:48,height:48,borderRadius:12,
+          background:"linear-gradient(135deg,#7c3aed,#b45309)",
+          display:"flex",alignItems:"center",justifyContent:"center",fontSize:24,
+          boxShadow:"0 4px 14px rgba(124,58,237,.35)",flexShrink:0
+        }}>🔬</div>
+        <div style={{flex:1}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:2}}>
+            <div style={{fontWeight:900,fontSize:15,color:"var(--text)"}}>Research Club</div>
+            {isResearcher
+              ? <div style={{background:"linear-gradient(135deg,#b45309,#f59e0b)",borderRadius:20,padding:"2px 9px",fontSize:9,fontWeight:900,color:"#fde68a",boxShadow:"0 1px 6px rgba(245,158,11,.4)"}}>🔬 RESEARCHER</div>
+              : <div style={{background:"rgba(124,58,237,.15)",borderRadius:20,padding:"2px 9px",fontSize:10,fontWeight:700,color:"#a78bfa",border:"1px solid rgba(124,58,237,.3)"}}>✦ Elite</div>
+            }
+          </div>
+          <div style={{fontSize:12,color:"var(--text3)",fontWeight:700}}>
+            {isResearcher
+              ? `You're a member · ${rcMemberCount||"..."} researchers · Click to open`
+              : `Join the elite research community · ${rcMemberCount||"..."} member${rcMemberCount!==1?"s":""} · Earn the golden RESEARCHER badge`
+            }
+          </div>
+        </div>
+        <div style={{fontSize:18,color:"var(--text3)",flexShrink:0}}>›</div>
+      </div>
+
       <div className="grid5" style={{marginBottom:24}}>
         {[
           {lbl:"CLASSES",val:classes.length,sub:"Active programs"},
@@ -3889,165 +3987,6 @@ function Handouts({ selectedClass, toast, currentUser, isLecturer }) {
 // ═══════════════════════════════════════════════════════════════════════
 const AVATAR_EMOJIS = ["👩‍⚕️","👨‍⚕️","🧑‍⚕️","👩‍🎓","👨‍🎓","🧑‍🎓","👩‍💼","👨‍💼","🌟","🏆","💡","🦋","🌺","🎯","🩺","🧬","💊","🏥"];
 const YEAR_OPTIONS = ["Year 1","Year 2","Year 3","Year 4","Year 5","Postgraduate","Intern","Other"];
-
-
-// ─── PWA Install Banner ───────────────────────────────────────────────
-// Shows on every login until the user installs the app.
-// No snooze/dismiss memory - only hides once installed or user taps X for this session.
-function PWAInstallBanner({ show }) {
-  const [visible, setVisible] = useState(false);
-  const [installing, setInstalling] = useState(false);
-  const [installed, setInstalled] = useState(false);
-  const [isIOS, setIsIOS] = useState(false);
-
-  useEffect(() => {
-    if (!show) { setVisible(false); return; }
-
-    // Already running as installed PWA - never show
-    const isStandalone =
-      window.matchMedia("(display-mode: standalone)").matches ||
-      window.navigator.standalone === true;
-    if (isStandalone) return;
-
-    const ios = /iphone|ipad|ipod/i.test(navigator.userAgent) && !window.MSStream;
-    setIsIOS(ios);
-
-    if (ios) {
-      // iOS: show manual instructions immediately
-      setTimeout(() => setVisible(true), 1800);
-      return;
-    }
-
-    // Android/Desktop: wait for browser install prompt
-    if (_pwaPrompt) {
-      setTimeout(() => setVisible(true), 1800);
-    } else {
-      const onReady = () => setTimeout(() => setVisible(true), 1800);
-      window.addEventListener("pwa-prompt-ready", onReady, { once: true });
-      return () => window.removeEventListener("pwa-prompt-ready", onReady);
-    }
-  }, [show]);
-
-  const handleInstall = async () => {
-    if (!_pwaPrompt) return;
-    setInstalling(true);
-    try {
-      await _pwaPrompt.prompt();
-      const { outcome } = await _pwaPrompt.userChoice;
-      if (outcome === "accepted") {
-        setInstalled(true);
-        _pwaPrompt = null;
-        setTimeout(() => setVisible(false), 2800);
-      }
-    } catch {}
-    setInstalling(false);
-  };
-
-  const dismiss = () => setVisible(false); // session-only dismiss, reappears next login
-
-  if (!visible) return null;
-
-  return (
-    <div style={{
-      position:"fixed", bottom:20, left:"50%", transform:"translateX(-50%)",
-      zIndex:99999, width:"min(430px,calc(100vw - 28px))",
-      background:"linear-gradient(135deg,#0077b6 0%,#00b4d8 100%)",
-      borderRadius:22, boxShadow:"0 10px 48px rgba(0,100,160,.5)",
-      padding:"20px 20px 18px", color:"white",
-      animation:"pwa-up .45s cubic-bezier(.34,1.56,.64,1) both",
-    }}>
-      <style>{`
-        @keyframes pwa-up {
-          from{opacity:0;transform:translateX(-50%) translateY(40px)}
-          to  {opacity:1;transform:translateX(-50%) translateY(0)}
-        }
-      `}</style>
-
-      {/* Close (session-only) */}
-      {!installed && (
-        <button onClick={dismiss} style={{
-          position:"absolute",top:12,right:14,background:"rgba(255,255,255,.18)",
-          border:"none",color:"white",width:28,height:28,borderRadius:"50%",
-          fontSize:14,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",
-          fontWeight:700,lineHeight:1,
-        }}>✕</button>
-      )}
-
-      {installed ? (
-        <div style={{textAlign:"center",padding:"10px 0 6px"}}>
-          <div style={{fontSize:42,marginBottom:8}}>🎉</div>
-          <div style={{fontWeight:800,fontSize:17,marginBottom:4}}>App installed!</div>
-          <div style={{fontSize:13,opacity:.88}}>Launch Nursing Hub from your home screen anytime.</div>
-        </div>
-      ) : (
-        <>
-          {/* Header row */}
-          <div style={{display:"flex",alignItems:"center",gap:14,marginBottom:14,paddingRight:20}}>
-            <div style={{
-              width:54,height:54,borderRadius:15,flexShrink:0,
-              background:"rgba(255,255,255,.2)",border:"2px solid rgba(255,255,255,.35)",
-              display:"flex",alignItems:"center",justifyContent:"center",fontSize:30,
-            }}>🏥</div>
-            <div>
-              <div style={{fontWeight:800,fontSize:16,marginBottom:3}}>Install Nursing Hub</div>
-              <div style={{fontSize:12.5,opacity:.9,lineHeight:1.5}}>
-                {isIOS
-                  ? "Add to your home screen for the best experience."
-                  : "Works offline · Faster · Feels like a native app."}
-              </div>
-            </div>
-          </div>
-
-          {isIOS ? (
-            <div style={{
-              background:"rgba(255,255,255,.18)",borderRadius:13,
-              padding:"12px 15px",marginBottom:14,
-              display:"flex",alignItems:"center",gap:12,fontSize:13,
-            }}>
-              <span style={{fontSize:22,flexShrink:0}}>📤</span>
-              <div>Tap <strong>Share</strong> <span style={{opacity:.8}}>(</span>⎙<span style={{opacity:.8}}>)</span> → <strong>Add to Home Screen</strong> → <strong>Add</strong></div>
-            </div>
-          ) : (
-            <div style={{display:"flex",gap:7,marginBottom:14,flexWrap:"wrap"}}>
-              {["⚡ Offline access","📲 Home screen","🔔 Notifications","🚀 Faster load"].map(f=>(
-                <span key={f} style={{
-                  background:"rgba(255,255,255,.17)",borderRadius:20,
-                  padding:"4px 11px",fontSize:11,fontWeight:700,
-                }}>{f}</span>
-              ))}
-            </div>
-          )}
-
-          <div style={{display:"flex",gap:10}}>
-            {!isIOS && (
-              <button onClick={handleInstall} disabled={installing} style={{
-                flex:1,padding:"12px 0",borderRadius:13,border:"none",
-                background:"white",color:"#0077b6",fontWeight:800,fontSize:14,
-                cursor:installing?"wait":"pointer",opacity:installing?.75:1,
-                transition:"opacity .2s, transform .15s",
-                boxShadow:"0 4px 16px rgba(0,0,0,.12)",
-              }}>
-                {installing ? "Installing…" : "📲 Install App"}
-              </button>
-            )}
-            <button onClick={dismiss} style={{
-              padding:"12px 18px",borderRadius:13,
-              border:"1.5px solid rgba(255,255,255,.4)",
-              background:"transparent",color:"white",fontWeight:700,fontSize:13,
-              cursor:"pointer",flexShrink:0,transition:"background .2s",
-            }}>
-              {isIOS ? "Got it" : "Later"}
-            </button>
-          </div>
-
-          <div style={{textAlign:"center",marginTop:10,fontSize:11,opacity:.65}}>
-            This reminder will appear each login until you install the app.
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
 
 function StudentProfile({ currentUser, toast }) {
   const [users, setUsers] = useSharedData("nv-users", []);
@@ -12688,6 +12627,943 @@ function AdminPushNotifications({ toast }) {
 
 
 // ════════════════════════════════════════════════════════════════════
+// RESEARCH REQUEST
+// ════════════════════════════════════════════════════════════════════
+const RR_STATUSES = {
+  pending:    { label:"Pending Quote",  color:"#f59e0b", bg:"rgba(245,158,11,.12)",  icon:"⏳" },
+  quoted:     { label:"Quote Sent",     color:"#3b82f6", bg:"rgba(59,130,246,.12)",  icon:"💰" },
+  accepted:   { label:"Accepted",       color:"#8b5cf6", bg:"rgba(139,92,246,.12)",  icon:"✅" },
+  inprogress: { label:"In Progress",    color:"#06b6d4", bg:"rgba(6,182,212,.12)",   icon:"🔄" },
+  completed:  { label:"Completed",      color:"#22c55e", bg:"rgba(34,197,94,.12)",   icon:"🎉" },
+  declined:   { label:"Declined",       color:"#ef4444", bg:"rgba(239,68,68,.12)",   icon:"❌" },
+};
+
+// ── Student: Research Request Page ───────────────────────────────────
+function ResearchRequestPage({ currentUser, toast }) {
+  const allUsers = ls("nv-users", []);
+  const me = allUsers.find(u => u.username === currentUser) || {};
+  const classes = ls("nv-classes", DEFAULT_CLASSES);
+  const myClass = classes.find(c => c.id === me.class);
+
+  const [requests, setRequests] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showForm, setShowForm] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [selected, setSelected] = useState(null); // view detail
+  const [accepting, setAccepting] = useState(false);
+
+  const blank = { topic:"", level:"", deadline:"", phone:"", notes:"" };
+  const [form, setForm] = useState(blank);
+
+  useEffect(() => {
+    const unsub = rrSubscribeMine(currentUser, data => {
+      setRequests(data);
+      setLoading(false);
+    });
+    return () => unsub();
+  }, [currentUser]);
+
+  const submit = async () => {
+    if (!form.topic.trim()) return toast("Enter your research topic","error");
+    if (!form.phone.trim()) return toast("Enter your contact phone number","error");
+    setSubmitting(true);
+    const req = {
+      id: "rr_" + Date.now() + "_" + Math.random().toString(36).slice(2,6),
+      student: currentUser,
+      studentName: me.displayName || currentUser.split("@")[0],
+      studentClass: myClass?.label || me.class || "—",
+      matricNumber: me.matricNumber || me.matric || "—",
+      topic: form.topic.trim(),
+      level: form.level.trim() || myClass?.label || "—",
+      deadline: form.deadline,
+      phone: form.phone.trim(),
+      notes: form.notes.trim(),
+      status: "pending",
+      createdAt: Date.now(),
+      price: null,
+      adminNote: "",
+      projectFile: null,
+    };
+    const ok = await rrSave(req);
+    setSubmitting(false);
+    if (ok) {
+      toast("✅ Request submitted! Admin will review and send you a quote.","success");
+      setForm(blank);
+      setShowForm(false);
+    } else {
+      toast("Failed to submit — check your connection","error");
+    }
+  };
+
+  const acceptQuote = async (req) => {
+    setAccepting(true);
+    const updated = { ...req, status:"accepted", acceptedAt: Date.now() };
+    const ok = await rrSave(updated);
+    setAccepting(false);
+    if (ok) { toast("✅ Quote accepted! Admin will begin your project.","success"); setSelected(updated); }
+    else toast("Failed — try again","error");
+  };
+
+  const declineQuote = async (req) => {
+    if (!window.confirm("Decline this quote? The request will be closed.")) return;
+    const updated = { ...req, status:"declined", declinedAt: Date.now() };
+    await rrSave(updated);
+    toast("Request declined","success");
+    setSelected(null);
+  };
+
+  const StatusBadge = ({ status }) => {
+    const s = RR_STATUSES[status] || RR_STATUSES.pending;
+    return (
+      <span style={{
+        background:s.bg, color:s.color, border:`1px solid ${s.color}44`,
+        borderRadius:20, padding:"3px 10px", fontSize:11, fontWeight:800
+      }}>{s.icon} {s.label}</span>
+    );
+  };
+
+  // ── Detail modal ──
+  if (selected) {
+    const s = RR_STATUSES[selected.status] || RR_STATUSES.pending;
+    return (
+      <div style={{maxWidth:600,margin:"0 auto",paddingBottom:40}}>
+        <button onClick={()=>setSelected(null)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--accent)",fontWeight:700,fontSize:13,marginBottom:16,padding:0}}>← Back to My Requests</button>
+        <div style={{background:"var(--card)",border:`2px solid ${s.color}44`,borderRadius:18,padding:24}}>
+          <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:16,gap:12,flexWrap:"wrap"}}>
+            <div>
+              <div style={{fontWeight:900,fontSize:17,color:"var(--text)",marginBottom:6}}>{selected.topic}</div>
+              <StatusBadge status={selected.status} />
+            </div>
+            <div style={{fontSize:11,color:"var(--text3)"}}>Submitted {new Date(selected.createdAt).toLocaleDateString()}</div>
+          </div>
+
+          {/* Details grid */}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
+            {[
+              ["Programme/Level", selected.level],
+              ["Deadline", selected.deadline ? new Date(selected.deadline).toLocaleDateString() : "—"],
+              ["Phone", selected.phone],
+              ["Matric No.", selected.matricNumber],
+            ].map(([k,v])=>(
+              <div key={k} style={{background:"var(--bg4)",borderRadius:10,padding:"10px 14px"}}>
+                <div style={{fontSize:10,color:"var(--text3)",fontWeight:700,textTransform:"uppercase",marginBottom:3}}>{k}</div>
+                <div style={{fontWeight:700,fontSize:13}}>{v}</div>
+              </div>
+            ))}
+          </div>
+
+          {selected.notes && (
+            <div style={{background:"var(--bg4)",borderRadius:10,padding:"12px 14px",marginBottom:16}}>
+              <div style={{fontSize:10,color:"var(--text3)",fontWeight:700,textTransform:"uppercase",marginBottom:3}}>Additional Notes</div>
+              <div style={{fontSize:13,fontWeight:700}}>{selected.notes}</div>
+            </div>
+          )}
+
+          {/* Quote section */}
+          {selected.price && (
+            <div style={{
+              background:"linear-gradient(135deg,rgba(59,130,246,.12),rgba(139,92,246,.08))",
+              border:"1.5px solid rgba(59,130,246,.3)",
+              borderRadius:14, padding:"16px 18px", marginBottom:16
+            }}>
+              <div style={{fontWeight:900,fontSize:15,color:"#3b82f6",marginBottom:6}}>💰 Admin Quote</div>
+              <div style={{fontWeight:900,fontSize:28,color:"var(--text)",marginBottom:6}}>₦{Number(selected.price).toLocaleString()}</div>
+              {selected.adminNote && <div style={{fontSize:13,color:"var(--text2)",fontWeight:700}}>{selected.adminNote}</div>}
+
+              {selected.status === "quoted" && (
+                <div style={{display:"flex",gap:10,marginTop:14,flexWrap:"wrap"}}>
+                  <button
+                    onClick={()=>acceptQuote(selected)}
+                    disabled={accepting}
+                    style={{flex:1,padding:"12px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14}}
+                  >{accepting?"⏳ Accepting…":"✅ Accept Quote"}</button>
+                  <button
+                    onClick={()=>declineQuote(selected)}
+                    style={{padding:"12px 20px",borderRadius:10,background:"rgba(239,68,68,.1)",color:"var(--danger)",border:"1px solid rgba(239,68,68,.3)",cursor:"pointer",fontWeight:700}}
+                  >❌ Decline</button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Completed — download project */}
+          {selected.status === "completed" && selected.projectFile && (
+            <div style={{
+              background:"rgba(34,197,94,.08)",border:"1.5px solid rgba(34,197,94,.3)",
+              borderRadius:14,padding:"16px 18px",marginBottom:16,textAlign:"center"
+            }}>
+              <div style={{fontSize:32,marginBottom:8}}>🎉</div>
+              <div style={{fontWeight:900,fontSize:15,color:"var(--success)",marginBottom:4}}>Your project is ready!</div>
+              <a
+                href={selected.projectFile}
+                download={`${selected.topic.slice(0,30)}.pdf`}
+                style={{display:"inline-block",padding:"12px 28px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",fontWeight:800,fontSize:14,textDecoration:"none",marginTop:8}}
+              >📥 Download Project</a>
+            </div>
+          )}
+
+          {/* Status timeline */}
+          <div style={{marginTop:16}}>
+            <div style={{fontSize:11,color:"var(--text3)",fontWeight:700,textTransform:"uppercase",marginBottom:10}}>Request Timeline</div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {[
+                ["pending","⏳","Request submitted",selected.createdAt],
+                selected.price ? ["quoted","💰","Quote sent by admin",selected.quotedAt] : null,
+                selected.acceptedAt ? ["accepted","✅","Quote accepted",selected.acceptedAt] : null,
+                selected.startedAt ? ["inprogress","🔄","Work started",selected.startedAt] : null,
+                selected.completedAt ? ["completed","🎉","Project completed",selected.completedAt] : null,
+                selected.declinedAt ? ["declined","❌","Declined",selected.declinedAt] : null,
+              ].filter(Boolean).map(([st,ic,lbl,ts])=>(
+                <div key={st} style={{display:"flex",alignItems:"center",gap:10}}>
+                  <div style={{width:26,height:26,borderRadius:"50%",background:(RR_STATUSES[st]||RR_STATUSES.pending).bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,flexShrink:0}}>{ic}</div>
+                  <div style={{flex:1,fontSize:12,fontWeight:700}}>{lbl}</div>
+                  <div style={{fontSize:11,color:"var(--text3)"}}>{ts?new Date(ts).toLocaleDateString():""}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{maxWidth:680,margin:"0 auto",paddingBottom:40}}>
+      {/* Header */}
+      <div style={{
+        background:"linear-gradient(135deg,#1e3a5f,#0f2847)",
+        borderRadius:18, padding:"24px 28px", marginBottom:24, color:"#fff",
+        position:"relative", overflow:"hidden"
+      }}>
+        <div style={{position:"absolute",right:-20,top:-20,fontSize:120,opacity:.06}}>📜</div>
+        <div style={{fontSize:13,opacity:.7,marginBottom:4}}>Academic Services</div>
+        <div style={{fontWeight:900,fontSize:22,marginBottom:6}}>📜 Research Project Request</div>
+        <div style={{fontSize:13,opacity:.8}}>Submit your research topic and get a professional project written by our academic team.</div>
+        <button
+          onClick={()=>setShowForm(true)}
+          style={{
+            marginTop:16,padding:"11px 24px",borderRadius:10,
+            background:"linear-gradient(135deg,#f59e0b,#d97706)",
+            color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14,
+            boxShadow:"0 4px 14px rgba(245,158,11,.4)"
+          }}
+        >+ New Request</button>
+      </div>
+
+      {/* New Request Form */}
+      {showForm && (
+        <div style={{background:"var(--card)",border:"2px solid rgba(245,158,11,.3)",borderRadius:16,padding:24,marginBottom:24}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+            <div style={{fontWeight:900,fontSize:16}}>📋 New Research Request</div>
+            <button onClick={()=>{setShowForm(false);setForm(blank);}} style={{background:"none",border:"none",cursor:"pointer",color:"var(--text3)",fontSize:20}}>✕</button>
+          </div>
+
+          <label className="lbl">Research Topic *</label>
+          <input className="inp" value={form.topic} onChange={e=>setForm({...form,topic:e.target.value})}
+            placeholder="e.g. The Effect of Malaria on Pregnant Women in Rural Areas" />
+
+          <label className="lbl">Programme / Level</label>
+          <input className="inp" value={form.level} onChange={e=>setForm({...form,level:e.target.value})}
+            placeholder={myClass?.label || "e.g. BNSc Year 3"} />
+
+          <label className="lbl">Deadline</label>
+          <input className="inp" type="date" value={form.deadline} onChange={e=>setForm({...form,deadline:e.target.value})}
+            min={new Date().toISOString().split("T")[0]} />
+
+          <label className="lbl">Contact Phone Number *</label>
+          <input className="inp" value={form.phone} onChange={e=>setForm({...form,phone:e.target.value})}
+            placeholder="e.g. 08012345678" type="tel" />
+
+          <label className="lbl">Additional Instructions (optional)</label>
+          <textarea className="inp" value={form.notes} onChange={e=>setForm({...form,notes:e.target.value})}
+            placeholder="Any specific requirements, chapters needed, referencing style, etc."
+            style={{minHeight:80,resize:"vertical"}} />
+
+          {/* Auto-filled info */}
+          <div style={{background:"rgba(34,197,94,.06)",border:"1px solid rgba(34,197,94,.2)",borderRadius:10,padding:"10px 14px",marginBottom:16,fontSize:12,color:"var(--text3)"}}>
+            ℹ️ Your name (<b style={{color:"var(--text)"}}>{me.displayName||currentUser.split("@")[0]}</b>), matric number, and class will be attached automatically.
+          </div>
+
+          <button
+            onClick={submit}
+            disabled={submitting}
+            style={{width:"100%",padding:"14px",borderRadius:10,background:"linear-gradient(135deg,#1e3a5f,#0f2847)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:15,opacity:submitting?.7:1}}
+          >{submitting?"⏳ Submitting…":"📤 Submit Request"}</button>
+        </div>
+      )}
+
+      {/* My Requests List */}
+      <div style={{fontWeight:800,fontSize:16,marginBottom:14}}>My Requests ({requests.length})</div>
+      {loading && <div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>Loading…</div>}
+      {!loading && requests.length===0 && (
+        <div style={{textAlign:"center",padding:"50px 20px",color:"var(--text3)",background:"var(--card)",border:"1px dashed var(--border)",borderRadius:14}}>
+          <div style={{fontSize:48,marginBottom:10}}>📜</div>
+          <div style={{fontWeight:700}}>No requests yet</div>
+          <div style={{fontSize:13,marginTop:4}}>Click "New Request" to get started</div>
+        </div>
+      )}
+      {requests.map(req=>{
+        const s = RR_STATUSES[req.status] || RR_STATUSES.pending;
+        return (
+          <div
+            key={req.id}
+            onClick={()=>setSelected(req)}
+            style={{
+              background:"var(--card)",border:`1px solid ${s.color}33`,
+              borderRadius:14,padding:"16px 18px",marginBottom:12,
+              cursor:"pointer",transition:"all .2s",
+              borderLeft:`4px solid ${s.color}`
+            }}
+            onMouseEnter={e=>e.currentTarget.style.transform="translateY(-1px)"}
+            onMouseLeave={e=>e.currentTarget.style.transform="translateY(0)"}
+          >
+            <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:10,flexWrap:"wrap"}}>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:800,fontSize:14,marginBottom:5,color:"var(--text)"}}>{req.topic}</div>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                  <span style={{fontSize:11,color:"var(--text3)"}}>{new Date(req.createdAt).toLocaleDateString()}</span>
+                  {req.deadline&&<span style={{fontSize:11,color:"var(--text3)"}}>· Due {new Date(req.deadline).toLocaleDateString()}</span>}
+                  {req.price&&<span style={{fontSize:12,fontWeight:800,color:"#f59e0b"}}>₦{Number(req.price).toLocaleString()}</span>}
+                </div>
+              </div>
+              <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:6}}>
+                <span style={{background:s.bg,color:s.color,border:`1px solid ${s.color}44`,borderRadius:20,padding:"3px 10px",fontSize:11,fontWeight:800}}>{s.icon} {s.label}</span>
+                {req.status==="quoted"&&<span style={{fontSize:11,color:"#3b82f6",fontWeight:700}}>Tap to review quote →</span>}
+                {req.status==="completed"&&req.projectFile&&<span style={{fontSize:11,color:"var(--success)",fontWeight:700}}>📥 Ready to download</span>}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Admin: Research Requests Manager ─────────────────────────────────
+function AdminResearchRequests({ toast }) {
+  const allUsers = ls("nv-users", []);
+  const [requests, setRequests] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState(null);
+  const [quoteForm, setQuoteForm] = useState({ price:"", adminNote:"" });
+  const [saving, setSaving] = useState(false);
+  const [filter, setFilter] = useState("all");
+  const [uploadingFile, setUploadingFile] = useState(false);
+  const fileRef = useRef(null);
+
+  useEffect(() => {
+    const unsub = rrSubscribeAll(data => { setRequests(data); setLoading(false); });
+    return () => unsub();
+  }, []);
+
+  const sendQuote = async () => {
+    if (!quoteForm.price || isNaN(quoteForm.price)) return toast("Enter a valid price","error");
+    setSaving(true);
+    const updated = { ...selected, status:"quoted", price: quoteForm.price, adminNote: quoteForm.adminNote, quotedAt: Date.now() };
+    const ok = await rrSave(updated);
+    setSaving(false);
+    if (ok) { toast("✅ Quote sent to student!","success"); setSelected(updated); }
+    else toast("Failed to send quote","error");
+  };
+
+  const markInProgress = async () => {
+    const updated = { ...selected, status:"inprogress", startedAt: Date.now() };
+    await rrSave(updated);
+    toast("Marked as In Progress","success");
+    setSelected(updated);
+  };
+
+  const uploadAndComplete = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    if (file.size > 3.5*1024*1024) return toast("File must be under 3.5MB","error");
+    setUploadingFile(true);
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const updated = { ...selected, status:"completed", projectFile: ev.target.result, projectFileName: file.name, completedAt: Date.now() };
+      const ok = await rrSave(updated);
+      setUploadingFile(false);
+      if (ok) { toast("🎉 Project uploaded and marked complete!","success"); setSelected(updated); }
+      else toast("Upload failed","error");
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const declineRequest = async () => {
+    if (!window.confirm("Decline this request?")) return;
+    const updated = { ...selected, status:"declined", declinedAt: Date.now() };
+    await rrSave(updated);
+    toast("Request declined","success");
+    setSelected(updated);
+  };
+
+  const filtered = filter==="all" ? requests : requests.filter(r=>r.status===filter);
+  const counts = Object.keys(RR_STATUSES).reduce((acc,k)=>({...acc,[k]:requests.filter(r=>r.status===k).length}),{});
+
+  const StatusBadge = ({ status }) => {
+    const s = RR_STATUSES[status] || RR_STATUSES.pending;
+    return <span style={{background:s.bg,color:s.color,border:`1px solid ${s.color}44`,borderRadius:20,padding:"3px 10px",fontSize:11,fontWeight:800}}>{s.icon} {s.label}</span>;
+  };
+
+  // ── Detail view ──
+  if (selected) {
+    const s = RR_STATUSES[selected.status] || RR_STATUSES.pending;
+    // Refresh selected from live data
+    const live = requests.find(r=>r.id===selected.id) || selected;
+    return (
+      <div style={{maxWidth:640,margin:"0 auto"}}>
+        <button onClick={()=>setSelected(null)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--accent)",fontWeight:700,fontSize:13,marginBottom:16,padding:0}}>← Back to All Requests</button>
+        <div style={{background:"var(--card)",border:`2px solid ${s.color}44`,borderRadius:18,padding:24}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16,flexWrap:"wrap",gap:10}}>
+            <div>
+              <div style={{fontWeight:900,fontSize:17,marginBottom:6}}>{live.topic}</div>
+              <StatusBadge status={live.status} />
+            </div>
+            <div style={{fontSize:11,color:"var(--text3)"}}>{new Date(live.createdAt).toLocaleDateString()}</div>
+          </div>
+
+          {/* Student info */}
+          <div style={{background:"var(--bg4)",borderRadius:12,padding:"14px 16px",marginBottom:16}}>
+            <div style={{fontWeight:800,fontSize:12,color:"var(--accent)",marginBottom:10,textTransform:"uppercase"}}>Student Information</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              {[
+                ["Name", live.studentName],
+                ["Email", live.student],
+                ["Matric No.", live.matricNumber],
+                ["Class", live.studentClass],
+                ["Programme", live.level],
+                ["Phone", live.phone],
+                ["Deadline", live.deadline ? new Date(live.deadline).toLocaleDateString() : "—"],
+              ].map(([k,v])=>(
+                <div key={k}>
+                  <div style={{fontSize:10,color:"var(--text3)",fontWeight:700}}>{k}</div>
+                  <div style={{fontSize:13,fontWeight:700,color:"var(--text)"}}>{v}</div>
+                </div>
+              ))}
+            </div>
+            {live.notes&&(
+              <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid var(--border)"}}>
+                <div style={{fontSize:10,color:"var(--text3)",fontWeight:700,marginBottom:3}}>Notes from Student</div>
+                <div style={{fontSize:13,fontWeight:700}}>{live.notes}</div>
+              </div>
+            )}
+          </div>
+
+          {/* Quote form — show if still pending */}
+          {(live.status==="pending"||live.status==="quoted") && (
+            <div style={{background:"rgba(245,158,11,.06)",border:"1.5px solid rgba(245,158,11,.3)",borderRadius:14,padding:"16px 18px",marginBottom:16}}>
+              <div style={{fontWeight:900,fontSize:14,color:"#f59e0b",marginBottom:12}}>💰 {live.status==="quoted"?"Update Quote":"Send Quote to Student"}</div>
+              <label className="lbl">Price (₦)</label>
+              <input className="inp" type="number" value={quoteForm.price||live.price||""} onChange={e=>setQuoteForm({...quoteForm,price:e.target.value})}
+                placeholder="e.g. 15000" style={{marginBottom:10}} />
+              <label className="lbl">Message to Student</label>
+              <textarea className="inp" value={quoteForm.adminNote||live.adminNote||""} onChange={e=>setQuoteForm({...quoteForm,adminNote:e.target.value})}
+                placeholder="e.g. Your project will cost ₦15,000 and will be ready in 5 working days."
+                style={{minHeight:70,resize:"vertical"}} />
+              <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                <button onClick={sendQuote} disabled={saving} style={{flex:1,padding:"11px",borderRadius:10,background:"linear-gradient(135deg,#f59e0b,#d97706)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14,opacity:saving?.7:1}}>
+                  {saving?"⏳ Sending…":"💰 Send Quote"}
+                </button>
+                {live.status!=="declined"&&<button onClick={declineRequest} style={{padding:"11px 18px",borderRadius:10,background:"rgba(239,68,68,.1)",color:"var(--danger)",border:"1px solid rgba(239,68,68,.3)",cursor:"pointer",fontWeight:700}}>❌ Decline</button>}
+              </div>
+            </div>
+          )}
+
+          {/* Accepted — can mark in progress or upload */}
+          {live.status==="accepted" && (
+            <div style={{background:"rgba(139,92,246,.06)",border:"1.5px solid rgba(139,92,246,.3)",borderRadius:14,padding:"16px 18px",marginBottom:16}}>
+              <div style={{fontWeight:900,fontSize:14,color:"#8b5cf6",marginBottom:12}}>🔄 Project Actions</div>
+              <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                <button onClick={markInProgress} style={{flex:1,padding:"11px",borderRadius:10,background:"linear-gradient(135deg,#06b6d4,#0891b2)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800}}>🔄 Mark In Progress</button>
+              </div>
+            </div>
+          )}
+
+          {/* In Progress — upload completed project */}
+          {live.status==="inprogress" && (
+            <div style={{background:"rgba(6,182,212,.06)",border:"1.5px solid rgba(6,182,212,.3)",borderRadius:14,padding:"16px 18px",marginBottom:16}}>
+              <div style={{fontWeight:900,fontSize:14,color:"#06b6d4",marginBottom:12}}>📤 Upload Completed Project</div>
+              <div style={{fontSize:12,color:"var(--text3)",marginBottom:12}}>Upload the finished project (PDF, max 3.5MB). The student will be notified and can download it.</div>
+              <input ref={fileRef} type="file" accept=".pdf,.doc,.docx" style={{display:"none"}} onChange={uploadAndComplete} />
+              <button
+                onClick={()=>fileRef.current?.click()}
+                disabled={uploadingFile}
+                style={{width:"100%",padding:"12px",borderRadius:10,background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14,opacity:uploadingFile?.7:1}}
+              >{uploadingFile?"⏳ Uploading…":"📤 Upload & Mark Complete"}</button>
+            </div>
+          )}
+
+          {/* Completed */}
+          {live.status==="completed" && (
+            <div style={{background:"rgba(34,197,94,.08)",border:"1.5px solid rgba(34,197,94,.3)",borderRadius:14,padding:"16px 18px",textAlign:"center"}}>
+              <div style={{fontSize:32,marginBottom:6}}>🎉</div>
+              <div style={{fontWeight:900,color:"var(--success)"}}>Project Completed!</div>
+              <div style={{fontSize:12,color:"var(--text3)",marginTop:4}}>Completed on {new Date(live.completedAt).toLocaleDateString()}</div>
+              {live.projectFile&&<a href={live.projectFile} download={live.projectFileName||"project.pdf"} style={{display:"inline-block",marginTop:10,padding:"8px 20px",borderRadius:9,background:"var(--success)",color:"#fff",fontWeight:700,fontSize:13,textDecoration:"none"}}>📥 Download</a>}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <div>
+          <div style={{fontWeight:900,fontSize:18}}>📜 Research Requests</div>
+          <div style={{fontSize:12,color:"var(--text3)",marginTop:2}}>{requests.length} total request{requests.length!==1?"s":""}</div>
+        </div>
+        {/* Summary badges */}
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          {Object.entries(RR_STATUSES).filter(([k])=>counts[k]>0).map(([k,s])=>(
+            <span key={k} style={{background:s.bg,color:s.color,borderRadius:20,padding:"3px 10px",fontSize:11,fontWeight:800,border:`1px solid ${s.color}33`}}>{s.icon} {counts[k]}</span>
+          ))}
+        </div>
+      </div>
+
+      {/* Filter tabs */}
+      <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap"}}>
+        {[["all","All",requests.length],...Object.entries(RR_STATUSES).map(([k,s])=>[k,s.label,counts[k]])].map(([k,lbl,cnt])=>(
+          <button key={k} onClick={()=>setFilter(k)} style={{
+            padding:"5px 12px",borderRadius:20,fontSize:12,fontWeight:700,cursor:"pointer",
+            background:filter===k?"var(--accent)":"transparent",
+            color:filter===k?"#fff":"var(--text3)",
+            border:`1px solid ${filter===k?"var(--accent)":"var(--border)"}`
+          }}>{lbl}{cnt>0?` (${cnt})`:""}</button>
+        ))}
+      </div>
+
+      {loading&&<div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>Loading requests…</div>}
+      {!loading&&filtered.length===0&&(
+        <div style={{textAlign:"center",padding:"50px 20px",color:"var(--text3)",border:"1px dashed var(--border)",borderRadius:14}}>
+          <div style={{fontSize:40,marginBottom:8}}>📜</div>
+          <div style={{fontWeight:700}}>{filter==="all"?"No requests yet":"No requests with this status"}</div>
+        </div>
+      )}
+
+      {filtered.map(req=>{
+        const s = RR_STATUSES[req.status]||RR_STATUSES.pending;
+        const studentUser = allUsers.find(u=>u.username===req.student);
+        return (
+          <div
+            key={req.id}
+            onClick={()=>{ setSelected(req); setQuoteForm({price:req.price||"",adminNote:req.adminNote||""}); }}
+            style={{
+              background:"var(--card)",border:`1px solid ${s.color}33`,
+              borderRadius:14,padding:"16px 18px",marginBottom:12,
+              cursor:"pointer",transition:"all .2s",borderLeft:`4px solid ${s.color}`
+            }}
+            onMouseEnter={e=>e.currentTarget.style.transform="translateY(-1px)"}
+            onMouseLeave={e=>e.currentTarget.style.transform="translateY(0)"}
+          >
+            <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:10,flexWrap:"wrap"}}>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:800,fontSize:14,marginBottom:4}}>{req.topic}</div>
+                <div style={{fontSize:12,color:"var(--text3)",marginBottom:6}}>
+                  <b style={{color:"var(--text)"}}>{req.studentName}</b> · {req.studentClass} · {req.matricNumber}
+                </div>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                  <span style={{fontSize:11,color:"var(--text3)"}}>{new Date(req.createdAt).toLocaleDateString()}</span>
+                  {req.deadline&&<span style={{fontSize:11,color:"var(--warn)"}}>⏰ Due {new Date(req.deadline).toLocaleDateString()}</span>}
+                  {req.phone&&<span style={{fontSize:11,color:"var(--text3)"}}>📞 {req.phone}</span>}
+                  {req.price&&<span style={{fontSize:12,fontWeight:800,color:"#f59e0b"}}>₦{Number(req.price).toLocaleString()}</span>}
+                </div>
+              </div>
+              <span style={{background:s.bg,color:s.color,border:`1px solid ${s.color}44`,borderRadius:20,padding:"3px 10px",fontSize:11,fontWeight:800,flexShrink:0}}>{s.icon} {s.label}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// RESEARCH CLUB
+// ════════════════════════════════════════════════════════════════════
+function ResearchClub({ currentUser, toast, isLecturer, isAdmin }) {
+  const allUsers = ls("nv-users", []);
+  const me = allUsers.find(u => u.username === currentUser) || {};
+  const [members, setMembers] = useState([]);
+  const [isMember, setIsMember] = useState(false);
+  const [registering, setRegistering] = useState(false);
+  // Check localStorage immediately so a registered member never sees the register form
+  const _lsKey = "rc-member-" + currentUser.replace(/[^a-z0-9]/gi,"_");
+  const _alreadyMember = (() => { try { return localStorage.getItem(_lsKey) === "1"; } catch { return false; } })();
+  const [view, setView] = useState(_alreadyMember || isAdmin || isLecturer ? "loading" : "loading");
+  const [msgs, setMsgs] = useState([]);
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [dmTarget, setDmTarget] = useState("");
+  const [recording, setRecording] = useState(false);
+  const [mediaRec, setMediaRec] = useState(null);
+  const [audioChunks, setAudioChunks] = useState([]);
+  const [attachFile, setAttachFile] = useState(null);
+  const bottomRef = useRef(null);
+  const fileRef = useRef(null);
+
+  // Load members — if localStorage says already a member, go straight to chat
+  useEffect(() => {
+    const alreadyLocal = (() => { try { return localStorage.getItem(_lsKey) === "1"; } catch { return false; } })();
+    if (alreadyLocal || isAdmin || isLecturer) {
+      // Go straight to chat; still load members list in background
+      setIsMember(true);
+      setView("chat");
+      rcGetMembers().then(list => {
+        const isAdminOrLecturer = isAdmin || isLecturer;
+        let finalList = list;
+        if (isAdminOrLecturer && !list.includes(currentUser)) {
+          finalList = [...list, currentUser];
+          rcSaveMembers(finalList);
+        }
+        setMembers(finalList);
+      });
+      return;
+    }
+    // Not locally confirmed — check Firestore
+    rcGetMembers().then(list => {
+      let finalList = list;
+      setMembers(finalList);
+      const member = finalList.includes(currentUser);
+      setIsMember(member);
+      if (member) {
+        // Persist locally so next visit skips this check
+        try { localStorage.setItem(_lsKey, "1"); } catch {}
+        setView("chat");
+      } else {
+        setView("register");
+      }
+    });
+  }, [currentUser, isAdmin, isLecturer]);
+
+  // Subscribe to chat
+  useEffect(() => {
+    if (view !== "chat") return;
+    const unsub = rcSubscribe(setMsgs);
+    return () => unsub();
+  }, [view]);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:"smooth" }); }, [msgs]);
+
+  const register = async () => {
+    setRegistering(true);
+    const updated = [...members, currentUser];
+    await rcSaveMembers(updated);
+    setMembers(updated);
+    setIsMember(true);
+    setRegistering(false);
+    setView("chat");
+    toast("🎉 Welcome to the Research Club! You've earned the RESEARCHER badge!", "success");
+    // Store membership locally for fast badge display
+    try { localStorage.setItem("rc-member-" + currentUser.replace(/[^a-z0-9]/gi,"_"), "1"); } catch{}
+  };
+
+  const displayName = (email) => {
+    const u = allUsers.find(x=>x.username===email);
+    return u?.displayName || email.split("@")[0];
+  };
+  const avatarChar = (email) => (displayName(email)[0]||"?").toUpperCase();
+  const roleTag = (email) => {
+    const u = allUsers.find(x=>x.username===email);
+    if (!u) return "👤";
+    if (u.role==="admin") return "🛡️";
+    if (u.role==="lecturer") return "👨‍🏫";
+    return "🎓";
+  };
+
+  const send = async () => {
+    if (!text.trim() && !attachFile) return;
+    if (sending) return;
+    setSending(true);
+    if (attachFile) {
+      await rcSend(currentUser, { type:"file", text: attachFile.name, fileData: attachFile.data, fileName: attachFile.name, fileType: attachFile.type });
+      setAttachFile(null);
+    } else {
+      await rcSend(currentUser, { type:"text", text: text.trim() });
+    }
+    setText(""); setSending(false);
+  };
+
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mr = new MediaRecorder(stream);
+      const chunks = [];
+      mr.ondataavailable = e => chunks.push(e.data);
+      mr.onstop = async () => {
+        stream.getTracks().forEach(t=>t.stop());
+        const blob = new Blob(chunks, { type:"audio/webm" });
+        const reader = new FileReader();
+        reader.onload = async (ev) => {
+          await rcSend(currentUser, { type:"voice", text:"🎤 Voice note", fileData:ev.target.result, fileName:"voice.webm", fileType:"audio/webm" });
+          toast("Voice note sent","success");
+        };
+        reader.readAsDataURL(blob);
+      };
+      mr.start();
+      setMediaRec(mr);
+      setRecording(true);
+    } catch(e) { toast("Microphone not available","error"); }
+  };
+  const stopRecording = () => { if(mediaRec){ mediaRec.stop(); setMediaRec(null); setRecording(false); } };
+
+  const handleFile = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    if (file.size > 3*1024*1024) return toast("File must be under 3MB","error");
+    const reader = new FileReader();
+    reader.onload = ev => setAttachFile({ name:file.name, data:ev.target.result, type:file.type });
+    reader.readAsDataURL(file);
+  };
+
+  // DM: navigate to Messages with pre-selected user
+  const openDM = () => {
+    if (!dmTarget || dmTarget===currentUser) return toast("Select a member","warn");
+    // Store pending DM in localStorage so Messages component picks it up
+    try { localStorage.setItem("nv-pending-dm", dmTarget); } catch{}
+    window.dispatchEvent(new CustomEvent("rc-open-dm", { detail: dmTarget }));
+    toast(`Opening chat with ${displayName(dmTarget)}…`, "success");
+  };
+
+  // ── REGISTER PAGE ──
+  if (view === "register") {
+    const name = me.displayName || currentUser.split("@")[0];
+    const matric = me.matric || "—";
+    const cls = ls("nv-classes", DEFAULT_CLASSES).find(c=>c.id===me.class);
+    return (
+      <div style={{maxWidth:560,margin:"0 auto",paddingBottom:40}}>
+        {/* Hero */}
+        <div style={{
+          background:"linear-gradient(135deg,#7c3aed,#b45309,#d97706)",
+          borderRadius:20, padding:"36px 32px", marginBottom:28, color:"#fff",
+          textAlign:"center", position:"relative", overflow:"hidden",
+          boxShadow:"0 20px 60px rgba(124,58,237,.35)"
+        }}>
+          <div style={{position:"absolute",top:-30,right:-30,fontSize:120,opacity:.07}}>🔬</div>
+          <div style={{position:"absolute",bottom:-20,left:-20,fontSize:80,opacity:.07}}>⚗️</div>
+          <div style={{fontSize:60,marginBottom:12,filter:"drop-shadow(0 4px 12px rgba(0,0,0,.4))"}}>🔬</div>
+          <div style={{fontWeight:900,fontSize:26,letterSpacing:.5,marginBottom:8,textShadow:"0 2px 12px rgba(0,0,0,.3)"}}>Research Club</div>
+          <div style={{fontSize:14,opacity:.9,lineHeight:1.6}}>Join an elite community of scholars, researchers, and academic trailblazers.</div>
+          <div style={{marginTop:16,display:"flex",justifyContent:"center",gap:12,flexWrap:"wrap"}}>
+            {["🏆 Prestigious Achievement","🧬 Research Sessions","👨‍🔬 Expert Mentors","🌐 Collaborative Network"].map(b=>(
+              <span key={b} style={{background:"rgba(255,255,255,.18)",borderRadius:20,padding:"4px 12px",fontSize:11,fontWeight:700,backdropFilter:"blur(8px)"}}>{b}</span>
+            ))}
+          </div>
+        </div>
+
+        {/* Golden badge preview */}
+        <div style={{
+          background:"linear-gradient(135deg,#78350f,#b45309,#f59e0b)",
+          borderRadius:16, padding:"20px 24px", marginBottom:24,
+          display:"flex",alignItems:"center",gap:16,
+          boxShadow:"0 8px 32px rgba(245,158,11,.4)", border:"2px solid #fbbf24"
+        }}>
+          <div style={{
+            background:"linear-gradient(135deg,#fbbf24,#f59e0b,#d97706)",
+            borderRadius:"50%", width:60, height:60,
+            display:"flex",alignItems:"center",justifyContent:"center",
+            fontSize:28, boxShadow:"0 0 24px rgba(251,191,36,.8), inset 0 1px 2px rgba(255,255,255,.4)",
+            flexShrink:0, border:"3px solid #fde68a"
+          }}>🔬</div>
+          <div>
+            <div style={{fontWeight:900,fontSize:18,color:"#fde68a",textShadow:"0 1px 6px rgba(0,0,0,.3)"}}>RESEARCHER</div>
+          </div>
+        </div>
+
+        {/* Auto-filled form */}
+        <div style={{background:"var(--card)",border:"2px solid rgba(124,58,237,.3)",borderRadius:16,padding:24,marginBottom:20}}>
+          <div style={{fontWeight:800,fontSize:16,marginBottom:4,color:"var(--text)"}}>📋 Registration Form</div>
+          <div style={{fontSize:12,color:"var(--text3)",marginBottom:20}}>Your information has been auto-filled from your profile.</div>
+          {[
+            ["Full Name", name],
+            ["Email Address", currentUser],
+            ["Matric Number", matric],
+            ["Class / Programme", cls?.label || me.class || "—"],
+          ].map(([label, val]) => (
+            <div key={label} style={{marginBottom:14}}>
+              <label className="lbl">{label}</label>
+              <div style={{background:"var(--bg4)",border:"2px solid var(--border)",borderRadius:9,padding:"11px 14px",color:"var(--text)",fontSize:14,fontWeight:700,opacity:.8}}>{val}</div>
+            </div>
+          ))}
+        </div>
+
+        <button
+          onClick={register}
+          disabled={registering}
+          style={{
+            width:"100%", padding:"16px", borderRadius:12,
+            background:"linear-gradient(135deg,#7c3aed,#b45309)",
+            color:"white", border:"none", cursor:"pointer",
+            fontWeight:900, fontSize:16, letterSpacing:.5,
+            boxShadow:"0 8px 24px rgba(124,58,237,.4)",
+            opacity:registering?.7:1, transition:"all .2s"
+          }}
+        >
+          {registering ? "⏳ Registering..." : "🔬 Register as Research Club Member"}
+        </button>
+        <div style={{textAlign:"center",fontSize:11,color:"var(--text3)",marginTop:10}}>
+          {members.length} member{members.length!==1?"s":""} in the club · Free to join
+        </div>
+      </div>
+    );
+  }
+
+  if (view === "loading") return (
+    <div style={{textAlign:"center",padding:60,color:"var(--text3)"}}>Loading Research Club…</div>
+  );
+
+  // ── CHAT PAGE ──
+  const otherMembers = members.filter(m => m !== currentUser);
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 120px)",maxWidth:760,margin:"0 auto"}}>
+      {/* Header */}
+      <div style={{
+        background:"linear-gradient(135deg,rgba(124,58,237,.15),rgba(180,83,9,.15))",
+        border:"1px solid rgba(124,58,237,.25)",
+        borderRadius:14, padding:"14px 18px", marginBottom:12,
+        display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10
+      }}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{
+            background:"linear-gradient(135deg,#7c3aed,#b45309)",
+            borderRadius:10, width:40, height:40,
+            display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,
+            boxShadow:"0 4px 12px rgba(124,58,237,.3)"
+          }}>🔬</div>
+          <div>
+            <div style={{fontWeight:900,fontSize:16,color:"var(--text)"}}>Research Club</div>
+            <div style={{fontSize:11,color:"var(--text3)"}}>{members.length} member{members.length!==1?"s":""} · Group Chat</div>
+          </div>
+          <div style={{
+            background:"linear-gradient(135deg,#fbbf24,#f59e0b)",
+            borderRadius:20, padding:"3px 10px",
+            fontSize:10, fontWeight:900, color:"#78350f",
+            boxShadow:"0 2px 8px rgba(245,158,11,.4)"
+          }}>✦ RESEARCHER</div>
+        </div>
+
+        {/* Private DM dropdown */}
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <select
+            value={dmTarget}
+            onChange={e=>setDmTarget(e.target.value)}
+            style={{padding:"7px 10px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg4)",color:"var(--text)",fontSize:12,fontWeight:700,minWidth:150}}
+          >
+            <option value="">💬 Private Chat With…</option>
+            {otherMembers.map(m=>(
+              <option key={m} value={m}>{roleTag(m)} {displayName(m)}</option>
+            ))}
+          </select>
+          <button
+            onClick={openDM}
+            disabled={!dmTarget}
+            style={{padding:"7px 14px",borderRadius:9,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontWeight:700,fontSize:12,opacity:!dmTarget?.5:1}}
+          >Open DM</button>
+        </div>
+      </div>
+
+      {/* Members chips */}
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
+        {members.slice(0,8).map(m=>(
+          <div key={m} style={{display:"flex",alignItems:"center",gap:5,background:"var(--bg4)",border:"1px solid var(--border)",borderRadius:20,padding:"3px 10px",fontSize:11,fontWeight:700}}>
+            <div style={{width:16,height:16,borderRadius:"50%",background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,color:"#fff",fontWeight:900}}>{avatarChar(m)}</div>
+            {displayName(m)} <span style={{opacity:.5}}>{roleTag(m)}</span>
+          </div>
+        ))}
+        {members.length>8&&<div style={{fontSize:11,color:"var(--text3)",padding:"3px 8px",borderRadius:20,background:"var(--bg4)",border:"1px solid var(--border)"}}>+{members.length-8} more</div>}
+      </div>
+
+      {/* Messages */}
+      <div style={{flex:1,overflowY:"auto",padding:"0 4px",display:"flex",flexDirection:"column",gap:10}}>
+        {msgs.length===0&&(
+          <div style={{textAlign:"center",padding:"60px 20px",color:"var(--text3)"}}>
+            <div style={{fontSize:48,marginBottom:10}}>🔬</div>
+            <div style={{fontWeight:700}}>Welcome to the Research Club!</div>
+            <div style={{fontSize:12,marginTop:4}}>Start the conversation — share research ideas, resources, and insights.</div>
+          </div>
+        )}
+        {msgs.map(m=>{
+          const mine = m.from===currentUser;
+          return (
+            <div key={m.id} style={{display:"flex",alignItems:"flex-end",gap:8,flexDirection:mine?"row-reverse":"row"}}>
+              {!mine&&<div style={{width:30,height:30,borderRadius:"50%",background:"linear-gradient(135deg,#7c3aed,#b45309)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:900,color:"#fff",flexShrink:0}}>{avatarChar(m.from)}</div>}
+              <div style={{maxWidth:"72%"}}>
+                {!mine&&<div style={{fontSize:10,color:"var(--text3)",marginBottom:3,marginLeft:2}}>{roleTag(m.from)} {displayName(m.from)}</div>}
+                <div style={{
+                  background: mine ? "linear-gradient(135deg,#7c3aed,#6d28d9)" : "var(--card2)",
+                  color: mine ? "#fff" : "var(--text)",
+                  borderRadius: mine ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
+                  padding:"10px 14px", fontSize:13, fontWeight:700,
+                  border: mine ? "none" : "1px solid var(--border)",
+                  boxShadow: mine ? "0 4px 14px rgba(124,58,237,.3)" : "none"
+                }}>
+                  {m.type==="voice" ? (
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <span>🎤</span>
+                      {m.fileData && <audio controls src={m.fileData} style={{height:28,maxWidth:200}} />}
+                      <span style={{fontSize:11,opacity:.7}}>Voice note</span>
+                    </div>
+                  ) : m.type==="file" ? (
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <span>📎</span>
+                      {m.fileData
+                        ? <a href={m.fileData} download={m.fileName||"file"} style={{color:mine?"#fde68a":"var(--accent)",fontWeight:700,fontSize:12}}>{m.fileName||"Download"}</a>
+                        : <span style={{fontSize:12}}>{m.fileName||"File"}</span>
+                      }
+                    </div>
+                  ) : m.text}
+                </div>
+                <div style={{fontSize:10,color:"var(--text3)",marginTop:3,textAlign:mine?"right":"left"}}>{new Date(m.sentAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}</div>
+              </div>
+            </div>
+          );
+        })}
+        <div ref={bottomRef} />
+      </div>
+
+      {/* Attach preview */}
+      {attachFile&&(
+        <div style={{padding:"6px 12px",background:"rgba(124,58,237,.1)",border:"1px solid rgba(124,58,237,.25)",borderRadius:9,marginBottom:6,fontSize:12,fontWeight:700,display:"flex",alignItems:"center",gap:8}}>
+          <span>📎 {attachFile.name}</span>
+          <button onClick={()=>setAttachFile(null)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--danger)",fontSize:14}}>✕</button>
+        </div>
+      )}
+
+      {/* Input bar */}
+      <div style={{display:"flex",gap:8,paddingTop:10,borderTop:"1px solid var(--border)",alignItems:"flex-end"}}>
+        {/* File attach */}
+        <button
+          onClick={()=>fileRef.current?.click()}
+          title="Attach file"
+          style={{width:36,height:36,borderRadius:"50%",background:"var(--bg4)",border:"1px solid var(--border)",cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}
+        >📎</button>
+        <input ref={fileRef} type="file" style={{display:"none"}} onChange={handleFile} />
+
+        {/* Audio record */}
+        <button
+          onClick={recording ? stopRecording : startRecording}
+          title={recording?"Stop recording":"Record voice"}
+          style={{width:36,height:36,borderRadius:"50%",background:recording?"rgba(239,68,68,.15)":"var(--bg4)",border:`1px solid ${recording?"var(--danger)":"var(--border)"}`,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,animation:recording?"pulse 1.2s infinite":""}}
+        >{recording?"⏹":"🎤"}</button>
+
+        <textarea
+          value={text}
+          onChange={e=>setText(e.target.value)}
+          onKeyDown={e=>{ if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();} }}
+          placeholder="Type a message to the Research Club… (Enter to send)"
+          rows={1}
+          style={{flex:1,padding:"10px 14px",borderRadius:14,border:"1.5px solid var(--border)",background:"var(--bg4)",color:"var(--text)",fontSize:13,fontFamily:"inherit",fontWeight:700,outline:"none",resize:"none",lineHeight:1.5}}
+        />
+        <button
+          onClick={send}
+          disabled={sending||(!text.trim()&&!attachFile)}
+          style={{padding:"10px 18px",borderRadius:14,background:"linear-gradient(135deg,#7c3aed,#6d28d9)",color:"#fff",border:"none",cursor:"pointer",fontWeight:800,fontSize:14,opacity:(sending||(!text.trim()&&!attachFile))?.5:1,flexShrink:0}}
+        >{sending?"…":"Send"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════
 // STUDY GROUPS
 // ════════════════════════════════════════════════════════════════════
 function StudyGroups({ currentUser, toast }) {
@@ -13614,6 +14490,7 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
       label: "Communication",
       items: [
         { key:"messages",       icon:"💬", label:"Messages",      badge: unreadDM||null },
+        { key:"research-club",  icon:"🔬", label:"Research Club" },
         { key:"study-groups",   icon:"👥", label:"Study Groups" },
         { key:"notifications",  icon:"🔔", label:"Notifications", badge: unreadNotifs||null },
         { key:"announcements",  icon:"📢", label:"Announcements" },
@@ -13645,6 +14522,7 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
       case "cbt":          return <CbtExamManager toast={toast} currentUser={currentUser} />;
       case "essay":        return <AdminEssayExams toast={toast} />;
       case "messages":     return <Messages user={currentUser} toast={toast} onUnreadChange={setUnreadDM} />;
+      case "research-club": return <ResearchClub currentUser={currentUser} toast={toast} isLecturer={true} isAdmin={false} />;
       case "study-groups": return <StudyGroups currentUser={currentUser} toast={toast} />;
       case "notifications":return <Notifications currentUser={currentUser} onRead={()=>setUnreadNotifs(0)} />;
       case "announcements":return <LecturerAnnouncements toast={toast} currentUser={currentUser} />;
@@ -14309,7 +15187,6 @@ self.addEventListener('notificationclick', e => {
   const [bypassPin,     setBypassPin]     = useState(false);  // user chose "use password"
   // Offline indicator
   const [isOffline, setIsOffline] = useState(!navigator.onLine);
-  const [showPWABanner, setShowPWABanner] = useState(false);
   // Forgot password states
   const [forgotMode, setForgotMode] = useState(false); // false | "email" | "code"
   const [forgotEmail, setForgotEmail] = useState("");
@@ -14531,8 +15408,11 @@ self.addEventListener('notificationclick', e => {
       setIsAdmin(localUser.role === "admin"); setIsLecturer(localUser.role === "lecturer");
       setPage("app");
       toast(`Welcome back! 👋`, "success");
+      // Auto-mark admin/lecturer as research club member in localStorage for badge display
+      if (localUser.role === "admin" || localUser.role === "lecturer") {
+        try { localStorage.setItem("rc-member-"+username.replace(/[^a-z0-9]/gi,"_"), "1"); } catch{}
+      }
       saveCredential(username, password);
-      setShowPWABanner(true);
       // Show PIN setup if not yet configured and not skipped
       if (!getSavedPin(username) && !hasBiometric(username) && !ls("nv-pin-skipped-" + username.replace(/[^a-z0-9]/gi,"_"))) {
         setTimeout(() => setShowPinSetup(true), 1200);
@@ -14558,8 +15438,9 @@ self.addEventListener('notificationclick', e => {
       setIsAdmin(remoteUser.role === "admin"); setIsLecturer(remoteUser.role === "lecturer");
       setPage("app");
       toast(`Welcome back! 👋`, "success");
-      saveCredential(username, password);
-      setShowPWABanner(true);
+      if (remoteUser.role === "admin" || remoteUser.role === "lecturer") {
+        try { localStorage.setItem("rc-member-"+username.replace(/[^a-z0-9]/gi,"_"), "1"); } catch{}
+      }
       if (!getSavedPin(username) && !hasBiometric(username) && !ls("nv-pin-skipped-" + username.replace(/[^a-z0-9]/gi,"_"))) {
         setTimeout(() => setShowPinSetup(true), 1200);
       }
@@ -14587,7 +15468,6 @@ self.addEventListener('notificationclick', e => {
     setPage("app");
     toast(`Welcome, ${regName.trim().split(" ")[0]}! 🎉`, "success");
     saveCredential(regUser, regPw);
-    setShowPWABanner(true);
     setTimeout(() => setShowPinSetup(true), 1500);
   };
 
@@ -14599,6 +15479,12 @@ self.addEventListener('notificationclick', e => {
     if (examType) setSelectedExamType(examType); else setSelectedExamType(null);
     setSidebarOpen(false);
   };
+  // Listen for rc-open-dm events from ResearchClub component
+  useEffect(() => {
+    const handler = () => navigate("messages");
+    window.addEventListener("rc-open-dm", handler);
+    return () => window.removeEventListener("rc-open-dm", handler);
+  }, []);
   const navTool = (tool) => {
     setNavHistory(h => [...h, { nav: activeNav, tool: activeTool, cls: selectedClass }]);
     setActiveTool(tool); setActiveNav(null); setSidebarOpen(false);
@@ -14631,6 +15517,8 @@ self.addEventListener('notificationclick', e => {
       case "questions": return <SchoolOnlyPastQuestionsView toast={toast} currentUser={currentUser} />;
       case "nursingexams": return <NursingExamsStandaloneView toast={toast} currentUser={currentUser} initialExam={selectedExamType} />;
       case "messages": return <Messages user={currentUser} toast={toast} onUnreadChange={setUnreadDM} />;
+      case "research-club": return <ResearchClub currentUser={currentUser} toast={toast} isLecturer={isLecturer} isAdmin={isAdmin} />;
+      case "research-request": return <ResearchRequestPage currentUser={currentUser} toast={toast} />;
       case "notifications": return <Notifications currentUser={currentUser} onRead={()=>setUnreadNotifs(0)} />;
       case "profile": return <StudentProfile currentUser={currentUser} toast={toast} />;
       case "student-id": return <StudentIDCard currentUser={currentUser} toast={toast} />;
@@ -14656,6 +15544,8 @@ self.addEventListener('notificationclick', e => {
     { icon:"🏫", label:"School Past Questions", key:"questions" },
     { icon:"🔔", label:"Notifications", key:"notifications" },
     { icon:"💬", label:"Messages", key:"messages" },
+    { icon:"🔬", label:"Research Club", key:"research-club" },
+    { icon:"📜", label:"Research Request", key:"research-request" },
     { icon:"👥", label:"Study Groups", key:"study-groups" },
     { icon:"📅", label:"Timetable", key:"timetable" },
     { icon:"📝", label:"Assignments", key:"assignments" },
@@ -14797,7 +15687,6 @@ self.addEventListener('notificationclick', e => {
         </div>
       </div>
       <Toasts list={toasts} />
-      <PWAInstallBanner show={showPWABanner} />
     </>
   );
 
@@ -14922,7 +15811,7 @@ self.addEventListener('notificationclick', e => {
             <div className="nav-item" style={{color:"#7bc950",background:"rgba(90,158,53,.15)",borderRadius:9,marginBottom:4}} onClick={switchToNursing}>
               <span className="nav-icon">🏛️</span>NC Exam Centre
             </div>
-            <div className="nav-item" style={{color:"var(--danger)",marginBottom:12}} onClick={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);setNavHistory([]);setShowPWABanner(false);}}>
+            <div className="nav-item" style={{color:"var(--danger)",marginBottom:12}} onClick={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);setNavHistory([]);}}>
               <span className="nav-icon">🚪</span>Sign Out
             </div>
 
@@ -14977,6 +15866,14 @@ self.addEventListener('notificationclick', e => {
               </div>
               {isAdmin&&activeNav!=="admin"&&<span className="tag tag-purple" style={{fontSize:10}}>🛡️ Admin</span>}
               {isLecturer&&!isAdmin&&<span className="tag" style={{fontSize:10,borderColor:"var(--accent2)",color:"var(--accent2)"}}>👨‍🏫 Lecturer</span>}
+              {(()=>{ try{ return localStorage.getItem("rc-member-"+currentUser.replace(/[^a-z0-9]/gi,"_"))==="1"; }catch{return false;} })()&&(
+                <div title="Research Club Member — Prestigious Achievement!" onClick={()=>navigate("research-club")} style={{
+                  background:"linear-gradient(135deg,#78350f,#b45309,#f59e0b)",
+                  borderRadius:20,padding:"3px 11px",fontSize:10,fontWeight:900,color:"#fde68a",
+                  boxShadow:"0 2px 10px rgba(245,158,11,.55),inset 0 1px 1px rgba(255,255,255,.18)",
+                  display:"flex",alignItems:"center",gap:4,border:"1px solid #fbbf24",cursor:"pointer",flexShrink:0
+                }}>🔬 RESEARCHER</div>
+              )}
             </div>
             <div className="topbar-right">
               <button className="nc-toggle-btn" onClick={switchToNursing} title="Switch to Nursing Council Exam Site">
@@ -15003,7 +15900,6 @@ self.addEventListener('notificationclick', e => {
         </div>
       </div>
       <Toasts list={toasts} />
-      <PWAInstallBanner show={showPWABanner} />
     </>
   );
 }
