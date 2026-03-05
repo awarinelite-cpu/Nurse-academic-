@@ -1689,7 +1689,7 @@ function AdminUsers({ toast }) {
   const [users, setUsers] = useSharedData("nv-users", []);
   const [edit, setEdit] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({username:"",password:"",role:"student",class:"",displayName:"",matricNumber:""});
+  const [form, setForm] = useState({username:"",password:"",role:"student",class:"",displayName:"",matricNumber:"",isPublicHealth:false});
   const classes = ls("nv-classes", DEFAULT_CLASSES);
   const [search, setSearch] = useState("");
   const [showPw, setShowPw] = useState({});
@@ -1703,7 +1703,7 @@ function AdminUsers({ toast }) {
     if (edit) { u = users.map(x=>x.username===edit?{...x,...entry}:x); toast("User profile updated ✅","success"); }
     else { u = [...users,{...entry,joined:new Date().toLocaleDateString()}]; toast("User added ✅","success"); }
     setUsers(u); saveShared("users",u); setEdit(null); setShowAdd(false);
-    setForm({username:"",password:"",role:"student",class:"",displayName:"",matricNumber:""});
+    setForm({username:"",password:"",role:"student",class:"",displayName:"",matricNumber:"",isPublicHealth:false});
   };
 
   const del = (username) => {
@@ -1727,7 +1727,7 @@ function AdminUsers({ toast }) {
           <div className="sec-title">👥 Users ({users.length})</div>
           <div style={{fontSize:12,color:"var(--text3)"}}>Manage all registered accounts</div>
         </div>
-        <button className="btn btn-purple" onClick={()=>{setShowAdd(true);setEdit(null);setForm({username:"",password:"",role:"student",class:"",displayName:"",matricNumber:""});}}>+ Add User</button>
+        <button className="btn btn-purple" onClick={()=>{setShowAdd(true);setEdit(null);setForm({username:"",password:"",role:"student",class:"",displayName:"",matricNumber:"",isPublicHealth:false});}}>+ Add User</button>
       </div>
 
       <div className="search-wrap" style={{marginBottom:14}}>
@@ -1747,6 +1747,7 @@ function AdminUsers({ toast }) {
                 <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
                   <span className={`tag ${roleColor(u.role||"student")}`}>{u.role||"student"}</span>
                   {u.class&&<span style={{fontSize:11,color:"var(--accent2)"}}>🏫 {classes.find(c=>c.id===u.class)?.label||u.class}</span>}
+                  {u.isPublicHealth&&<span style={{fontSize:11,background:"rgba(46,125,50,.15)",color:"#2e7d32",borderRadius:8,padding:"1px 7px",fontWeight:700}}>🌍 PHN</span>}
                   <span style={{fontSize:11,color:"var(--text3)"}}>📅 {u.joined||"—"}</span>
                 </div>
               </div>
@@ -1754,9 +1755,20 @@ function AdminUsers({ toast }) {
                 <button className="btn btn-sm btn-accent" onClick={()=>setViewUser(u)}>👁 View</button>
                 <button className="btn btn-sm" onClick={()=>{
                   setEdit(u.username);
-                  setForm({username:u.username,password:u.password,role:u.role||"student",class:u.class||"",displayName:u.displayName||"",matricNumber:u.matricNumber||""});
+                  setForm({username:u.username,password:u.password,role:u.role||"student",class:u.class||"",displayName:u.displayName||"",matricNumber:u.matricNumber||"",isPublicHealth:!!u.isPublicHealth});
                   setShowAdd(true);
                 }}>✏️ Edit</button>
+                <button
+                  className="btn btn-sm"
+                  title={u.isPublicHealth ? "Remove PHN status" : "Mark as Public Health Nursing student"}
+                  style={{background:u.isPublicHealth?"rgba(46,125,50,.15)":"transparent",color:"#2e7d32",border:"1px solid #2e7d32",fontWeight:700}}
+                  onClick={()=>{
+                    const updated = users.map(x=>x.username===u.username?{...x,isPublicHealth:!x.isPublicHealth,class:!x.isPublicHealth?"publichealth":(x.class==="publichealth"?"":x.class)}:x);
+                    setUsers(updated); saveShared("users",updated);
+                    toast(u.isPublicHealth?"PHN status removed":"✅ Marked as PHN student","success");
+                  }}>
+                  {u.isPublicHealth?"🌍 Un-PHN":"🌍 PHN"}
+                </button>
                 <button className="btn btn-sm btn-danger" onClick={()=>del(u.username)}>🗑️</button>
               </div>
             </div>
@@ -1785,6 +1797,7 @@ function AdminUsers({ toast }) {
                 {lbl:"👤 Display Name", val: viewUser.displayName||viewUser.username.split("@")[0]},
                 {lbl:"🎓 Matric No.", val: viewUser.matricNumber||"—"},
                 {lbl:"🏫 Class", val: classes.find(c=>c.id===viewUser.class)?.label||"No class assigned"},
+                {lbl:"🌍 PHN Status", val: viewUser.isPublicHealth ? "✅ Public Health Nursing Student" : "Not a PHN student"},
                 {lbl:"📅 Joined", val: viewUser.joined||"Unknown"},
               ].map(row=>(
                 <div key={row.lbl} style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid var(--border)",paddingBottom:8}}>
@@ -1799,7 +1812,7 @@ function AdminUsers({ toast }) {
             <div style={{display:"flex",gap:8,marginTop:14}}>
               <button className="btn btn-accent" style={{flex:1}} onClick={()=>{
                 setEdit(viewUser.username);
-                setForm({username:viewUser.username,password:viewUser.password,role:viewUser.role||"student",class:viewUser.class||"",displayName:viewUser.displayName||"",matricNumber:viewUser.matricNumber||""});
+                setForm({username:viewUser.username,password:viewUser.password,role:viewUser.role||"student",class:viewUser.class||"",displayName:viewUser.displayName||"",matricNumber:viewUser.matricNumber||"",isPublicHealth:!!viewUser.isPublicHealth});
                 setShowAdd(true); setViewUser(null);
               }}>✏️ Edit Profile</button>
               <button className="btn btn-danger" onClick={()=>del(viewUser.username)}>🗑️ Delete</button>
@@ -1839,6 +1852,25 @@ function AdminUsers({ toast }) {
               <option value="">— No class —</option>
               {classes.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
             </select>
+            {/* ── PHN toggle for admin ── */}
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(46,125,50,.07)",border:"1.5px solid #2e7d32",borderRadius:10,padding:"10px 14px",marginBottom:4}}>
+              <div>
+                <div style={{fontWeight:700,fontSize:13,color:"#2e7d32"}}>🌍 Public Health Nursing Student</div>
+                <div style={{fontSize:11,color:"var(--text3)"}}>Auto-assigns to PHN Forum & sets class to Public Health</div>
+              </div>
+              <button
+                type="button"
+                onClick={()=>setForm(f=>({...f,isPublicHealth:!f.isPublicHealth,class:!f.isPublicHealth?"publichealth":(f.class==="publichealth"?"":f.class)}))}
+                style={{
+                  width:44,height:24,borderRadius:12,border:"none",cursor:"pointer",transition:"all .25s",flexShrink:0,
+                  background:form.isPublicHealth?"#2e7d32":"var(--border2)",position:"relative",
+                }}>
+                <span style={{
+                  position:"absolute",top:2,left:form.isPublicHealth?22:2,width:20,height:20,
+                  borderRadius:"50%",background:"white",transition:"left .25s",boxShadow:"0 1px 4px rgba(0,0,0,.25)"
+                }}/>
+              </button>
+            </div>
             <div style={{display:"flex",gap:8}}>
               <button className="btn btn-purple" style={{flex:1}} onClick={save}>💾 Save</button>
               <button className="btn" onClick={()=>setShowAdd(false)}>Cancel</button>
@@ -16413,7 +16445,7 @@ self.addEventListener('notificationclick', e => {
   const [authTab, setAuthTab] = useState("signin");
   const [loginType, setLoginType] = useState("student"); // "student" | "admin"
   const [username, setUsername] = useState(""); const [password, setPassword] = useState(""); const [showPw, setShowPw] = useState(false);
-  const [regUser, setRegUser] = useState(""); const [regPw, setRegPw] = useState(""); const [regClass, setRegClass] = useState(""); const [regName, setRegName] = useState(""); const [regMatric, setRegMatric] = useState("");
+  const [regUser, setRegUser] = useState(""); const [regPw, setRegPw] = useState(""); const [regClass, setRegClass] = useState(""); const [regName, setRegName] = useState(""); const [regMatric, setRegMatric] = useState(""); const [regStudentType, setRegStudentType] = useState("class"); // "class" | "phn"
   const [activeNav, setActiveNav] = useState("dashboard"); const [activeTool, setActiveTool] = useState(null);
   const [themeMode, setThemeMode] = useState("light"); const [sidebarOpen, setSidebarOpen] = useState(false);
   const [toasts, setToasts] = useState([]); const [currentUser, setCurrentUser] = useState(""); const [isAdmin, setIsAdmin] = useState(false);
@@ -16755,10 +16787,13 @@ self.addEventListener('notificationclick', e => {
     if (!regUser || !regPw) return toast("Fill in all fields", "error");
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(regUser)) return toast("Enter a valid email address", "error");
     if (!regMatric.trim()) return toast("Enter your matric number", "error");
+    if (regStudentType !== "phn" && !regClass) return toast("Please select your class", "error");
     const users = ls("nv-users", []);
     if (users.find(u => u.username === regUser)) return toast("Email already registered", "error");
     if (users.find(u => u.matricNumber && u.matricNumber.toLowerCase() === regMatric.trim().toLowerCase())) return toast("Matric number already registered", "error");
-    const newUsers = [...users, { username: regUser, password: regPw, role: "student", class: regClass, displayName: regName.trim(), matricNumber: regMatric.trim().toUpperCase(), joined: new Date().toLocaleDateString() }];
+    const isPHN = regStudentType === "phn";
+    const assignedClass = isPHN ? "publichealth" : regClass;
+    const newUsers = [...users, { username: regUser, password: regPw, role: "student", class: assignedClass, isPublicHealth: isPHN, displayName: regName.trim(), matricNumber: regMatric.trim().toUpperCase(), joined: new Date().toLocaleDateString() }];
     saveShared("users", newUsers);
     setCurrentUserRef(regUser); setCurrentUser(regUser);
     setIsAdmin(false); setIsLecturer(false);
@@ -16970,10 +17005,39 @@ self.addEventListener('notificationclick', e => {
                     <label className="lbl">Password</label>
                     <input className="inp" type="password" placeholder="Choose password" value={regPw} onChange={e=>setRegPw(e.target.value)} />
                     <label className="lbl">Your Class</label>
-                    <select className="inp" value={regClass} onChange={e=>setRegClass(e.target.value)}>
-                      <option value="">Select class...</option>
-                      {classes.map(c=><option key={c.id} value={c.id}>{c.label} — {c.desc}</option>)}
-                    </select>
+                    {/* ── Student type toggle ── */}
+                    <div style={{display:"flex",borderRadius:12,overflow:"hidden",border:"2px solid var(--accent)",marginBottom:10}}>
+                      <button
+                        type="button"
+                        onClick={()=>setRegStudentType("class")}
+                        style={{
+                          flex:1,padding:"10px 6px",fontWeight:700,fontSize:13,border:"none",cursor:"pointer",transition:"all .2s",
+                          background:(!regStudentType||regStudentType==="class")?"var(--accent)":"transparent",
+                          color:(!regStudentType||regStudentType==="class")?"white":"var(--accent)",
+                        }}>
+                        🏫 Class Student
+                      </button>
+                      <button
+                        type="button"
+                        onClick={()=>setRegStudentType("phn")}
+                        style={{
+                          flex:1,padding:"10px 6px",fontWeight:700,fontSize:13,border:"none",cursor:"pointer",transition:"all .2s",
+                          background:regStudentType==="phn"?"#2e7d32":"transparent",
+                          color:regStudentType==="phn"?"white":"#2e7d32",
+                        }}>
+                        🌍 Public Health Student
+                      </button>
+                    </div>
+                    {regStudentType==="phn" ? (
+                      <div style={{background:"rgba(46,125,50,.08)",border:"1.5px solid #2e7d32",borderRadius:10,padding:"10px 12px",marginBottom:4,fontSize:12,color:"#2e7d32",fontWeight:600}}>
+                        ✅ You will be registered as a <strong>Public Health Nursing student</strong>. You'll automatically appear in the PHN Forum once you log in.
+                      </div>
+                    ) : (
+                      <select className="inp" value={regClass} onChange={e=>setRegClass(e.target.value)}>
+                        <option value="">Select class...</option>
+                        {classes.map(c=><option key={c.id} value={c.id}>{c.label} — {c.desc}</option>)}
+                      </select>
+                    )}
                     <button className="btn-primary" onClick={register}>Create Account →</button>
                     <div className="auth-switch">Have account? <span onClick={()=>setAuthTab("signin")}>Sign in</span></div>
                   </>
