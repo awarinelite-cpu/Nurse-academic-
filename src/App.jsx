@@ -4,7 +4,7 @@ import React, { useState, useEffect, useCallback, useRef, Fragment } from "react
 // ─── EMAILJS CONFIG ──────────────────────────────────────────────────
 // EmailJS free tier: 200 emails/month — sign up at https://www.emailjs.com
 // Fill in your own IDs below after creating a free account:
-const EMAILJS_PUBLIC_KEY  = "PDEu7sKFo4tLDnn0x";
+const EMAILJS_PUBLIC_KEY  = "2JgrOiZvJn9_Xdo5Y";
 const EMAILJS_SERVICE_ID  = "service_jqh2a8i";
 const EMAILJS_TEMPLATE_ID = "template_60264xt";
 
