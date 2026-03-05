@@ -7711,6 +7711,67 @@ function PHNFolderModal({ currentUser, isAdmin, onClose }) {
   );
 }
 
+// ── GroupVideoCallBtn ─────────────────────────────────────────────────
+// Reusable button that opens a Jitsi Meet group video call for any room.
+// roomId: a stable unique string (class id, group id, etc.)
+// label: short label shown on button
+function GroupVideoCallBtn({ roomId, label = "Video Call", style = {} }) {
+  const [showPanel, setShowPanel] = useState(false);
+  const jitsiUrl = `https://meet.jit.si/NursingHub-${roomId.replace(/[^a-z0-9]/gi, "-")}`;
+  return (
+    <>
+      <button
+        onClick={() => setShowPanel(true)}
+        title={`Start group video call — ${label}`}
+        style={{
+          background: "linear-gradient(135deg,#1d4ed8,#3b82f6)",
+          border: "none", borderRadius: 10, padding: "6px 13px",
+          color: "white", fontSize: 12, fontWeight: 800,
+          cursor: "pointer", display: "flex", alignItems: "center", gap: 5,
+          boxShadow: "0 2px 8px rgba(59,130,246,.35)", flexShrink: 0,
+          ...style,
+        }}
+      >📹 Video Call</button>
+
+      {showPanel && (
+        <div style={{ position:"fixed", inset:0, zIndex:10002, background:"rgba(0,0,0,.72)", display:"flex", alignItems:"center", justifyContent:"center", padding:16 }}>
+          <div style={{ background:"var(--bg)", borderRadius:20, width:"min(95vw,520px)", overflow:"hidden", boxShadow:"0 24px 64px rgba(0,0,0,.5)", border:"1.5px solid #3b82f6" }}>
+            <div style={{ padding:"14px 18px", background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", display:"flex", alignItems:"center", gap:12 }}>
+              <div style={{ width:40, height:40, borderRadius:12, background:"rgba(255,255,255,.15)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:20 }}>📹</div>
+              <div style={{ flex:1 }}>
+                <div style={{ fontWeight:900, fontSize:15, color:"white" }}>{label} — Group Video Call</div>
+                <div style={{ fontSize:11, color:"rgba(255,255,255,.75)" }}>Share the link below so others can join</div>
+              </div>
+              <button onClick={() => setShowPanel(false)} style={{ background:"rgba(255,255,255,.18)", border:"none", borderRadius:8, padding:"6px 11px", color:"white", cursor:"pointer", fontWeight:700, fontSize:14 }}>✕</button>
+            </div>
+            <div style={{ padding:"22px 20px" }}>
+              <div style={{ fontSize:13, color:"var(--text3)", marginBottom:12, lineHeight:1.6 }}>
+                Click <b>Join Video Call</b> to open a free, secure group video room. Everyone in <b>{label}</b> can join using the same link.
+              </div>
+              <div style={{ background:"var(--bg4)", border:"1.5px solid var(--border)", borderRadius:12, padding:"10px 14px", fontFamily:"'DM Mono',monospace", fontSize:11, color:"var(--text)", wordBreak:"break-all", marginBottom:16, userSelect:"all" }}>
+                {jitsiUrl}
+              </div>
+              <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+                <button
+                  onClick={() => { window.open(jitsiUrl, "_blank"); }}
+                  style={{ flex:1, padding:"12px 0", borderRadius:12, background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", border:"none", color:"white", fontWeight:800, fontSize:14, cursor:"pointer", boxShadow:"0 4px 16px rgba(59,130,246,.4)" }}
+                >📹 Join Video Call</button>
+                <button
+                  onClick={() => { try { navigator.clipboard.writeText(jitsiUrl); } catch(e) {} }}
+                  style={{ padding:"12px 18px", borderRadius:12, background:"var(--bg4)", border:"1.5px solid var(--border)", color:"var(--text)", fontWeight:700, fontSize:13, cursor:"pointer" }}
+                >📋 Copy Link</button>
+              </div>
+              <div style={{ fontSize:11, color:"var(--text3)", marginTop:14, textAlign:"center" }}>
+                Powered by <b>Jitsi Meet</b> · No account needed · End-to-end encrypted
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 function PHNClassForum({ currentUser, onClose, onUnreadChange }) {
   const allUsers  = ls("nv-users", []);
   const me        = allUsers.find(u => u.username === currentUser) || {};
@@ -7957,6 +8018,7 @@ function PHNClassForum({ currentUser, onClose, onUnreadChange }) {
                 👨‍🏫 Lecturers
               </button>
             )}
+            <GroupVideoCallBtn roomId={PHN_FORUM_ID} label="PHN Class Forum" style={{ background:"rgba(59,130,246,.35)", border:"1.5px solid rgba(59,130,246,.6)" }} />
             <button onClick={() => setShowFolder(true)} title="PHN Study Folder"
               style={{ background: "rgba(255,255,255,.22)", border: "1.5px solid rgba(255,255,255,.45)", borderRadius: 10, padding: "6px 13px", color: "white", fontSize: 12, fontWeight: 800, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
               📁 Folder
@@ -8044,6 +8106,7 @@ function PHNClassForum({ currentUser, onClose, onUnreadChange }) {
           onClose={() => setShowFolder(false)}
         />
       )}
+      {/* Group Video Call via Jitsi */}
     </div>
   );
 }
@@ -9673,6 +9736,271 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
   );
 }
 
+// ── VideoCallModal ──────────────────────────────────────────────────────
+function VideoCallModal({ user, peer, role, onEnd, toast }) {
+  const [status, setStatus]     = useState(role === "caller" ? "calling" : "incoming");
+  const [duration, setDuration] = useState(0);
+  const [muted, setMuted]       = useState(false);
+  const [videoOff, setVideoOff] = useState(false);
+  const [connState, setConnState] = useState("");
+
+  const pcRef             = useRef(null);
+  const localStreamRef    = useRef(null);
+  const localVideoRef     = useRef(null);
+  const remoteVideoRef    = useRef(null);
+  const timerRef          = useRef(null);
+  const unsubRef          = useRef(null);
+  const appliedCalleeIce  = useRef(0);
+  const appliedCallerIce  = useRef(0);
+  const remoteDescSet     = useRef(false);
+  const pendingCandidates = useRef([]);
+
+  const allUsers  = ls("nv-users", []);
+  const peerName   = allUsers.find(u => u.username === peer)?.displayName || peer.split("@")[0];
+  const peerAvatar = (peerName[0] || "?").toUpperCase();
+
+  // Use a separate Firestore path for video calls
+  const vcCallId   = (a, b) => "vc__" + [a, b].map(_safeKey).sort().join("__");
+  const vcSignal   = async (data) => {
+    const ready = await _loadFirebase(); if (!ready) return false;
+    try { await _db.collection("video_calls").doc(vcCallId(user, peer)).set({ ...data, updatedAt: Date.now() }, { merge: true }); return true; }
+    catch(e) { return false; }
+  };
+  const vcAddCandidate = async (myRole, candidate) => {
+    const ready = await _loadFirebase(); if (!ready) return;
+    try {
+      const cid = vcCallId(user, peer);
+      const snap = await _db.collection("video_calls").doc(cid).get();
+      const field = myRole === "caller" ? "callerCandidates" : "calleeCandidates";
+      const existing = snap.exists ? (snap.data()[field] || []) : [];
+      await _db.collection("video_calls").doc(cid).update({ [field]: [...existing, candidate] });
+    } catch(e) {}
+  };
+  const vcSubscribe = (onChange) =>
+    _mkSub(db => db.collection("video_calls").doc(vcCallId(user, peer)).onSnapshot(snap => { if (snap.exists) onChange({ id: snap.id, ...snap.data() }); }, () => {}));
+  const vcEnd = async () => {
+    const ready = await _loadFirebase(); if (!ready) return;
+    try { await _db.collection("video_calls").doc(vcCallId(user, peer)).set({ status: "ended", updatedAt: Date.now() }, { merge: true }); } catch(e) {}
+  };
+
+  const flushPending = useCallback(async (pc) => {
+    for (const c of pendingCandidates.current) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
+    }
+    pendingCandidates.current = [];
+  }, []);
+
+  const safeAddIce = useCallback(async (pc, candidate) => {
+    if (!pc || pc.signalingState === "closed") return;
+    if (!remoteDescSet.current) { pendingCandidates.current.push(candidate); return; }
+    try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch(e) {}
+  }, []);
+
+  const cleanup = useCallback(() => {
+    clearInterval(timerRef.current);
+    if (unsubRef.current)    { unsubRef.current(); unsubRef.current = null; }
+    if (pcRef.current)       { try { pcRef.current.close(); } catch(e){} pcRef.current = null; }
+    if (localStreamRef.current) { localStreamRef.current.getTracks().forEach(t => t.stop()); localStreamRef.current = null; }
+    remoteDescSet.current = false; pendingCandidates.current = [];
+  }, []);
+
+  const hangUp = useCallback(async () => {
+    cleanup(); await vcEnd(); setStatus("ended"); setTimeout(() => onEnd(), 1500);
+  }, [user, peer, cleanup, onEnd]);
+
+  const setupPC = useCallback(async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+    });
+    localStreamRef.current = stream;
+    if (localVideoRef.current) { localVideoRef.current.srcObject = stream; localVideoRef.current.play().catch(()=>{}); }
+
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "turn:a.relay.metered.ca:80", username: "free", credential: "free" },
+        { urls: "turn:a.relay.metered.ca:443", username: "free", credential: "free" },
+        { urls: "turns:a.relay.metered.ca:443", username: "free", credential: "free" },
+      ],
+      iceCandidatePoolSize: 10,
+    });
+    pcRef.current = pc;
+    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+    pc.ontrack = (e) => {
+      const remoteStream = e.streams?.[0] || new MediaStream([e.track]);
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = remoteStream;
+        remoteVideoRef.current.play().catch(()=>{});
+      }
+    };
+    pc.onicecandidate = async (e) => {
+      if (e.candidate) await vcAddCandidate(role === "caller" ? "caller" : "callee", e.candidate.toJSON());
+    };
+    pc.onconnectionstatechange = () => {
+      setConnState(pc.connectionState);
+      if (pc.connectionState === "failed") { toast("Video call connection failed", "error"); hangUp(); }
+    };
+    return pc;
+  }, [user, peer, role, hangUp, toast]);
+
+  const startCall = useCallback(async () => {
+    try {
+      const pc = await setupPC();
+      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      await pc.setLocalDescription(offer);
+      await vcSignal({ caller: user, callee: peer, status: "ringing", offer: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
+      unsubRef.current = vcSubscribe(async (doc) => {
+        if (doc.status === "rejected" || doc.status === "ended") { cleanup(); setStatus("ended"); setTimeout(() => onEnd(), 1500); return; }
+        if (doc.answer && !remoteDescSet.current && pc.signalingState !== "closed") {
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(doc.answer));
+            remoteDescSet.current = true; await flushPending(pc);
+            setStatus("active"); timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
+          } catch(err) {}
+        }
+        if (doc.calleeCandidates) {
+          const fresh = doc.calleeCandidates.slice(appliedCalleeIce.current);
+          for (const c of fresh) await safeAddIce(pc, c);
+          appliedCalleeIce.current = doc.calleeCandidates.length;
+        }
+      });
+    } catch(e) { toast("Could not start video call: " + (e.message || "camera/mic denied"), "error"); hangUp(); }
+  }, [setupPC, user, peer, cleanup, onEnd, hangUp, toast, flushPending, safeAddIce]);
+
+  const answerCall = useCallback(async () => {
+    try {
+      const pc = await setupPC();
+      const cid  = vcCallId(user, peer);
+      const snap = await _db.collection("video_calls").doc(cid).get();
+      if (!snap.exists || !snap.data().offer) { toast("Video call offer not found", "error"); hangUp(); return; }
+      await pc.setRemoteDescription(new RTCSessionDescription(snap.data().offer));
+      remoteDescSet.current = true; await flushPending(pc);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await vcSignal({ status: "active", answer: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
+      setStatus("active"); timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
+      unsubRef.current = vcSubscribe(async (doc) => {
+        if (doc.status === "ended") { cleanup(); setStatus("ended"); setTimeout(() => onEnd(), 1500); return; }
+        if (doc.callerCandidates) {
+          const fresh = doc.callerCandidates.slice(appliedCallerIce.current);
+          for (const c of fresh) await safeAddIce(pc, c);
+          appliedCallerIce.current = doc.callerCandidates.length;
+        }
+      });
+    } catch(e) { toast("Could not answer video call: " + (e.message || "camera/mic denied"), "error"); hangUp(); }
+  }, [setupPC, user, peer, cleanup, onEnd, hangUp, toast, flushPending, safeAddIce]);
+
+  const rejectCall = useCallback(async () => {
+    await vcSignal({ status: "rejected" }); cleanup(); onEnd();
+  }, [user, peer, cleanup, onEnd]);
+
+  useEffect(() => { if (role === "caller") startCall(); return () => cleanup(); }, []); // eslint-disable-line
+
+  const toggleMute = () => {
+    if (localStreamRef.current) {
+      const nowMuted = !muted;
+      localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = !nowMuted; });
+      setMuted(nowMuted);
+    }
+  };
+  const toggleVideo = () => {
+    if (localStreamRef.current) {
+      const nowOff = !videoOff;
+      localStreamRef.current.getVideoTracks().forEach(t => { t.enabled = !nowOff; });
+      setVideoOff(nowOff);
+    }
+  };
+
+  const fmtDur = (s) => String(Math.floor(s/60)).padStart(2,"0") + ":" + String(s%60).padStart(2,"0");
+  const statusColors = { calling:"#f59e0b", incoming:"#3b82f6", active:"#22c55e", ended:"#6b7280" };
+
+  return (
+    <div style={{ position:"fixed", inset:0, zIndex:9999, display:"flex", alignItems:"center", justifyContent:"center", background:"rgba(0,0,0,.85)", backdropFilter:"blur(12px)" }}>
+      <div style={{ background:"#111", borderRadius:24, width:"min(95vw,780px)", maxHeight:"92vh", display:"flex", flexDirection:"column", overflow:"hidden", boxShadow:"0 32px 80px rgba(0,0,0,.7)", border:"1.5px solid rgba(255,255,255,.08)" }}>
+
+        {/* Remote video (main) */}
+        <div style={{ position:"relative", flex:1, background:"#000", minHeight:260, display:"flex", alignItems:"center", justifyContent:"center" }}>
+          <video ref={remoteVideoRef} autoPlay playsInline style={{ width:"100%", height:"100%", objectFit:"cover", display: status==="active" ? "block" : "none" }} />
+
+          {/* Peer avatar placeholder when not active */}
+          {status !== "active" && (
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:16 }}>
+              <div style={{ width:96, height:96, borderRadius:"50%", background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:40, fontWeight:800, color:"white", boxShadow:"0 0 0 4px " + statusColors[status] + "60" }}>
+                {peerAvatar}
+              </div>
+              <div style={{ color:"white", fontWeight:800, fontSize:20 }}>{peerName}</div>
+              <div style={{ color: statusColors[status], fontWeight:700, fontSize:14, fontFamily:"'DM Mono',monospace" }}>
+                {status==="calling" ? "Calling…" : status==="incoming" ? "📹 Incoming Video Call" : status==="ended" ? "Call Ended" : ""}
+              </div>
+            </div>
+          )}
+
+          {/* Status bar when active */}
+          {status === "active" && (
+            <div style={{ position:"absolute", top:14, left:0, right:0, display:"flex", justifyContent:"center" }}>
+              <div style={{ background:"rgba(0,0,0,.55)", borderRadius:20, padding:"5px 16px", color:"white", fontFamily:"'DM Mono',monospace", fontSize:13, fontWeight:700 }}>
+                📹 {fmtDur(duration)}{connState==="connecting" ? " (connecting…)" : ""}
+              </div>
+            </div>
+          )}
+
+          {/* Local video (picture-in-picture) */}
+          {(status === "active" || status === "calling") && (
+            <div style={{ position:"absolute", bottom:14, right:14, width:120, height:90, borderRadius:12, overflow:"hidden", border:"2px solid rgba(255,255,255,.25)", background:"#222", boxShadow:"0 4px 20px rgba(0,0,0,.5)" }}>
+              <video ref={localVideoRef} autoPlay playsInline muted style={{ width:"100%", height:"100%", objectFit:"cover", display: videoOff ? "none" : "block" }} />
+              {videoOff && <div style={{ width:"100%", height:"100%", display:"flex", alignItems:"center", justifyContent:"center", color:"rgba(255,255,255,.5)", fontSize:28 }}>🚫</div>}
+            </div>
+          )}
+        </div>
+
+        {/* Controls bar */}
+        <div style={{ padding:"18px 24px", background:"#1a1a1a", display:"flex", alignItems:"center", justifyContent:"center", gap:20, flexShrink:0 }}>
+
+          {status === "incoming" && (
+            <>
+              <div style={{ textAlign:"center" }}>
+                <button onClick={rejectCall} style={{ width:58, height:58, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", boxShadow:"0 4px 16px rgba(239,68,68,.4)" }}>📵</button>
+                <div style={{ fontSize:11, color:"rgba(255,255,255,.55)", fontWeight:700 }}>Decline</div>
+              </div>
+              <div style={{ textAlign:"center" }}>
+                <button onClick={answerCall} style={{ width:58, height:58, borderRadius:"50%", background:"#22c55e", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", boxShadow:"0 4px 16px rgba(34,197,94,.4)" }}>📹</button>
+                <div style={{ fontSize:11, color:"rgba(255,255,255,.55)", fontWeight:700 }}>Answer</div>
+              </div>
+            </>
+          )}
+
+          {(status === "active" || status === "calling") && (
+            <>
+              <div style={{ textAlign:"center" }}>
+                <button onClick={toggleMute} style={{ width:50, height:50, borderRadius:"50%", background: muted ? "#ef4444" : "rgba(255,255,255,.12)", border:"1.5px solid rgba(255,255,255,.15)", cursor:"pointer", fontSize:20, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px" }}>
+                  {muted ? "🔇" : "🎙️"}
+                </button>
+                <div style={{ fontSize:10, color:"rgba(255,255,255,.5)", fontWeight:700 }}>{muted?"Unmute":"Mute"}</div>
+              </div>
+              <div style={{ textAlign:"center" }}>
+                <button onClick={toggleVideo} style={{ width:50, height:50, borderRadius:"50%", background: videoOff ? "#ef4444" : "rgba(255,255,255,.12)", border:"1.5px solid rgba(255,255,255,.15)", cursor:"pointer", fontSize:20, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px" }}>
+                  {videoOff ? "🚫" : "📷"}
+                </button>
+                <div style={{ fontSize:10, color:"rgba(255,255,255,.5)", fontWeight:700 }}>{videoOff?"Camera Off":"Camera"}</div>
+              </div>
+              <div style={{ textAlign:"center" }}>
+                <button onClick={hangUp} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", boxShadow:"0 4px 16px rgba(239,68,68,.4)" }}>📵</button>
+                <div style={{ fontSize:10, color:"rgba(255,255,255,.5)", fontWeight:700 }}>End Call</div>
+              </div>
+            </>
+          )}
+
+          {status === "ended" && (
+            <div style={{ color:"rgba(255,255,255,.5)", fontSize:14 }}>Call ended</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Messages({ user, toast, onUnreadChange }) {
   const allUsers  = ls("nv-users", []);
   const allClasses = ls("nv-classes", DEFAULT_CLASSES);
@@ -9833,9 +10161,37 @@ function Messages({ user, toast, onUnreadChange }) {
     return () => { unsub(); };
   }, [user]);
 
+  const [videoCallModal, setVideoCallModal] = useState(null);
+
+  // ── Listen for incoming VIDEO calls ───────────────────────────────
+  const videoCallModalRef = useRef(videoCallModal);
+  useEffect(() => { videoCallModalRef.current = videoCallModal; }, [videoCallModal]);
+
+  useEffect(() => {
+    if (!user || !_db) return;
+    const unsub = _db.collection("video_calls")
+      .where("callee", "==", user)
+      .onSnapshot(snap => {
+        snap.docChanges().forEach(change => {
+          if (change.type === "added" || change.type === "modified") {
+            const d = change.doc.data();
+            if (d.status === "ringing" && !videoCallModalRef.current) {
+              setVideoCallModal({ peer: d.caller, role: "callee" });
+            }
+          }
+        });
+      }, () => {});
+    return () => { unsub(); };
+  }, [user]);
+
   const startVoiceCall = () => {
     if (!activeUser) return;
     setCallModal({ peer: activeUser, role: "caller" });
+  };
+
+  const startVideoCall = () => {
+    if (!activeUser) return;
+    setVideoCallModal({ peer: activeUser, role: "caller" });
   };
 
   // ── Send text ─────────────────────────────────────────────────────
@@ -10218,10 +10574,11 @@ function Messages({ user, toast, onUnreadChange }) {
                     {/* Header */}
                     <div style={{ padding:"10px 16px", borderBottom:"1.5px solid var(--border)", background:"var(--bg4)", display:"flex", alignItems:"center", gap:10 }}>
                       <div style={{ width:32, height:32, borderRadius:9, background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🏫</div>
-                      <div>
+                      <div style={{ flex:1 }}>
                         <div style={{ fontWeight:800, fontSize:14, color:"var(--text)" }}>{allClasses.find(c=>c.id===broadcastClass)?.label}</div>
                         <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===broadcastClass).length} students · Group chat</div>
                       </div>
+                      <GroupVideoCallBtn roomId={"class-" + broadcastClass} label={allClasses.find(c=>c.id===broadcastClass)?.label || "Class"} />
                     </div>
 
                     {/* Messages */}
@@ -10299,10 +10656,11 @@ function Messages({ user, toast, onUnreadChange }) {
               {(() => { if (!broadcastClass && myClassId) setTimeout(()=>setBroadcastClass(myClassId),0); return null; })()}
               <div style={{ padding:"10px 16px", borderBottom:"1.5px solid var(--border)", background:"var(--bg4)", display:"flex", alignItems:"center", gap:10 }}>
                 <div style={{ width:32, height:32, borderRadius:9, background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🏫</div>
-                <div>
+                <div style={{ flex:1 }}>
                   <div style={{ fontWeight:800, fontSize:14, color:"var(--text)" }}>{allClasses.find(c=>c.id===myClassId)?.label || "Class Group Chat"}</div>
                   <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===myClassId).length + 1} members · Group chat</div>
                 </div>
+                <GroupVideoCallBtn roomId={"class-" + myClassId} label={allClasses.find(c=>c.id===myClassId)?.label || "Class"} />
               </div>
               {/* Messages */}
               <div style={{ flex:1, overflowY:"auto", padding:"16px 20px", display:"flex", flexDirection:"column", gap:10 }}>
@@ -10474,6 +10832,17 @@ function Messages({ user, toast, onUnreadChange }) {
               onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}
             >📞</button>
           )}
+          {/* Video call button */}
+          {activeUser && (
+            <button
+              className="btn btn-sm"
+              style={{ flexShrink:0, width:36, height:36, borderRadius:"50%", padding:0, display:"flex", alignItems:"center", justifyContent:"center", fontSize:17, background:"linear-gradient(135deg,#3b82f6,#1d4ed8)", border:"none", color:"white", boxShadow:"0 2px 8px rgba(59,130,246,.35)", cursor:"pointer", transition:"transform .15s" }}
+              title={`Video call ${displayName(activeUser)}`}
+              onClick={startVideoCall}
+              onMouseEnter={e=>e.currentTarget.style.transform="scale(1.08)"}
+              onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}
+            >📹</button>
+          )}
         </div>
 
         {/* ── CHAT AREA (full width) ── */}
@@ -10592,6 +10961,16 @@ function Messages({ user, toast, onUnreadChange }) {
         role={callModal.role}
         toast={toast}
         onEnd={() => setCallModal(null)}
+      />
+    )}
+    {/* ── Video Call Modal ── */}
+    {videoCallModal && (
+      <VideoCallModal
+        user={user}
+        peer={videoCallModal.peer}
+        role={videoCallModal.role}
+        toast={toast}
+        onEnd={() => setVideoCallModal(null)}
       />
     )}
     </Fragment>
@@ -14723,6 +15102,7 @@ function ResearchClub({ currentUser, toast, isLecturer, isAdmin }) {
 
         {/* Private DM dropdown */}
         <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <GroupVideoCallBtn roomId="research-club-main" label="Research Club" />
           <select
             value={dmTarget}
             onChange={e=>setDmTarget(e.target.value)}
@@ -14903,7 +15283,8 @@ function StudyGroups({ currentUser, toast }) {
       <div style={{display:"flex",alignItems:"center",gap:12,padding:"12px 0",borderBottom:"1px solid var(--border)",marginBottom:12}}>
         <button onClick={()=>setActiveGroup(null)} style={{background:"none",border:"none",cursor:"pointer",fontSize:20,color:"var(--text3)"}}>←</button>
         <div style={{width:40,height:40,borderRadius:50,background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>👥</div>
-        <div><div style={{fontWeight:800,fontSize:16}}>{activeGroup.name}</div><div style={{fontSize:11,color:"var(--text3)"}}>{activeGroup.desc||myClass?.label||"Study group"}</div></div>
+        <div style={{flex:1}}><div style={{fontWeight:800,fontSize:16}}>{activeGroup.name}</div><div style={{fontSize:11,color:"var(--text3)"}}>{activeGroup.desc||myClass?.label||"Study group"}</div></div>
+        <GroupVideoCallBtn roomId={activeGroup.id} label={activeGroup.name} />
       </div>
       <div style={{flex:1,overflowY:"auto",padding:"0 4px",display:"flex",flexDirection:"column",gap:8}}>
         {msgs.map(m => {
@@ -15762,7 +16143,6 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
   const [isOffline, setIsOffline] = useState(!navigator.onLine);
   const [pinLocked, setPinLocked] = useState(false);
   const [bypassPin, setBypassPin] = useState(false);
-  const [showPinSetup, setShowPinSetup] = useState(false);
   useEffect(() => {
     const go  = () => setIsOffline(false);
     const off = () => setIsOffline(true);
@@ -16469,6 +16849,7 @@ self.addEventListener('notificationclick', e => {
   const [unreadPHNForum, setUnreadPHNForum] = useState(0);  // show setup modal after first login
   const [pinLocked,     setPinLocked]     = useState(false);  // show unlock screen
   const [bypassPin,     setBypassPin]     = useState(false);  // user chose "use password"
+  const [showPinSetup,  setShowPinSetup]  = useState(false); // show PIN setup modal after login/register
   // Offline indicator
   const [isOffline, setIsOffline] = useState(!navigator.onLine);
   // Forgot password states
@@ -17268,6 +17649,17 @@ self.addEventListener('notificationclick', e => {
         </div>
       </div>
       <Toasts list={toasts} />
+      {showPinSetup && (
+        <PinSetupModal
+          email={currentUser}
+          toast={toast}
+          onDone={() => setShowPinSetup(false)}
+          onSkip={() => {
+            try { localStorage.setItem("nv-pin-skipped-" + currentUser.replace(/[^a-z0-9]/gi,"_"), "1"); } catch{}
+            setShowPinSetup(false);
+          }}
+        />
+      )}
     </>
   );
 }
