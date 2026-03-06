@@ -7714,34 +7714,38 @@ function PHNFolderModal({ currentUser, isAdmin, onClose }) {
 // ════════════════════════════════════════════════════════════════════════
 // GROUP VIDEO CALL — fully embedded on-site WebRTC mesh
 //
-// Firestore layout  (mirrors the working voice_calls pattern exactly):
-//   group_calls/{roomId}/peers/{safeUid}   ← presence
-//   group_calls/{roomId}/sigs/{pairId}     ← one doc per caller/callee pair
-//     pairId = _safeKey(callerUid) + "__" + _safeKey(calleeUid)
-//     fields : caller, callee, offer, answer, callerIce[], calleeIce[]
+// Firestore layout:
+//   group_calls/{roomId}/peers/{safeUid}          ← presence heartbeat
+//   group_calls/{roomId}/signals/{safeFrom}_{safeTo}  ← one doc per direction
+//     fields: from, to, offer?, answer?, callerIce[], calleeIce[]
 //
-// Rule: caller = the peer whose uid is alphabetically SMALLER.
+// Caller  = alphabetically-smaller uid  (creates offer)
+// Callee  = alphabetically-larger  uid  (creates answer)
+// Each pair shares ONE signal doc keyed caller_callee.
 // ════════════════════════════════════════════════════════════════════════
 
 const GVC_ICE = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "turn:a.relay.metered.ca:80",              username:"free", credential:"free" },
-    { urls: "turn:a.relay.metered.ca:80?transport=tcp", username:"free", credential:"free" },
-    { urls: "turn:a.relay.metered.ca:443",             username:"free", credential:"free" },
-    { urls: "turns:a.relay.metered.ca:443",            username:"free", credential:"free" },
+    { urls: "turn:a.relay.metered.ca:80",               username:"free", credential:"free" },
+    { urls: "turn:a.relay.metered.ca:80?transport=tcp",  username:"free", credential:"free" },
+    { urls: "turn:a.relay.metered.ca:443",              username:"free", credential:"free" },
+    { urls: "turns:a.relay.metered.ca:443",             username:"free", credential:"free" },
   ],
   iceCandidatePoolSize: 10,
 };
 
-// ── Firestore helpers (same read-then-write pattern as callAddCandidate) ─
-const _gvcPeersCol = (roomId) => _db.collection("group_calls").doc(roomId).collection("peers");
-const _gvcSigsCol  = (roomId) => _db.collection("group_calls").doc(roomId).collection("sigs");
-// pairId: caller is always the smaller uid
-const _gvcPairId  = (a, b) => { const [x,y] = a < b ? [a,b] : [b,a]; return _safeKey(x)+"__"+_safeKey(y); };
-const _gvcSigDoc  = (roomId, a, b) => _gvcSigsCol(roomId).doc(_gvcPairId(a, b));
+// Deterministic doc id for a pair — always caller(smaller)_callee(larger)
+const _gvcPairId = (a, b) => {
+  const [x, y] = a < b ? [a, b] : [b, a];
+  return _safeKey(x) + "_" + _safeKey(y);
+};
+const _gvcPeersCol  = (roomId) => _db.collection("group_calls").doc(roomId).collection("peers");
+const _gvcSigsCol   = (roomId) => _db.collection("group_calls").doc(roomId).collection("signals");
+const _gvcSigDoc    = (roomId, a, b) => _gvcSigsCol(roomId).doc(_gvcPairId(a, b));
 
+// Presence
 const gvcJoin  = async (roomId, uid) => {
   const ready = await _loadFirebase(); if (!ready) return;
   await _gvcPeersCol(roomId).doc(_safeKey(uid)).set({ uid, ts: Date.now() }, { merge: true });
@@ -7750,105 +7754,88 @@ const gvcLeave = async (roomId, uid) => {
   const ready = await _loadFirebase(); if (!ready) return;
   try { await _gvcPeersCol(roomId).doc(_safeKey(uid)).delete(); } catch(e) {}
 };
-// Write offer — fresh doc, wipes stale state from previous calls
-const gvcWriteOffer = async (roomId, callerUid, calleeUid, offer) => {
-  await _gvcSigDoc(roomId, callerUid, calleeUid).set({
-    caller: callerUid, callee: calleeUid,
-    offer, callerIce: [], calleeIce: [], ts: Date.now(),
-  });
+
+// Write offer (caller → signal doc)
+const gvcWriteOffer = async (roomId, caller, callee, offer) => {
+  await _gvcSigDoc(roomId, caller, callee).set(
+    { from: caller, to: callee, offer, callerIce: [], calleeIce: [], updatedAt: Date.now() },
+    { merge: false }   // always fresh for a new call session
+  );
 };
-// Merge answer into existing doc
-const gvcWriteAnswer = async (roomId, callerUid, calleeUid, answer) => {
-  await _gvcSigDoc(roomId, callerUid, calleeUid).set({ answer }, { merge: true });
+// Write answer (callee → signal doc)
+const gvcWriteAnswer = async (roomId, caller, callee, answer) => {
+  await _gvcSigDoc(roomId, caller, callee).set({ answer, updatedAt: Date.now() }, { merge: true });
 };
-// Append one ICE candidate — uses the same read-then-write as the working voice call
-const gvcAddIce = async (roomId, callerUid, calleeUid, candidate, role) => {
-  try {
-    const field = role === "caller" ? "callerIce" : "calleeIce";
-    const ref   = _gvcSigDoc(roomId, callerUid, calleeUid);
-    const snap  = await ref.get();
-    const existing = snap.exists ? (snap.data()[field] || []) : [];
-    await ref.update({ [field]: [...existing, candidate] });
-  } catch(e) { console.warn("[GVC] addIce failed:", e.message); }
+// Append ICE using arrayUnion — race-condition safe
+const gvcAddIce = async (roomId, a, b, candidate, role) => {
+  // role: "caller" | "callee"
+  const field = role === "caller" ? "callerIce" : "calleeIce";
+  await _gvcSigDoc(roomId, a, b).set(
+    { [field]: window.firebase.firestore.FieldValue.arrayUnion(candidate) },
+    { merge: true }
+  );
 };
 
 function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
   const allUsers = ls("nv-users", []);
 
-  const [peers,    setPeers]    = useState({});
+  const [peers,    setPeers]    = useState({});    // { uid: { name, stream } }
   const [muted,    setMuted]    = useState(false);
   const [videoOff, setVideoOff] = useState(false);
   const [duration, setDuration] = useState(0);
   const [status,   setStatus]   = useState("joining");
   const [errMsg,   setErrMsg]   = useState("");
+  const [volume,   setVolume]   = useState(1);   // 1 = normal, up to 3 = 3× boost
 
-  const localStreamRef = useRef(null);
-  const localVideoRef  = useRef(null);
-  const pcsRef         = useRef({});  // remoteUid → RTCPeerConnection
-  const unsubsRef      = useRef([]);
-  const hbRef          = useRef(null);
-  const timerRef       = useRef(null);
-  // ICE queues — hold candidates that arrive before remoteDescription is ready
-  const iceQueues      = useRef({});  // remoteUid_role → [candidate, ...]
-  // How many ICE from each array we have already applied
-  const iceApplied     = useRef({});  // remoteUid_role → number
+  const localStreamRef  = useRef(null);
+  const localVideoRef   = useRef(null);
+  const pcsRef          = useRef({});   // remoteUid → RTCPeerConnection
+  const unsubsRef       = useRef([]);
+  const hbRef           = useRef(null);
+  const timerRef        = useRef(null);
+  const volumeRef       = useRef(1);   // synced with volume state, readable from callbacks
+  // Per-peer applied-ICE counters to avoid re-adding candidates
+  const appliedIce      = useRef({});   // remoteUid → { caller: n, callee: n }
 
-  const dname  = (uid) => { const u = allUsers.find(x=>x.username===uid); return u?.displayName||uid.split("@")[0]; };
-  const avChar = (uid) => (dname(uid)[0]||"?").toUpperCase();
+  const dname = (uid) => {
+    const u = allUsers.find(x => x.username === uid);
+    return u?.displayName || uid.split("@")[0];
+  };
+  const avChar = (uid) => (dname(uid)[0] || "?").toUpperCase();
 
-  // ── Safely apply a slice of the remote's ICE array ─────────────────
-  // Queues candidates if remoteDescription not yet set; drains queue when called after setRemoteDescription
-  const applyIceArr = useCallback(async (remoteUid, arr, role) => {
-    const pc  = pcsRef.current[remoteUid];
-    if (!pc || pc.signalingState === "closed") return;
-    const key = remoteUid + "_" + role;
-    // Queue candidates that are newer than what we've already seen
-    const seen = iceApplied.current[key] || 0;
-    const fresh = (arr || []).slice(seen);
-    iceApplied.current[key] = seen + fresh.length;
-    // Add to queue
-    iceQueues.current[key] = [...(iceQueues.current[key] || []), ...fresh];
-    // Only flush if remote description is already set
-    if (!pc.remoteDescription) return;
-    const toFlush = iceQueues.current[key] || [];
-    iceQueues.current[key] = [];
-    for (const c of toFlush) {
-      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
-    }
-  }, []);
-
-  // Flush pending queued ICE for a peer — call this right after setRemoteDescription
-  const flushIceQueue = useCallback(async (remoteUid) => {
+  // ── Apply new ICE candidates safely ───────────────────────────────
+  const applyIce = useCallback(async (remoteUid, candidates, role) => {
     const pc = pcsRef.current[remoteUid];
     if (!pc || pc.signalingState === "closed") return;
-    for (const role of ["caller","callee"]) {
-      const key  = remoteUid + "_" + role;
-      const todo = iceQueues.current[key] || [];
-      iceQueues.current[key] = [];
-      for (const c of todo) {
-        try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
-      }
+    if (!pc.remoteDescription) return; // not ready yet — will be called again after setRemoteDescription
+    const key = remoteUid + "_" + role;
+    const from = appliedIce.current[key] || 0;
+    const fresh = (candidates || []).slice(from);
+    for (const c of fresh) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
     }
+    appliedIce.current[key] = from + fresh.length;
   }, []);
 
-  // ── Create an RTCPeerConnection with local tracks and standard handlers ─
+  // ── Build one RTCPeerConnection for remoteUid ─────────────────────
   const makePc = useCallback((remoteUid) => {
+    if (pcsRef.current[remoteUid]) return pcsRef.current[remoteUid];
     const pc = new RTCPeerConnection(GVC_ICE);
     pcsRef.current[remoteUid] = pc;
-    iceQueues.current[remoteUid+"_caller"]  = [];
-    iceQueues.current[remoteUid+"_callee"]  = [];
-    iceApplied.current[remoteUid+"_caller"] = 0;
-    iceApplied.current[remoteUid+"_callee"] = 0;
-    // Attach our own tracks so the remote receives them
+    appliedIce.current[remoteUid + "_caller"] = 0;
+    appliedIce.current[remoteUid + "_callee"] = 0;
+
+    // Attach local tracks
     localStreamRef.current?.getTracks().forEach(t => pc.addTrack(t, localStreamRef.current));
-    // When remote tracks arrive, show their tile
+
+    // Remote stream → show tile
     pc.ontrack = (e) => {
       const stream = e.streams?.[0] || new MediaStream([e.track]);
       setPeers(prev => ({ ...prev, [remoteUid]: { name: dname(remoteUid), stream } }));
     };
     pc.onconnectionstatechange = () => {
       if (["disconnected","failed","closed"].includes(pc.connectionState)) {
-        setPeers(prev => { const n={...prev}; delete n[remoteUid]; return n; });
+        setPeers(prev => { const n = { ...prev }; delete n[remoteUid]; return n; });
         try { pc.close(); } catch(e) {}
         delete pcsRef.current[remoteUid];
       }
@@ -7856,130 +7843,128 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
     return pc;
   }, []); // eslint-disable-line
 
-  // ── CALLER (smaller uid): create offer, watch for answer + callee ICE ─
-  const connectAsCaller = useCallback(async (calleeUid) => {
-    if (pcsRef.current[calleeUid]) return;
-    const pc = makePc(calleeUid);
-
-    // When we gather ICE, append it to Firestore using safe read-then-write
+  // ── Connect as CALLER (currentUser < remoteUid) ───────────────────
+  const connectAsCaller = useCallback(async (remoteUid) => {
+    const pc = makePc(remoteUid);
+    // Send our ICE
     pc.onicecandidate = async (e) => {
-      if (e.candidate) await gvcAddIce(roomId, currentUser, calleeUid, e.candidate.toJSON(), "caller");
+      if (e.candidate) await gvcAddIce(roomId, currentUser, remoteUid, e.candidate.toJSON(), "caller");
     };
-
-    // Create offer and write the signal doc (fresh)
-    const offer = await pc.createOffer({ offerToReceiveAudio:true, offerToReceiveVideo:true });
+    // Create & send offer
+    const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
     await pc.setLocalDescription(offer);
-    await gvcWriteOffer(roomId, currentUser, calleeUid, { type:offer.type, sdp:offer.sdp });
+    await gvcWriteOffer(roomId, currentUser, remoteUid, { type: offer.type, sdp: offer.sdp });
 
-    // Watch the signal doc for the answer and callee ICE
-    const unsub = _gvcSigDoc(roomId, currentUser, calleeUid).onSnapshot(async snap => {
+    // Watch signal doc for answer + callee ICE
+    const unsub = _gvcSigDoc(roomId, currentUser, remoteUid).onSnapshot(async snap => {
       if (!snap.exists) return;
       const d = snap.data();
-      const thisPc = pcsRef.current[calleeUid];
-      if (!thisPc || thisPc.signalingState === "closed") return;
-      // Apply answer exactly once
-      if (d.answer && !thisPc.remoteDescription) {
+      // Set answer once
+      if (d.answer && !pc.remoteDescription && pc.signalingState === "have-local-offer") {
         try {
-          await thisPc.setRemoteDescription(new RTCSessionDescription(d.answer));
-          await flushIceQueue(calleeUid);
-        } catch(e) { console.warn("[GVC caller] setRemoteDesc:", e.message); }
+          await pc.setRemoteDescription(new RTCSessionDescription(d.answer));
+          // Drain any callee ICE that arrived before answer
+          await applyIce(remoteUid, d.calleeIce, "callee");
+        } catch(e) { console.warn("[GVC caller] setRemoteDescription:", e.message); }
+      } else if (d.answer && pc.remoteDescription) {
+        // Answer already set — just drain new callee ICE
+        await applyIce(remoteUid, d.calleeIce, "callee");
       }
-      // Apply any new callee ICE candidates
-      await applyIceArr(calleeUid, d.calleeIce, "callee");
-    }, (e) => console.warn("[GVC caller] snapshot err:", e));
+    }, () => {});
     unsubsRef.current.push(unsub);
-  }, [roomId, currentUser, makePc, applyIceArr, flushIceQueue]);
+  }, [roomId, currentUser, makePc, applyIce]);
 
-  // ── CALLEE (larger uid): receive offer, create answer, watch for caller ICE ─
-  const connectAsCallee = useCallback(async (callerUid, offerData) => {
-    if (pcsRef.current[callerUid]) return;
-    const pc = makePc(callerUid);
-
-    // When we gather ICE, append it to Firestore
+  // ── Connect as CALLEE (currentUser > remoteUid) ───────────────────
+  const connectAsCallee = useCallback(async (remoteUid, offerData) => {
+    const pc = makePc(remoteUid);
+    // Send our ICE
     pc.onicecandidate = async (e) => {
-      if (e.candidate) await gvcAddIce(roomId, callerUid, currentUser, e.candidate.toJSON(), "callee");
+      if (e.candidate) await gvcAddIce(roomId, currentUser, remoteUid, e.candidate.toJSON(), "callee");
     };
-
-    // Apply offer, create answer
+    // Set offer → create answer
     await pc.setRemoteDescription(new RTCSessionDescription(offerData));
-    await flushIceQueue(callerUid); // apply any ICE queued before this
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    await gvcWriteAnswer(roomId, callerUid, currentUser, { type:answer.type, sdp:answer.sdp });
+    await gvcWriteAnswer(roomId, remoteUid, currentUser, { type: answer.type, sdp: answer.sdp });
+
+    // Drain any caller ICE that arrived before we got the offer
+    const snap = await _gvcSigDoc(roomId, remoteUid, currentUser).get().catch(()=>null);
+    if (snap?.exists) await applyIce(remoteUid, snap.data().callerIce, "caller");
 
     // Watch for new caller ICE
-    const unsub = _gvcSigDoc(roomId, callerUid, currentUser).onSnapshot(async snap => {
-      if (!snap.exists) return;
-      await applyIceArr(callerUid, snap.data().callerIce, "caller");
-    }, (e) => console.warn("[GVC callee] snapshot err:", e));
+    const unsub = _gvcSigDoc(roomId, remoteUid, currentUser).onSnapshot(async snap2 => {
+      if (!snap2.exists) return;
+      await applyIce(remoteUid, snap2.data().callerIce, "caller");
+    }, () => {});
     unsubsRef.current.push(unsub);
-  }, [roomId, currentUser, makePc, applyIceArr, flushIceQueue]);
+  }, [roomId, currentUser, makePc, applyIce]);
 
-  // ── Main effect: get media → join → watch peers → watch sigs ───────
+  // ── Main effect ────────────────────────────────────────────────────
   useEffect(() => {
     let active = true;
 
     (async () => {
-      // 1. Camera + mic
+      // 1. Get camera + mic
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation:true, noiseSuppression:true },
-          video: { width:{ ideal:1280 }, height:{ ideal:720 }, facingMode:"user" },
+          audio: { echoCancellation: true, noiseSuppression: true },
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
         });
       } catch(e) {
         setErrMsg("Camera/mic access denied. Please allow permissions and try again.");
         setStatus("error");
         return;
       }
-      if (!active) { stream.getTracks().forEach(t=>t.stop()); return; }
+      if (!active) { stream.getTracks().forEach(t => t.stop()); return; }
       localStreamRef.current = stream;
-      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      if (localVideoRef.current) { localVideoRef.current.srcObject = stream; }
 
-      // 2. Announce presence
+      // 2. Announce presence + heartbeat
       await gvcJoin(roomId, currentUser);
-      hbRef.current   = setInterval(() => gvcJoin(roomId, currentUser), 8000);
-      timerRef.current = setInterval(() => setDuration(d=>d+1), 1000);
+      hbRef.current  = setInterval(() => gvcJoin(roomId, currentUser), 8000);
+      timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
       setStatus("active");
 
-      // 3. Watch the peers subcollection
-      //    → if I am the caller (smaller uid), kick off the offer
+      // 3. Watch peers — start a connection to each new one
       const unsub1 = _gvcPeersCol(roomId).onSnapshot(snap => {
         if (!active) return;
-        snap.docs.forEach(doc => {
-          const uid = doc.data().uid;
+        snap.docs.forEach(d => {
+          const uid = d.data().uid;
           if (!uid || uid === currentUser || pcsRef.current[uid]) return;
           if (currentUser < uid) {
-            connectAsCaller(uid).catch(e => console.warn("[GVC] caller err:", e.message));
+            // We are the caller for this pair
+            connectAsCaller(uid).catch(console.warn);
           }
-          // callee path triggered by sigs watcher below
+          // Callee path is triggered by the signals watcher below
         });
-        // Disconnect peers who left
-        const present = new Set(snap.docs.map(d=>d.data().uid));
+        // Clean up peers who left
+        const present = new Set(snap.docs.map(d => d.data().uid));
         Object.keys(pcsRef.current).forEach(uid => {
           if (!present.has(uid)) {
             try { pcsRef.current[uid].close(); } catch(e) {}
             delete pcsRef.current[uid];
-            setPeers(prev => { const n={...prev}; delete n[uid]; return n; });
+            setPeers(prev => { const n = { ...prev }; delete n[uid]; return n; });
           }
         });
       }, () => {});
       unsubsRef.current.push(unsub1);
 
-      // 4. Watch the sigs subcollection
-      //    → if I am the callee (larger uid) and there's an offer for me, answer it
+      // 4. Watch signals collection for offers addressed TO ME (callee path)
       const unsub2 = _gvcSigsCol(roomId).onSnapshot(snap => {
         if (!active) return;
         snap.docChanges().forEach(async change => {
-          if (change.type === "removed") return;
           const d = change.doc.data();
-          // Only handle docs where I am the callee and there's a fresh offer
-          if (!d.offer || d.callee !== currentUser) return;
-          const callerUid = d.caller;
-          if (!callerUid || callerUid === currentUser || pcsRef.current[callerUid]) return;
+          // We care about docs where `to === currentUser` and there's an offer
+          if (!d.offer || d.to !== currentUser) return;
+          const remoteUid = d.from;
+          if (!remoteUid || remoteUid === currentUser) return;
+          if (pcsRef.current[remoteUid]) return; // already connected
+          // Safety: callee is always the alphabetically larger uid
+          if (!(currentUser > remoteUid)) return;
           try {
-            await connectAsCallee(callerUid, d.offer);
-          } catch(e) { console.warn("[GVC] callee err:", e.message); }
+            await connectAsCallee(remoteUid, d.offer);
+          } catch(e) { console.warn("[GVC callee]", e.message); }
         });
       }, () => {});
       unsubsRef.current.push(unsub2);
@@ -8005,6 +7990,13 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
     const nowOff = !videoOff;
     localStreamRef.current?.getVideoTracks().forEach(t => { t.enabled = !nowOff; });
     setVideoOff(nowOff);
+  };
+  const changeVolume = (v) => {
+    volumeRef.current = v;
+    window._gvcVolume = v;
+    setVolume(v);
+    // Update all remote tiles' gain nodes via custom event
+    window.dispatchEvent(new CustomEvent("gvc-volume", { detail: v }));
   };
 
   const fmtDur = s => String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
@@ -8073,6 +8065,18 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
           </button>
           <div style={{ fontSize:10, color:"rgba(255,255,255,.4)", fontWeight:700 }}>{videoOff ? "Start Video" : "Stop Video"}</div>
         </div>
+        {/* Volume boost slider */}
+        <div style={{ textAlign:"center", display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
+          <div style={{ fontSize:20 }}>{volume >= 2 ? "🔊" : volume >= 1 ? "🔉" : "🔈"}</div>
+          <input
+            type="range" min="0.5" max="3" step="0.1" value={volume}
+            onChange={e => changeVolume(parseFloat(e.target.value))}
+            style={{ width:72, accentColor:"var(--accent)", cursor:"pointer" }}
+          />
+          <div style={{ fontSize:10, color:"rgba(255,255,255,.4)", fontWeight:700 }}>
+            {volume === 1 ? "Volume" : volume > 1 ? `+${Math.round((volume-1)*100)}%` : `${Math.round(volume*100)}%`}
+          </div>
+        </div>
         <div style={{ textAlign:"center" }}>
           <button onClick={onClose} style={{ width:62, height:62, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 5px", boxShadow:"0 4px 16px rgba(239,68,68,.5)" }}>📵</button>
           <div style={{ fontSize:10, color:"rgba(255,255,255,.4)", fontWeight:700 }}>End Call</div>
@@ -8082,15 +8086,50 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
   );
 }
 
-// Separate component so each remote video gets its own stable ref
+// Separate component so each remote video gets its own stable ref + audio gain
 function RemoteVideoTile({ name, stream, avatarChar }) {
-  const videoRef = useRef(null);
+  const videoRef   = useRef(null);
+  const audioCtx   = useRef(null);
+  const gainNode   = useRef(null);
+
   useEffect(() => {
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
+    if (!stream) return;
+    let boostedStream = stream;
+    try {
+      const ctx  = new (window.AudioContext || window.webkitAudioContext)();
+      const gain = ctx.createGain();
+      gain.gain.value = window._gvcVolume || 1;
+      const src  = ctx.createMediaStreamSource(stream);
+      const dest = ctx.createMediaStreamDestination();
+      src.connect(gain);
+      gain.connect(dest);
+      audioCtx.current = ctx;
+      gainNode.current = gain;
+      // Combine boosted audio track with original video tracks
+      boostedStream = new MediaStream([
+        ...stream.getVideoTracks(),
+        ...dest.stream.getAudioTracks(),
+      ]);
+    } catch(e) {}
+    if (videoRef.current) {
+      videoRef.current.srcObject = boostedStream;
       videoRef.current.play().catch(()=>{});
     }
+    return () => {
+      try { audioCtx.current?.close(); } catch(e) {}
+      audioCtx.current = null; gainNode.current = null;
+    };
   }, [stream]);
+
+  // Listen for volume change events from the parent modal
+  useEffect(() => {
+    const handler = (e) => {
+      if (gainNode.current) gainNode.current.gain.value = e.detail;
+    };
+    window.addEventListener("gvc-volume", handler);
+    return () => window.removeEventListener("gvc-volume", handler);
+  }, []);
+
   return (
     <div style={{ position:"relative", background:"#1a1a1a", borderRadius:12, overflow:"hidden", aspectRatio:"16/9", display:"flex", alignItems:"center", justifyContent:"center" }}>
       {stream
@@ -10099,14 +10138,17 @@ function VoiceCallModal({ user, peer, role, onEnd, toast }) {
 function VideoCallModal({ user, peer, role, onEnd, toast }) {
   const [status, setStatus]     = useState(role === "caller" ? "calling" : "incoming");
   const [duration, setDuration] = useState(0);
-  const [muted, setMuted]       = useState(false);
-  const [videoOff, setVideoOff] = useState(false);
+  const [muted, setMuted]         = useState(false);
+  const [videoOff, setVideoOff]   = useState(false);
   const [connState, setConnState] = useState("");
+  const [volume, setVolume]       = useState(1);   // 1 = normal, up to 3 = 3× boost
 
   const pcRef             = useRef(null);
   const localStreamRef    = useRef(null);
   const localVideoRef     = useRef(null);
   const remoteVideoRef    = useRef(null);
+  const audioCtxRef       = useRef(null);
+  const gainNodeRef       = useRef(null);
   const timerRef          = useRef(null);
   const unsubRef          = useRef(null);
   const appliedCalleeIce  = useRef(0);
@@ -10160,6 +10202,7 @@ function VideoCallModal({ user, peer, role, onEnd, toast }) {
     if (unsubRef.current)    { unsubRef.current(); unsubRef.current = null; }
     if (pcRef.current)       { try { pcRef.current.close(); } catch(e){} pcRef.current = null; }
     if (localStreamRef.current) { localStreamRef.current.getTracks().forEach(t => t.stop()); localStreamRef.current = null; }
+    if (audioCtxRef.current) { try { audioCtxRef.current.close(); } catch(e){} audioCtxRef.current = null; gainNodeRef.current = null; }
     remoteDescSet.current = false; pendingCandidates.current = [];
   }, []);
 
@@ -10189,9 +10232,29 @@ function VideoCallModal({ user, peer, role, onEnd, toast }) {
 
     pc.ontrack = (e) => {
       const remoteStream = e.streams?.[0] || new MediaStream([e.track]);
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = remoteStream;
-        remoteVideoRef.current.play().catch(()=>{});
+      // Route through Web Audio gain node for volume boost
+      try {
+        if (!audioCtxRef.current) {
+          const ctx  = new (window.AudioContext || window.webkitAudioContext)();
+          const gain = ctx.createGain();
+          gain.gain.value = volume;
+          const src  = ctx.createMediaStreamSource(remoteStream);
+          const dest = ctx.createMediaStreamDestination();
+          src.connect(gain);
+          gain.connect(dest);
+          audioCtxRef.current = ctx;
+          gainNodeRef.current = gain;
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = dest.stream;
+            remoteVideoRef.current.play().catch(()=>{});
+          }
+        }
+      } catch(err) {
+        // Fallback: direct assign if Web Audio fails
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = remoteStream;
+          remoteVideoRef.current.play().catch(()=>{});
+        }
       }
     };
     pc.onicecandidate = async (e) => {
@@ -10271,6 +10334,10 @@ function VideoCallModal({ user, peer, role, onEnd, toast }) {
       setVideoOff(nowOff);
     }
   };
+  const changeVolume = (v) => {
+    setVolume(v);
+    if (gainNodeRef.current) gainNodeRef.current.gain.value = v;
+  };
 
   const fmtDur = (s) => String(Math.floor(s/60)).padStart(2,"0") + ":" + String(s%60).padStart(2,"0");
   const statusColors = { calling:"#f59e0b", incoming:"#3b82f6", active:"#22c55e", ended:"#6b7280" };
@@ -10343,6 +10410,18 @@ function VideoCallModal({ user, peer, role, onEnd, toast }) {
                   {videoOff ? "🚫" : "📷"}
                 </button>
                 <div style={{ fontSize:10, color:"rgba(255,255,255,.5)", fontWeight:700 }}>{videoOff?"Camera Off":"Camera"}</div>
+              </div>
+              {/* Volume boost slider */}
+              <div style={{ textAlign:"center", display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
+                <div style={{ fontSize:18 }}>{volume >= 2 ? "🔊" : volume >= 1 ? "🔉" : "🔈"}</div>
+                <input
+                  type="range" min="0.5" max="3" step="0.1" value={volume}
+                  onChange={e => changeVolume(parseFloat(e.target.value))}
+                  style={{ width:72, accentColor:"var(--accent)", cursor:"pointer" }}
+                />
+                <div style={{ fontSize:10, color:"rgba(255,255,255,.5)", fontWeight:700 }}>
+                  {volume === 1 ? "Volume" : volume > 1 ? `+${Math.round((volume-1)*100)}%` : `${Math.round(volume*100)}%`}
+                </div>
               </div>
               <div style={{ textAlign:"center" }}>
                 <button onClick={hangUp} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", boxShadow:"0 4px 16px rgba(239,68,68,.4)" }}>📵</button>
