@@ -2464,7 +2464,7 @@ function AdminSkills({ toast }) {
   return (
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
-        <div className="sec-title">✅ Skills Checklist ({skills.length})</div>
+        <div className="sec-title">✅ OSCE Clinical Checklist for RN ({skills.length})</div>
         <div style={{display:"flex",gap:8}}>
           <button className="btn btn-success btn-sm" onClick={()=>setPasteMode(p=>!p)}>📋 Paste</button>
           {skills.length>0&&<button className="btn btn-sm btn-danger" onClick={()=>{if(window.confirm(`Delete all ${skills.length} skills? This cannot be undone.`)){setSkills([]);saveShared("skills",[]);setSelSkills(new Set());toast("All skills deleted","success");}}}>🗑️ Delete All</button>}
@@ -6922,9 +6922,10 @@ function AdminNursingExams({ toast }) {
 
   // OSCE states
   const [osceText, setOsceText] = useState("");
+  const [osceAnswersText, setOsceAnswersText] = useState("");
   const [parsedOsce, setParsedOsce] = useState([]);
   const [editCheckIdx, setEditCheckIdx] = useState(null);
-  const [editCheckForm, setEditCheckForm] = useState({heading:"", steps:""});
+  const [editCheckForm, setEditCheckForm] = useState({heading:"", instructions:"", activities:"", questionStation:"", answers:""});
 
   const meta = NURSING_EXAM_META[activeSpec];
   const yearData = getYearData(data, activeSpec, selYear);
@@ -7047,50 +7048,169 @@ function AdminNursingExams({ toast }) {
   };
 
   // ── OSCE helpers ──
+  // Rich OSCE parser — handles PROCEDURE STATION format with instructions, activities (marks), question station, and answers
   const parseOsce = () => {
-    // Format: HEADING: <title>\n- step1\n- step2\n\nHEADING: <title>\n...
-    // Also supports: ## <title> or numbered heading
-    const blocks = osceText.trim().split(/\n\s*\n+/).filter(b=>b.trim());
-    const items = blocks.map(block=>{
-      const lines = block.split("\n").map(l=>l.trim()).filter(Boolean);
-      let heading="", steps=[];
-      lines.forEach((line,i)=>{
-        if(i===0||line.match(/^(?:HEADING|SKILL|PROCEDURE|##|###)[:\s]/i)||
-          (!line.match(/^[-•*✓\d]/)&&i===0)){
-          heading=line.replace(/^(?:HEADING|SKILL|PROCEDURE|##|###)[:\s]*/i,"").replace(/^\d+[.)]\s*/,"").trim();
-        } else {
-          const step=line.replace(/^[-•*✓✔\d.)\s]+/,"").trim();
-          if(step) steps.push(step);
-        }
+    const rawText = osceText.trim();
+    const answersRaw = osceAnswersText.trim();
+    if (!rawText) { toast("Paste OSCE content first","error"); return; }
+
+    // Split into individual station blocks
+    const stationBlocks = rawText.split(/(?=^PROCEDURE STATION[\s:])/mi).filter(b=>b.trim());
+    const blocks = stationBlocks.length > 1 ? stationBlocks : [rawText];
+
+    // Parse answers text — one per line, letter or "A. text" format
+    const parseAnswers = (raw) => {
+      if (!raw) return [];
+      return raw.split("\n").map(l=>l.trim()).filter(Boolean).map(l => {
+        const m = l.match(/^(?:\d+[.)\s]+)?([A-Da-d])[.)\s]*/);
+        if (m) return m[1].toUpperCase();
+        return l.replace(/^\d+[.)\s]*/,"").trim();
       });
-      if(!heading&&lines.length) heading=lines[0];
-      return {heading:heading.trim(),steps};
-    }).filter(i=>i.heading);
+    };
+    const answerKey = parseAnswers(answersRaw);
+    let globalQIdx = 0; // tracks MCQ index across stations for answer key
+
+    const items = blocks.map((block) => {
+      const lines = block.split("\n").map(l => l.trim());
+      let heading = "", instructions = [], activities = [], questionStation = [], totalMarks = "";
+      let mode = "heading";
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line) continue;
+
+        // Section headers
+        if (line.match(/^INSTRUCTION(S)? TO CANDIDATE/i)) { mode = "instructions"; continue; }
+        if (line.match(/^ACTIVITIES$/i)) { mode = "activities"; continue; }
+        if (line.match(/^QUESTION STATION[\s:]*/i)) { mode = "questions"; continue; }
+        if (line.match(/^Total Marks/i)) { totalMarks = line; mode = "done"; continue; }
+
+        // Title line
+        if (line.match(/^PROCEDURE STATION[\s:]*/i)) {
+          heading = line.replace(/^PROCEDURE STATION[\s:]*/i,"").trim();
+          mode = "heading_seen"; continue;
+        }
+        if ((mode === "heading" || mode === "heading_seen") && !heading) {
+          heading = line.replace(/^Title[\s:]*/i,"").trim(); continue;
+        }
+        if (mode === "heading_seen" && heading && !line.match(/^(?:INSTRUCTION|ACTIVIT|QUESTION)/i)) {
+          // multi-line title
+          heading += " " + line; continue;
+        }
+
+        if (mode === "instructions") {
+          const clean = line.replace(/^[➤►>•\-]\s*/,"").trim();
+          if (clean) instructions.push(clean);
+          continue;
+        }
+
+        if (mode === "activities") {
+          // Main numbered item: "1. Text (½ mark)" or "17." sub items
+          const actM = line.match(/^(\d+[a-z]?)[.)]\s+(.+)$/i);
+          const subM = line.match(/^([a-z])[.)]\s+(.+)$/i);
+          if (actM) {
+            const text = actM[2].trim();
+            const markM = text.match(/\(([^)]+marks?)\)\s*$/i);
+            activities.push({ num: actM[1], text: markM ? text.replace(markM[0],"").trim() : text, mark: markM ? markM[1] : "", subItems: [] });
+          } else if (subM && activities.length > 0) {
+            const text = subM[2].trim();
+            const markM = text.match(/\(([^)]+marks?)\)\s*$/i);
+            const parent = activities[activities.length-1];
+            if (!parent.subItems) parent.subItems = [];
+            parent.subItems.push({ letter: subM[1], text: markM ? text.replace(markM[0],"").trim() : text, mark: markM ? markM[1] : "" });
+          }
+          continue;
+        }
+
+        if (mode === "questions") {
+          const optM = line.match(/^([a-d])[.)]\s+(.+)$/i);
+          const lastQ = questionStation.length > 0 ? questionStation[questionStation.length-1] : null;
+
+          if (optM && lastQ && lastQ.type === "mcq") {
+            lastQ.options.push({ letter: optM[1].toUpperCase(), text: optM[2].trim() });
+          } else if (!optM && line.trim()) {
+            const lookahead = lines.slice(i+1, i+6).join("\n");
+            const hasMcqOptions = lookahead.match(/^[a-d][.)]\s/im);
+            const cleanQ = line.replace(/^\d+[.)\s]*/,"").trim();
+            if (hasMcqOptions) {
+              const ans = answerKey[globalQIdx] || null;
+              questionStation.push({ type:"mcq", q: cleanQ, options:[], ans, qNum: globalQIdx+1 });
+              globalQIdx++;
+            } else if (cleanQ) {
+              // Fill-in-blank or free response (has blanks like ……… or ___)
+              const isFill = cleanQ.match(/[…_]{3,}/) || cleanQ.match(/Mention \d+/i);
+              questionStation.push({ type: isFill ? "fill" : "text", q: cleanQ, ans: answerKey[globalQIdx] || "" });
+              if (isFill) globalQIdx++;
+            }
+          }
+          continue;
+        }
+      }
+
+      if (!heading) heading = lines.find(l=>l.trim()) || "OSCE Station";
+      // Legacy steps for backward compat
+      const steps = activities.map(a => {
+        const parts = [`${a.num}. ${a.text}${a.mark ? " ("+a.mark+")" : ""}`];
+        if (a.subItems && a.subItems.length) a.subItems.forEach(s => parts.push(`   ${s.letter}. ${s.text}${s.mark?" ("+s.mark+")":""}`));
+        return parts;
+      }).flat();
+
+      return { heading: heading.trim(), instructions, activities, questionStation, totalMarks, steps };
+    }).filter(i => i.heading);
+
     setParsedOsce(items);
-    if(!items.length) toast("No checklists parsed — check format","error");
-    else toast(`✅ ${items.length} checklist(s) parsed!`,"success");
+    if (!items.length) toast("No stations parsed — check format","error");
+    else toast("✅ " + items.length + " OSCE station(s) parsed!","success");
   };
 
   const importOsce = () => {
     if(!parsedOsce.length) return;
-    const newChecks = parsedOsce.map(p=>({id:Date.now()+Math.random(),heading:p.heading,steps:p.steps}));
+    const newChecks = parsedOsce.map(p=>({
+      id: Date.now()+Math.random(),
+      heading: p.heading,
+      instructions: p.instructions || [],
+      activities: p.activities || [],
+      questionStation: p.questionStation || [],
+      totalMarks: p.totalMarks || "",
+      steps: p.steps || [],
+    }));
     const osce = yearData.osce || emptyOsce();
     const nd = setYearPaperData(data,activeSpec,selYear,"osce",{...osce,checklists:[...(osce.checklists||[]),...newChecks]});
     saveData(nd);
-    setParsedOsce([]); setOsceText("");
-    toast(`✅ ${newChecks.length} checklist(s) added!`,"success");
+    setParsedOsce([]); setOsceText(""); setOsceAnswersText("");
+    toast("✅ " + newChecks.length + " OSCE station(s) added!","success");
   };
 
   const saveEditChecklist = () => {
     if(!editCheckForm.heading.trim()) return toast("Heading required","error");
-    const steps = editCheckForm.steps.split("\n").map(s=>s.replace(/^[-•*✓\d.)\s]+/,"").trim()).filter(Boolean);
+    // Re-parse activities and question station from text areas
+    const activitiesLines = editCheckForm.activities.split("\n").map(s=>s.trim()).filter(Boolean);
+    const activities = [];
+    activitiesLines.forEach(line => {
+      const actM = line.match(/^(\d+[a-z]?)[.)]\s+(.+)$/i);
+      const subM = line.match(/^([a-z])[.)]\s+(.+)$/i);
+      if (actM) {
+        const text = actM[2].trim();
+        const markM = text.match(/\(([^)]+marks?)\)\s*$/i);
+        activities.push({ num: actM[1], text: markM ? text.replace(markM[0],"").trim() : text, mark: markM ? markM[1] : "", subItems: [] });
+      } else if (subM && activities.length > 0) {
+        const text = subM[2].trim();
+        const markM = text.match(/\(([^)]+marks?)\)\s*$/i);
+        const parent = activities[activities.length-1];
+        if (!parent.subItems) parent.subItems = [];
+        parent.subItems.push({ letter: subM[1], text: markM ? text.replace(markM[0],"").trim() : text, mark: markM ? markM[1] : "" });
+      }
+    });
+    const steps = activities.map(a => `${a.num}. ${a.text}${a.mark?" ("+a.mark+")":""}`);
+    const instructions = editCheckForm.instructions.split("\n").map(s=>s.replace(/^[➤►>•\-]\s*/,"").trim()).filter(Boolean);
     const osce = yearData.osce || emptyOsce();
     const checklists = (osce.checklists||[]).map((c,i)=>
-      i===editCheckIdx ? {...c,heading:editCheckForm.heading.trim(),steps} : c
+      i===editCheckIdx ? {...c, heading:editCheckForm.heading.trim(), instructions, activities, steps,
+        questionStation: c.questionStation||[], totalMarks: editCheckForm.totalMarks||c.totalMarks||""} : c
     );
     const nd = setYearPaperData(data,activeSpec,selYear,"osce",{...osce,checklists});
     saveData(nd);
-    setEditCheckIdx(null); setEditCheckForm({heading:"",steps:""});
+    setEditCheckIdx(null); setEditCheckForm({heading:"",instructions:"",activities:"",questionStation:"",answers:""});
     toast("✏️ Checklist updated","success");
   };
 
@@ -7326,58 +7446,53 @@ function AdminNursingExams({ toast }) {
       {/* ════ OSCE EDITOR ════ */}
       {isOsce && (
         <div>
-          {/* Paste area */}
+          {/* Two-pane paste area */}
           <div className="card2" style={{marginBottom:16,border:`1px solid ${meta.color}30`}}>
-            <div style={{fontWeight:800,fontSize:13,color:meta.color,marginBottom:8}}>🩺 Add OSCE Checklists</div>
-            <div style={{fontSize:12,color:"var(--text3)",marginBottom:10,lineHeight:1.6}}>
-              Paste one or more checklists below. Separate checklists with a blank line.<br/>
-              First line of each block = the skill heading. Remaining lines (starting with - or • or numbers) = procedure steps.
+            <div style={{fontWeight:800,fontSize:13,color:meta.color,marginBottom:6}}>🩺 Paste OSCE Station Content</div>
+            <div style={{fontSize:11,color:"var(--text3)",marginBottom:10,lineHeight:1.6}}>
+              Paste the full OSCE station text (title, instructions, activities, question station). The system will auto-parse it.<br/>
+              For multiple stations, separate with a blank line or start each with "PROCEDURE STATION:".
             </div>
-            <div style={{background:"var(--bg4)",border:"1px solid var(--border)",borderRadius:8,padding:"10px 12px",marginBottom:10,fontSize:12,color:"var(--text3)"}}>
-              <div style={{fontWeight:800,marginBottom:5}}>📋 Format example:</div>
-              <pre style={{fontFamily:"monospace",fontSize:11,margin:0,whiteSpace:"pre-wrap",opacity:.85}}>{`Venepuncture / Blood Collection
-- Wash hands and don PPE
-- Verify patient identity and consent
-- Select appropriate vein (antecubital fossa)
-- Apply tourniquet 5–10 cm above site
-- Clean site with 70% alcohol swab, allow to dry
-- Insert needle at 15–30° angle, bevel up
-- Collect required blood into correct tubes
-- Release tourniquet before withdrawing needle
-- Apply pressure and dispose of sharps safely
-
-Urinary Catheterisation (Male)
-- Explain procedure and obtain consent
-- Assemble sterile catheterisation pack
-- Clean urethral meatus with antiseptic
-- Apply sterile draping
-- Insert lubricated catheter gently
-- Inflate balloon with sterile water (10 mL)
-- Attach drainage bag and secure catheter`}</pre>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:10}}>
+              <div>
+                <div style={{fontSize:11,fontWeight:800,color:meta.color,marginBottom:4}}>📋 Full OSCE Station Text</div>
+                <textarea className="paste-box" rows={18} style={{fontFamily:"monospace",fontSize:11,resize:"vertical"}}
+                  value={osceText} onChange={e=>{setOsceText(e.target.value);setParsedOsce([]);}}
+                  placeholder={"PROCEDURE STATION: TAKING GENERAL, PERSONAL, FAMILY AND SOCIAL HEALTH HISTORY\n\nINSTRUCTION TO CANDIDATE\n➤ Take the history of Hajiya Fatima...\n\nACTIVITIES\n1. Greets client and introduces self (½ mark)\n2. Explains procedure and obtains consent (½ mark)\n...\n\nQUESTION STATION: HISTORY TAKING\nWhich are keys to history taking?\na. Trust\nb. Right Questions\nc. Interpreting the responses\nd. All the above\n\nTotal Marks Obtainable: 12 Marks"} />
+              </div>
+              <div>
+                <div style={{fontSize:11,fontWeight:800,color:"var(--success)",marginBottom:4}}>✅ MCQ Answers (one per line: A / B / C / D)</div>
+                <textarea className="paste-box" rows={18} style={{resize:"vertical",borderColor:"rgba(34,197,94,.35)"}}
+                  value={osceAnswersText} onChange={e=>{setOsceAnswersText(e.target.value);setParsedOsce([]);}}
+                  placeholder={"D\nA\nC\nD\nD\nC\nA"} />
+              </div>
             </div>
-            <textarea className="inp" rows={14} style={{fontFamily:"monospace",fontSize:12,resize:"vertical"}}
-              value={osceText} onChange={e=>{setOsceText(e.target.value);setParsedOsce([]);}}
-              placeholder="Paste your OSCE checklists here..." />
-            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:4}}>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
               <button className="btn btn-accent" style={{background:`linear-gradient(135deg,${meta.color},${meta.color}bb)`,border:"none"}}
-                onClick={parseOsce}>🔍 Auto-Parse Checklists</button>
-              {parsedOsce.length>0&&<button className="btn btn-success" onClick={importOsce}>✅ Add {parsedOsce.length} Checklist{parsedOsce.length!==1?"s":""}</button>}
-              <button className="btn" onClick={()=>{setParsedOsce([]);setOsceText("");}}>🗑️ Clear</button>
+                onClick={parseOsce}>🔍 Auto-Parse Station</button>
+              {parsedOsce.length>0&&<button className="btn btn-success" onClick={importOsce}>✅ Import {parsedOsce.length} Station{parsedOsce.length!==1?"s":""}</button>}
+              <button className="btn" onClick={()=>{setParsedOsce([]);setOsceText("");setOsceAnswersText("");}}>🗑️ Clear</button>
             </div>
+
+            {/* Preview parsed stations */}
             {parsedOsce.length>0&&(
               <div style={{marginTop:12,border:"1px solid var(--success)",borderRadius:8,overflow:"hidden"}}>
                 <div style={{padding:"8px 14px",background:"rgba(34,197,94,.1)",fontSize:12,fontWeight:800,color:"var(--success)"}}>
-                  ✓ {parsedOsce.length} checklist{parsedOsce.length!==1?"s":""} parsed — review then import
+                  ✓ {parsedOsce.length} station{parsedOsce.length!==1?"s":""} parsed — review then import
                 </div>
                 {parsedOsce.map((c,i)=>(
-                  <div key={i} style={{padding:"10px 14px",borderTop:"1px solid var(--border)"}}>
-                    <div style={{fontWeight:800,fontSize:13,color:meta.color,marginBottom:6}}>🩺 {c.heading}</div>
-                    {c.steps.map((s,si)=>(
-                      <div key={si} style={{display:"flex",gap:8,alignItems:"flex-start",fontSize:12,marginBottom:3}}>
-                        <span style={{color:"var(--success)",flexShrink:0,marginTop:1}}>✓</span>
-                        <span>{s}</span>
+                  <div key={i} style={{padding:"12px 14px",borderTop:"1px solid var(--border)"}}>
+                    <div style={{fontWeight:800,fontSize:13,color:meta.color,marginBottom:4}}>🩺 {c.heading}</div>
+                    {c.instructions.length>0&&(
+                      <div style={{marginBottom:6}}>
+                        <div style={{fontSize:10,fontWeight:800,color:"var(--text3)",marginBottom:3}}>INSTRUCTIONS ({c.instructions.length})</div>
+                        {c.instructions.map((ins,ii)=><div key={ii} style={{fontSize:11,color:"var(--text2)",marginBottom:2}}>➤ {ins}</div>)}
                       </div>
-                    ))}
+                    )}
+                    <div style={{fontSize:11,color:"var(--text3)"}}>
+                      {c.activities.length} activities · {c.questionStation.length} question station item{c.questionStation.length!==1?"s":""}
+                      {c.totalMarks&&` · ${c.totalMarks}`}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -7387,45 +7502,61 @@ Urinary Catheterisation (Male)
           {/* Edit checklist inline */}
           {editCheckIdx!==null&&(
             <div className="card2" style={{marginBottom:14,border:`2px solid ${meta.color}`,background:`${meta.color}07`}}>
-              <div style={{fontWeight:800,fontSize:13,color:meta.color,marginBottom:10}}>✏️ Edit Checklist</div>
-              <label className="lbl">Skill / Procedure Heading *</label>
-              <input className="inp" value={editCheckForm.heading} onChange={e=>setEditCheckForm({...editCheckForm,heading:e.target.value})} placeholder="e.g. Venepuncture / Blood Collection" />
-              <label className="lbl">Procedure Steps (one step per line)</label>
-              <textarea className="inp" rows={10} style={{fontFamily:"monospace",fontSize:12,resize:"vertical"}}
-                value={editCheckForm.steps} onChange={e=>setEditCheckForm({...editCheckForm,steps:e.target.value})}
-                placeholder={"- Wash hands and don PPE\n- Verify patient identity\n- Explain procedure..."} />
+              <div style={{fontWeight:800,fontSize:13,color:meta.color,marginBottom:10}}>✏️ Edit OSCE Station</div>
+              <label className="lbl">Station Title *</label>
+              <input className="inp" value={editCheckForm.heading} onChange={e=>setEditCheckForm({...editCheckForm,heading:e.target.value})} placeholder="e.g. TAKING GENERAL, PERSONAL, FAMILY AND SOCIAL HEALTH HISTORY" />
+              <label className="lbl">Instructions to Candidate (one per line)</label>
+              <textarea className="inp" rows={3} style={{fontFamily:"monospace",fontSize:12,resize:"vertical"}}
+                value={editCheckForm.instructions} onChange={e=>setEditCheckForm({...editCheckForm,instructions:e.target.value})}
+                placeholder={"➤ Take the history of Hajiya Fatima...\n➤ Report as you carry out the procedure."} />
+              <label className="lbl">Activities / Procedure Steps (one per line with marks)</label>
+              <textarea className="inp" rows={12} style={{fontFamily:"monospace",fontSize:12,resize:"vertical"}}
+                value={editCheckForm.activities} onChange={e=>setEditCheckForm({...editCheckForm,activities:e.target.value})}
+                placeholder={"1. Greets client and introduces self (½ mark)\n2. Explains procedure and obtains consent (½ mark)"} />
+              <label className="lbl">Total Marks Line</label>
+              <input className="inp" value={editCheckForm.totalMarks||""} onChange={e=>setEditCheckForm({...editCheckForm,totalMarks:e.target.value})} placeholder="Total Marks Obtainable: 12 Marks" />
               <div style={{display:"flex",gap:8}}>
                 <button className="btn btn-accent" style={{background:`linear-gradient(135deg,${meta.color},${meta.color}bb)`,border:"none"}} onClick={saveEditChecklist}>💾 Save Changes</button>
-                <button className="btn" onClick={()=>{setEditCheckIdx(null);setEditCheckForm({heading:"",steps:""});}}>Cancel</button>
+                <button className="btn" onClick={()=>{setEditCheckIdx(null);setEditCheckForm({heading:"",instructions:"",activities:"",questionStation:"",answers:""});}}>Cancel</button>
               </div>
             </div>
           )}
 
           {/* Checklists list */}
           <div style={{fontWeight:800,fontSize:13,marginBottom:10}}>
-            🩺 {osceData.checklists?.length||0} OSCE Checklist{(osceData.checklists?.length||0)!==1?"s":""}
+            🩺 {osceData.checklists?.length||0} OSCE Station{(osceData.checklists?.length||0)!==1?"s":""}
           </div>
           {(osceData.checklists?.length||0)===0&&(
             <div style={{textAlign:"center",padding:20,color:"var(--text3)",fontSize:13,border:"1px dashed var(--border)",borderRadius:10}}>
-              No OSCE checklists yet — paste and import above.
+              No OSCE stations yet — paste and import above.
             </div>
           )}
           {(osceData.checklists||[]).map((c,ci)=>(
             <div key={c.id||ci} className="card2" style={{marginBottom:10,borderLeft:`3px solid ${ci===editCheckIdx?meta.color:"var(--border)"}`}}>
               <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
                 <div style={{flex:1}}>
-                  <div style={{fontWeight:800,fontSize:14,color:meta.color,marginBottom:8}}>🩺 {c.heading}</div>
-                  {c.steps.map((s,si)=>(
-                    <div key={si} style={{display:"flex",gap:8,alignItems:"flex-start",fontSize:13,marginBottom:4}}>
-                      <span style={{color:"var(--success)",flexShrink:0,marginTop:1}}>✓</span>
-                      <span style={{color:"var(--text2)"}}>{s}</span>
-                    </div>
-                  ))}
+                  <div style={{fontWeight:800,fontSize:14,color:meta.color,marginBottom:4}}>🩺 {c.heading}</div>
+                  <div style={{fontSize:11,color:"var(--text3)"}}>
+                    {(c.activities||c.steps||[]).length} activities · {(c.questionStation||[]).length} Q-station items
+                    {c.totalMarks&&` · ${c.totalMarks}`}
+                  </div>
                 </div>
                 <div style={{display:"flex",gap:4,flexShrink:0}}>
                   <button className="btn btn-sm" onClick={()=>{
                     setEditCheckIdx(ci);
-                    setEditCheckForm({heading:c.heading, steps:c.steps.join("\n")});
+                    const actText = (c.activities||[]).map(a=>{
+                      const lines = [`${a.num}. ${a.text}${a.mark?" ("+a.mark+")":""}`];
+                      if (a.subItems) a.subItems.forEach(s=>lines.push(`${s.letter}. ${s.text}${s.mark?" ("+s.mark+")":""}`));
+                      return lines.join("\n");
+                    }).join("\n");
+                    setEditCheckForm({
+                      heading:c.heading,
+                      instructions:(c.instructions||[]).map(s=>"➤ "+s).join("\n"),
+                      activities: actText || (c.steps||[]).join("\n"),
+                      questionStation:"",
+                      totalMarks: c.totalMarks||"",
+                      answers:"",
+                    });
                   }}>✏️</button>
                   <button className="btn btn-sm btn-danger" onClick={()=>deleteChecklist(ci)}>🗑️</button>
                 </div>
@@ -8796,6 +8927,8 @@ function NursingOsceView({ osce, meta, year, onBack, currentUser, isUnlocked }) 
   const [ticked, setTicked] = useState({});
   const [expandAll, setExpandAll] = useState(true);
   const [expanded, setExpanded] = useState({});
+  const [revealedQS, setRevealedQS] = useState({});
+  const [mcqAnswers, setMcqAnswers] = useState({});
 
   const toggle = (ci, si) => {
     const key = `${ci}-${si}`;
@@ -8826,16 +8959,17 @@ function NursingOsceView({ osce, meta, year, onBack, currentUser, isUnlocked }) 
       </div>
     );
   }
-  const totalSteps = checklists.reduce((s,c)=>s+c.steps.length,0);
+  // Rich activity count for progress
+  const totalActivities = checklists.reduce((s,c) => s + ((c.activities&&c.activities.length) ? c.activities.length : (c.steps||[]).length), 0);
   const tickedCount = Object.values(ticked).filter(Boolean).length;
 
   return (
-    <div style={{maxWidth:700,margin:"0 auto"}}>
+    <div style={{maxWidth:720,margin:"0 auto"}}>
       <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18,flexWrap:"wrap"}}>
         <button className="btn btn-sm" onClick={onBack}>← Back</button>
         <div style={{flex:1}}>
           <div style={{fontWeight:800,fontSize:16,color:meta.color}}>{meta.icon} {meta.short} — {year} OSCE</div>
-          <div style={{fontSize:11,color:"var(--text3)"}}>Clinical Skills Checklists · {checklists.length} skill{checklists.length!==1?"s":""}</div>
+          <div style={{fontSize:11,color:"var(--text3)"}}>OSCE Clinical Checklist for RN · {checklists.length} station{checklists.length!==1?"s":""}</div>
         </div>
         <div style={{display:"flex",gap:6}}>
           <button className="btn btn-sm" onClick={()=>{setExpandAll(true);setExpanded({});}}>Expand All</button>
@@ -8847,55 +8981,186 @@ function NursingOsceView({ osce, meta, year, onBack, currentUser, isUnlocked }) 
       <div className="card" style={{marginBottom:18,padding:"14px 18px"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
           <div style={{fontWeight:800,fontSize:13}}>Practice Progress</div>
-          <div style={{fontWeight:800,fontSize:13,color:meta.color}}>{tickedCount}/{totalSteps}</div>
+          <div style={{fontWeight:800,fontSize:13,color:meta.color}}>{tickedCount}/{totalActivities}</div>
         </div>
         <div className="progress-wrap">
-          <div className="progress-fill" style={{width:`${totalSteps>0?(tickedCount/totalSteps)*100:0}%`,background:`linear-gradient(90deg,${meta.color},${meta.color}bb)`}} />
+          <div className="progress-fill" style={{width:`${totalActivities>0?(tickedCount/totalActivities)*100:0}%`,background:`linear-gradient(90deg,${meta.color},${meta.color}bb)`}} />
         </div>
-        <div style={{fontSize:10,color:"var(--text3)",marginTop:5}}>Tick each step as you practise — progress resets on refresh</div>
+        <div style={{fontSize:10,color:"var(--text3)",marginTop:5}}>Tick each activity as you practise</div>
       </div>
 
       {checklists.map((c,ci)=>{
         const isCollapsed = expandAll ? (expanded[ci]===true) : (expanded[ci]!==true);
-        const stepsTickedHere = c.steps.filter((_,si)=>ticked[`${ci}-${si}`]).length;
+        const acts = c.activities && c.activities.length ? c.activities : [];
+        const legacySteps = !acts.length ? (c.steps||[]) : [];
+        const totalHere = acts.length || legacySteps.length;
+        const tickedHere = (acts.length ? acts : legacySteps).filter((_,si)=>ticked[`${ci}-${si}`]).length;
+        const qs = c.questionStation || [];
+
         return (
-          <div key={c.id||ci} className="card" style={{marginBottom:14,borderLeft:`4px solid ${meta.color}`}}>
-            {/* Checklist heading */}
+          <div key={c.id||ci} className="card" style={{marginBottom:20,borderLeft:`4px solid ${meta.color}`}}>
+            {/* Station heading */}
             <div style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",padding:"2px 0"}}
               onClick={()=>toggleSection(ci)}>
-              <div style={{width:36,height:36,borderRadius:9,background:`${meta.color}18`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>🩺</div>
+              <div style={{width:38,height:38,borderRadius:9,background:`${meta.color}18`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>🩺</div>
               <div style={{flex:1}}>
-                <div style={{fontWeight:800,fontSize:15,color:meta.color}}>{c.heading}</div>
-                <div style={{fontSize:11,color:"var(--text3)"}}>{stepsTickedHere}/{c.steps.length} steps checked</div>
+                <div style={{fontWeight:800,fontSize:14,color:meta.color,lineHeight:1.3}}>PROCEDURE STATION: {c.heading}</div>
+                <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>{tickedHere}/{totalHere} activities checked{qs.length>0?` · ${qs.length} question station item${qs.length!==1?"s":""}`:""}</div>
               </div>
               <div style={{display:"flex",alignItems:"center",gap:8}}>
-                {stepsTickedHere===c.steps.length&&c.steps.length>0&&<span style={{fontSize:11,fontWeight:700,color:"var(--success)"}}>✅ Complete</span>}
+                {tickedHere===totalHere&&totalHere>0&&<span style={{fontSize:11,fontWeight:700,color:"var(--success)"}}>✅ Done</span>}
                 <span style={{fontSize:13,color:"var(--text3)",transition:"transform .2s",display:"inline-block",transform:isCollapsed?"rotate(-90deg)":"rotate(0deg)"}}>▾</span>
               </div>
             </div>
 
             {!isCollapsed&&(
-              <div style={{marginTop:14,borderTop:"1px solid var(--border)",paddingTop:12}}>
-                {c.steps.map((step,si)=>{
-                  const key=`${ci}-${si}`;
-                  const done=!!ticked[key];
-                  return (
-                    <div key={si} onClick={()=>toggle(ci,si)}
-                      style={{display:"flex",alignItems:"flex-start",gap:12,padding:"9px 8px",borderRadius:8,cursor:"pointer",
-                        background:done?`${meta.color}08`:"transparent",marginBottom:3,transition:"background .15s",
-                        border:`1px solid ${done?meta.color+"30":"transparent"}`}}>
-                      <div style={{width:22,height:22,borderRadius:6,border:`2px solid ${done?meta.color:"var(--border2)"}`,
-                        background:done?meta.color:"transparent",display:"flex",alignItems:"center",justifyContent:"center",
-                        flexShrink:0,transition:"all .2s",marginTop:1}}>
-                        {done&&<span style={{color:"white",fontSize:12,fontWeight:800}}>✓</span>}
+              <div style={{marginTop:14,borderTop:"1px solid var(--border)",paddingTop:14}}>
+
+                {/* Instructions */}
+                {(c.instructions||[]).length>0&&(
+                  <div style={{marginBottom:14,background:`${meta.color}08`,borderRadius:10,padding:"10px 14px",border:`1px solid ${meta.color}20`}}>
+                    <div style={{fontWeight:800,fontSize:11,color:meta.color,marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>📋 Instruction to Candidate</div>
+                    {(c.instructions||[]).map((ins,ii)=>(
+                      <div key={ii} style={{display:"flex",gap:8,alignItems:"flex-start",fontSize:13,marginBottom:4}}>
+                        <span style={{color:meta.color,flexShrink:0,marginTop:1}}>➤</span>
+                        <span style={{color:"var(--text2)",lineHeight:1.5}}>{ins}</span>
                       </div>
-                      <div style={{fontSize:14,fontWeight:done?700:500,color:done?"var(--text)":"var(--text2)",
-                        textDecoration:done?"none":"none",lineHeight:1.5}}>
-                        {step}
-                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Activities */}
+                {(acts.length>0||legacySteps.length>0)&&(
+                  <div style={{marginBottom:14}}>
+                    <div style={{fontWeight:800,fontSize:11,color:"var(--text3)",marginBottom:8,textTransform:"uppercase",letterSpacing:1}}>📝 Activities</div>
+                    {acts.length>0 ? acts.map((act,si)=>{
+                      const key=`${ci}-${si}`;
+                      const done=!!ticked[key];
+                      return (
+                        <div key={si}>
+                          <div onClick={()=>toggle(ci,si)}
+                            style={{display:"flex",alignItems:"flex-start",gap:10,padding:"8px 10px",borderRadius:8,cursor:"pointer",
+                              background:done?`${meta.color}08`:"transparent",marginBottom:2,transition:"background .15s",
+                              border:`1px solid ${done?meta.color+"30":"transparent"}`}}>
+                            <div style={{width:22,height:22,borderRadius:6,border:`2px solid ${done?meta.color:"var(--border2)"}`,
+                              background:done?meta.color:"transparent",display:"flex",alignItems:"center",justifyContent:"center",
+                              flexShrink:0,transition:"all .2s",marginTop:1}}>
+                              {done&&<span style={{color:"white",fontSize:11,fontWeight:800}}>✓</span>}
+                            </div>
+                            <div style={{flex:1}}>
+                              <span style={{fontSize:13,fontWeight:done?700:500,color:done?"var(--text)":"var(--text2)",lineHeight:1.5}}>
+                                <span style={{color:meta.color,fontWeight:800}}>{act.num}.</span> {act.text}
+                              </span>
+                              {act.mark&&<span style={{marginLeft:6,fontSize:11,background:`${meta.color}18`,color:meta.color,borderRadius:4,padding:"1px 6px",fontWeight:700}}>({act.mark})</span>}
+                            </div>
+                          </div>
+                          {(act.subItems||[]).map((sub,sbi)=>(
+                            <div key={sbi} style={{paddingLeft:32,marginBottom:2}}>
+                              <div style={{display:"flex",alignItems:"flex-start",gap:8,padding:"5px 8px",borderRadius:6,
+                                background:"var(--bg4)",fontSize:12,color:"var(--text2)",lineHeight:1.5}}>
+                                <span style={{color:meta.color,fontWeight:700,flexShrink:0}}>{sub.letter}.</span>
+                                <span>{sub.text}</span>
+                                {sub.mark&&<span style={{marginLeft:4,fontSize:10,color:meta.color,fontWeight:700}}>({sub.mark})</span>}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    }) : legacySteps.map((step,si)=>{
+                      const key=`${ci}-${si}`;
+                      const done=!!ticked[key];
+                      return (
+                        <div key={si} onClick={()=>toggle(ci,si)}
+                          style={{display:"flex",alignItems:"flex-start",gap:10,padding:"8px 10px",borderRadius:8,cursor:"pointer",
+                            background:done?`${meta.color}08`:"transparent",marginBottom:2,transition:"background .15s",
+                            border:`1px solid ${done?meta.color+"30":"transparent"}`}}>
+                          <div style={{width:22,height:22,borderRadius:6,border:`2px solid ${done?meta.color:"var(--border2)"}`,
+                            background:done?meta.color:"transparent",display:"flex",alignItems:"center",justifyContent:"center",
+                            flexShrink:0,transition:"all .2s",marginTop:1}}>
+                            {done&&<span style={{color:"white",fontSize:11,fontWeight:800}}>✓</span>}
+                          </div>
+                          <div style={{fontSize:13,fontWeight:done?700:500,color:done?"var(--text)":"var(--text2)",lineHeight:1.5}}>{step}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Total Marks */}
+                {c.totalMarks&&(
+                  <div style={{marginBottom:14,padding:"8px 12px",background:"var(--bg4)",borderRadius:8,fontSize:12,fontWeight:700,color:"var(--text2)",borderLeft:`3px solid ${meta.color}`}}>
+                    📊 {c.totalMarks}
+                  </div>
+                )}
+
+                {/* Question Station */}
+                {qs.length>0&&(
+                  <div style={{marginTop:6}}>
+                    <div style={{fontWeight:800,fontSize:11,color:"var(--text3)",marginBottom:10,textTransform:"uppercase",letterSpacing:1,paddingTop:10,borderTop:"1px dashed var(--border)"}}>
+                      ❓ Question Station
                     </div>
-                  );
-                })}
+                    {qs.map((q,qi)=>{
+                      const qKey = `${ci}-q${qi}`;
+                      const revealed = !!revealedQS[qKey];
+                      const userAns = mcqAnswers[qKey];
+                      if (q.type === "mcq") {
+                        return (
+                          <div key={qi} style={{marginBottom:12,background:"var(--bg4)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--border)"}}>
+                            <div style={{fontWeight:700,fontSize:13,marginBottom:8,lineHeight:1.5}}>
+                              <span style={{color:meta.color,fontWeight:800,marginRight:4}}>{q.qNum||qi+1}.</span>{q.q}
+                            </div>
+                            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                              {(q.options||[]).map((opt,oi)=>{
+                                const isSelected = userAns === opt.letter;
+                                const isCorrect = revealed && q.ans === opt.letter;
+                                const isWrong = revealed && isSelected && q.ans !== opt.letter;
+                                return (
+                                  <div key={oi} onClick={()=>!revealed&&setMcqAnswers(a=>({...a,[qKey]:opt.letter}))}
+                                    style={{display:"flex",gap:8,alignItems:"center",padding:"7px 10px",borderRadius:7,cursor:revealed?"default":"pointer",
+                                      transition:"all .15s",
+                                      background: isCorrect?"rgba(34,197,94,.12)":isWrong?"rgba(239,68,68,.08)":isSelected?`${meta.color}10`:"transparent",
+                                      border:`1px solid ${isCorrect?"var(--success)":isWrong?"var(--danger)":isSelected?meta.color:"var(--border)"}`}}>
+                                    <div style={{width:20,height:20,borderRadius:"50%",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800,
+                                      background: isCorrect?"var(--success)":isWrong?"var(--danger)":isSelected?meta.color:"var(--bg4)",
+                                      color: isCorrect||isWrong||isSelected?"white":"var(--text3)",border:`1px solid ${isCorrect?"var(--success)":isWrong?"var(--danger)":isSelected?meta.color:"var(--border)"}`}}>
+                                      {opt.letter}
+                                    </div>
+                                    <span style={{fontSize:13,color:isCorrect?"var(--success)":isWrong?"var(--danger)":"var(--text2)",fontWeight:isCorrect?700:400}}>{opt.text}</span>
+                                    {isCorrect&&<span style={{marginLeft:"auto",fontSize:11,color:"var(--success)",fontWeight:800}}>✓ Correct</span>}
+                                    {isWrong&&<span style={{marginLeft:"auto",fontSize:11,color:"var(--danger)",fontWeight:800}}>✗</span>}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                            <div style={{marginTop:8,display:"flex",gap:8}}>
+                              {!revealed&&userAns&&(
+                                <button className="btn btn-sm btn-accent" style={{fontSize:11,padding:"4px 10px",background:meta.color,border:"none",color:"white"}}
+                                  onClick={()=>setRevealedQS(r=>({...r,[qKey]:true}))}>Check Answer</button>
+                              )}
+                              {revealed&&<span style={{fontSize:11,color:"var(--success)",fontWeight:700}}>✅ Answer revealed</span>}
+                            </div>
+                          </div>
+                        );
+                      } else {
+                        // fill-in-blank or text question
+                        return (
+                          <div key={qi} style={{marginBottom:10,background:"var(--bg4)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--border)"}}>
+                            <div style={{fontWeight:700,fontSize:13,marginBottom:6,lineHeight:1.6,color:"var(--text)"}}>{q.q}</div>
+                            {q.ans&&(
+                              <div>
+                                {!revealed&&(
+                                  <button className="btn btn-sm" style={{fontSize:11,padding:"3px 10px"}}
+                                    onClick={()=>setRevealedQS(r=>({...r,[qKey]:true}))}>Show Answer</button>
+                                )}
+                                {revealed&&<div style={{fontSize:12,fontWeight:700,color:"var(--success)",marginTop:4}}>✓ {q.ans}</div>}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      }
+                    })}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -8907,7 +9172,6 @@ function NursingOsceView({ osce, meta, year, onBack, currentUser, isUnlocked }) 
     </div>
   );
 }
-
 // ─── STUDENT: Nursing MCQ Exam ─────────────────────────────────────────
 function NursingMCQExam({ toast, currentUser, paper, meta, onBack, isUnlocked }) {
   const isUnlockedFull = isUnlocked || useNcAccess(currentUser);
@@ -9724,13 +9988,13 @@ function SkillsView() {
   return(
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
-        <div className="sec-title" style={{marginBottom:0}}>✅ Skills Checklist</div>
+        <div className="sec-title" style={{marginBottom:0}}>✅ OSCE Clinical Checklist for RN</div>
         <label style={{display:"flex",alignItems:"center",gap:5,fontSize:12,color:"var(--text3)",cursor:"pointer"}}>
           <input type="checkbox" className="cb-all" checked={ssAll} onChange={()=>{if(ssAll){setSsSel(new Set());}else{setSsSel(new Set(skillsDb.map(s=>s.id)));}}} />
           All
         </label>
       </div>
-      <div className="sec-sub">Track clinical competencies</div>
+      <div className="sec-sub">Track clinical competencies for RN OSCE</div>
       {ssSel.size>0&&(
         <div className="bulk-bar">
           <span className="bulk-bar-count">☑ {ssSel.size} selected</span>
@@ -17657,7 +17921,7 @@ self.addEventListener('notificationclick', e => {
     { icon:"🧪", label:"Lab Reference", key:"lab-ref" },
     { icon:"💊", label:"Drug Guide", key:"drug-guide" },
     { icon:"🧮", label:"Med Calculator", key:"med-calc" },
-    { icon:"✅", label:"Skills Checklist", key:"skills" },
+    { icon:"✅", label:"OSCE Clinical Checklist for RN", key:"skills" },
     { icon:"🎓", label:"GPA Calculator", key:"gpa" },
   ];
 
