@@ -689,78 +689,6 @@ const attLoadRange = async (classId, dates) => {
   } catch(e) { return {}; }
 };
 
-// ════════════════════════════════════════════════════════════════════════
-// AUTO VIRTUAL ATTENDANCE
-//
-// Rules enforced before marking a student "virtual" (counts as present):
-//   1. roomId must be "class-{classId}" — not PHN Forum / Research Club etc.
-//   2. Student must have been present for ≥ 90% of the official class session.
-//      The lecturer's modal writes a session doc when they open the call;
-//      that timestamp is used as the official class start.
-//   3. Liveness check must pass — the student's camera feed must show movement
-//      (pixel-diff on a 64×36 canvas sampled every 5 s). At least 30% of
-//      sampled frames must exceed the motion threshold. This prevents a static
-//      image or dummy face from passing.
-//
-// Firestore:  group_calls/{roomId}/meta/session
-//   { startedAt, lecturer, date, endedAt? }
-// ════════════════════════════════════════════════════════════════════════
-
-const _gvcMetaRef = (roomId) =>
-  _db.collection("group_calls").doc(roomId).collection("meta").doc("session");
-
-// Lecturer calls this when they open the class call
-const gvcStartSession = async (roomId, lecturerUid) => {
-  const ready = await _loadFirebase(); if (!ready) return;
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-    const snap  = await _gvcMetaRef(roomId).get();
-    // Only create a new session if none exists for today
-    if (!snap.exists || snap.data().date !== today) {
-      await _gvcMetaRef(roomId).set({ startedAt: Date.now(), lecturer: lecturerUid, date: today });
-    }
-  } catch(e) { console.warn("[GVC] startSession:", e.message); }
-};
-
-// Lecturer calls this when they leave the call
-const gvcEndSession = async (roomId) => {
-  const ready = await _loadFirebase(); if (!ready) return;
-  try { await _gvcMetaRef(roomId).set({ endedAt: Date.now() }, { merge: true }); } catch(e) {}
-};
-
-// Evaluate criteria and write virtual attendance for one student
-const attMarkVirtual = async ({ roomId, studentUid, joinedAt, leftAt, livenessOk }) => {
-  if (!roomId.startsWith("class-")) return;
-  if (!livenessOk) return; // failed liveness check
-
-  const classId = roomId.slice("class-".length);
-  const date    = new Date().toISOString().slice(0, 10);
-
-  try {
-    const ready = await _loadFirebase(); if (!ready) return;
-
-    // Fetch the official session times written by the lecturer
-    const metaSnap     = await _gvcMetaRef(roomId).get();
-    const sessionStart = metaSnap.exists ? metaSnap.data().startedAt : joinedAt;
-    const sessionEnd   = (metaSnap.exists && metaSnap.data().endedAt) ? metaSnap.data().endedAt : leftAt;
-    const sessionMs    = Math.max(sessionEnd - sessionStart, 1);
-
-    // Clamp student's window to the session window, then check ≥ 90%
-    const overlapStart = Math.max(joinedAt, sessionStart);
-    const overlapEnd   = Math.min(leftAt,   sessionEnd);
-    const overlapMs    = Math.max(overlapEnd - overlapStart, 0);
-    if (overlapMs / sessionMs < 0.90) return; // < 90% — no credit
-
-    // Don't overwrite a manual mark already set by the lecturer
-    const sk     = _safeKey(studentUid);
-    const docRef = _db.collection("attendance").doc(classId + "_" + date);
-    const snap   = await docRef.get();
-    if (snap.exists && snap.data()[sk] && snap.data()[sk] !== "virtual") return;
-
-    await docRef.set({ [sk]: "virtual" }, { merge: true });
-  } catch(e) { console.warn("[Attendance] virtual mark failed:", e.message); }
-};
-
 // ── REACTIVE SYNC ─────────────────────────────────────────────────────
 const NV_SYNC_EVENT = "nv-sync";
 const dispatchSync = () => window.dispatchEvent(new CustomEvent(NV_SYNC_EVENT));
@@ -7838,26 +7766,27 @@ const gvcWriteOffer = async (roomId, caller, callee, offer) => {
 const gvcWriteAnswer = async (roomId, caller, callee, answer) => {
   await _gvcSigDoc(roomId, caller, callee).set({ answer, updatedAt: Date.now() }, { merge: true });
 };
-// Append ICE using arrayUnion — race-condition safe
+// Append ICE — read-then-write, same pattern as the working voice callAddCandidate
 const gvcAddIce = async (roomId, a, b, candidate, role) => {
-  // role: "caller" | "callee"
-  const field = role === "caller" ? "callerIce" : "calleeIce";
-  await _gvcSigDoc(roomId, a, b).set(
-    { [field]: window.firebase.firestore.FieldValue.arrayUnion(candidate) },
-    { merge: true }
-  );
+  const ready = await _loadFirebase(); if (!ready) return;
+  try {
+    const field = role === "caller" ? "callerIce" : "calleeIce";
+    const ref   = _gvcSigDoc(roomId, a, b);
+    const snap  = await ref.get();
+    const existing = snap.exists ? (snap.data()[field] || []) : [];
+    await ref.set({ [field]: [...existing, candidate] }, { merge: true });
+  } catch(e) { console.warn("[GVC] addIce failed:", e.message); }
 };
 
 function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
   const allUsers = ls("nv-users", []);
 
-  const [peers,    setPeers]    = useState({});    // { uid: { name, stream } }
+  const [peers,    setPeers]    = useState({});
   const [muted,    setMuted]    = useState(false);
   const [videoOff, setVideoOff] = useState(false);
   const [duration, setDuration] = useState(0);
   const [status,   setStatus]   = useState("joining");
   const [errMsg,   setErrMsg]   = useState("");
-  const [volume,   setVolume]   = useState(1);   // 1 = normal, up to 3 = 3× boost
 
   const localStreamRef  = useRef(null);
   const localVideoRef   = useRef(null);
@@ -7865,130 +7794,151 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
   const unsubsRef       = useRef([]);
   const hbRef           = useRef(null);
   const timerRef        = useRef(null);
-  const volumeRef       = useRef(1);
 
-  // ── Attendance tracking ──────────────────────────────────────────
-  const joinedAtRef        = useRef(null);   // ms timestamp when THIS user joined
-  const livenessFrames     = useRef(0);      // total frames sampled
-  const livenessMotion     = useRef(0);      // frames that showed movement
-  const livenessPrevData   = useRef(null);   // previous frame Uint8ClampedArray
-  const livenessCanvasRef  = useRef(null);   // off-screen canvas
-  const livenessTimerRef   = useRef(null);
+  // Per-peer ICE tracking
+  const appliedIce  = useRef({});   // uid_role → count applied so far
+  const pendingIce  = useRef({});   // uid → { callerIce:[], calleeIce:[] } queued before remoteDesc
 
-  // Per-peer applied-ICE counters
-  const appliedIce = useRef({});
-
-  const dname = (uid) => {
-    const u = allUsers.find(x => x.username === uid);
-    return u?.displayName || uid.split("@")[0];
-  };
+  const dname  = (uid) => { const u = allUsers.find(x => x.username === uid); return u?.displayName || uid.split("@")[0]; };
   const avChar = (uid) => (dname(uid)[0] || "?").toUpperCase();
 
-  // ── Apply new ICE candidates safely ───────────────────────────────
+  // ── Apply ICE from a Firestore snapshot array, queue if not yet ready ─────
   const applyIce = useCallback(async (remoteUid, candidates, role) => {
     const pc = pcsRef.current[remoteUid];
     if (!pc || pc.signalingState === "closed") return;
-    if (!pc.remoteDescription) return; // not ready yet — will be called again after setRemoteDescription
-    const key = remoteUid + "_" + role;
+    const key  = remoteUid + "_" + role;
     const from = appliedIce.current[key] || 0;
     const fresh = (candidates || []).slice(from);
-    for (const c of fresh) {
-      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
-    }
+    if (!fresh.length) return;
     appliedIce.current[key] = from + fresh.length;
+
+    if (!pc.remoteDescription) {
+      // Queue until setRemoteDescription is called
+      const q = pendingIce.current[remoteUid] || { callerIce: [], calleeIce: [] };
+      const field = role === "caller" ? "callerIce" : "calleeIce";
+      q[field].push(...fresh);
+      pendingIce.current[remoteUid] = q;
+      return;
+    }
+    for (const c of fresh) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_) {}
+    }
   }, []);
 
-  // ── Build one RTCPeerConnection for remoteUid ─────────────────────
+  // ── Flush pending ICE immediately after setRemoteDescription ────────────
+  const flushPendingIce = useCallback(async (remoteUid) => {
+    const pc = pcsRef.current[remoteUid];
+    if (!pc || !pc.remoteDescription) return;
+    const q = pendingIce.current[remoteUid];
+    if (!q) return;
+    const all = [...q.callerIce, ...q.calleeIce];
+    pendingIce.current[remoteUid] = { callerIce: [], calleeIce: [] };
+    for (const c of all) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_) {}
+    }
+  }, []);
+
+  // ── Build one RTCPeerConnection ────────────────────────────────────────
   const makePc = useCallback((remoteUid) => {
     if (pcsRef.current[remoteUid]) return pcsRef.current[remoteUid];
     const pc = new RTCPeerConnection(GVC_ICE);
     pcsRef.current[remoteUid] = pc;
     appliedIce.current[remoteUid + "_caller"] = 0;
     appliedIce.current[remoteUid + "_callee"] = 0;
+    pendingIce.current[remoteUid] = { callerIce: [], calleeIce: [] };
 
-    // Attach local tracks
+    // Add local tracks to this connection
     localStreamRef.current?.getTracks().forEach(t => pc.addTrack(t, localStreamRef.current));
 
-    // Remote stream → show tile
+    // Remote track handling — keep one stable MediaStream per peer.
+    // Audio and video often arrive as two separate ontrack events.
+    // Re-using the same MediaStream object avoids re-assigning srcObject
+    // and the resulting video freeze.
+    const remoteStream = new MediaStream();
     pc.ontrack = (e) => {
-      const stream = e.streams?.[0] || new MediaStream([e.track]);
-      setPeers(prev => ({ ...prev, [remoteUid]: { name: dname(remoteUid), stream } }));
+      if (e.streams && e.streams[0]) {
+        // Chrome/Safari provide the full stream directly — use it
+        setPeers(prev => ({ ...prev, [remoteUid]: { name: dname(remoteUid), stream: e.streams[0] } }));
+      } else {
+        // Firefox etc. deliver tracks individually — accumulate into one stream
+        e.track.onunmute = () => {
+          remoteStream.addTrack(e.track);
+          setPeers(prev => ({ ...prev, [remoteUid]: { name: dname(remoteUid), stream: remoteStream } }));
+        };
+        if (e.track.readyState === "live") {
+          remoteStream.addTrack(e.track);
+          setPeers(prev => ({ ...prev, [remoteUid]: { name: dname(remoteUid), stream: remoteStream } }));
+        }
+      }
     };
+
     pc.onconnectionstatechange = () => {
       if (["disconnected","failed","closed"].includes(pc.connectionState)) {
         setPeers(prev => { const n = { ...prev }; delete n[remoteUid]; return n; });
-        try { pc.close(); } catch(e) {}
+        try { pc.close(); } catch(_) {}
         delete pcsRef.current[remoteUid];
       }
     };
     return pc;
   }, []); // eslint-disable-line
 
-  // ── Connect as CALLER (currentUser < remoteUid) ───────────────────
+  // ── Caller path ────────────────────────────────────────────────────────
   const connectAsCaller = useCallback(async (remoteUid) => {
     const pc = makePc(remoteUid);
-    // Send our ICE
     pc.onicecandidate = async (e) => {
       if (e.candidate) await gvcAddIce(roomId, currentUser, remoteUid, e.candidate.toJSON(), "caller");
     };
-    // Create & send offer
     const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
     await pc.setLocalDescription(offer);
     await gvcWriteOffer(roomId, currentUser, remoteUid, { type: offer.type, sdp: offer.sdp });
 
-    // Watch signal doc for answer + callee ICE
     const unsub = _gvcSigDoc(roomId, currentUser, remoteUid).onSnapshot(async snap => {
       if (!snap.exists) return;
       const d = snap.data();
-      // Set answer once
       if (d.answer && !pc.remoteDescription && pc.signalingState === "have-local-offer") {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(d.answer));
-          // Drain any callee ICE that arrived before answer
-          await applyIce(remoteUid, d.calleeIce, "callee");
-        } catch(e) { console.warn("[GVC caller] setRemoteDescription:", e.message); }
-      } else if (d.answer && pc.remoteDescription) {
-        // Answer already set — just drain new callee ICE
+          await flushPendingIce(remoteUid);                  // drain queued ICE now
+          await applyIce(remoteUid, d.calleeIce, "callee");  // apply any in Firestore
+        } catch(e) { console.warn("[GVC caller] SRD:", e.message); }
+      } else if (pc.remoteDescription) {
         await applyIce(remoteUid, d.calleeIce, "callee");
       }
     }, () => {});
     unsubsRef.current.push(unsub);
-  }, [roomId, currentUser, makePc, applyIce]);
+  }, [roomId, currentUser, makePc, applyIce, flushPendingIce]);
 
-  // ── Connect as CALLEE (currentUser > remoteUid) ───────────────────
+  // ── Callee path ────────────────────────────────────────────────────────
   const connectAsCallee = useCallback(async (remoteUid, offerData) => {
     const pc = makePc(remoteUid);
-    // Send our ICE
     pc.onicecandidate = async (e) => {
       if (e.candidate) await gvcAddIce(roomId, currentUser, remoteUid, e.candidate.toJSON(), "callee");
     };
-    // Set offer → create answer
     await pc.setRemoteDescription(new RTCSessionDescription(offerData));
+    await flushPendingIce(remoteUid);  // drain any ICE queued before setRemoteDescription
+
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     await gvcWriteAnswer(roomId, remoteUid, currentUser, { type: answer.type, sdp: answer.sdp });
 
-    // Drain any caller ICE that arrived before we got the offer
-    const snap = await _gvcSigDoc(roomId, remoteUid, currentUser).get().catch(()=>null);
+    // Apply caller ICE already in Firestore
+    const snap = await _gvcSigDoc(roomId, remoteUid, currentUser).get().catch(() => null);
     if (snap?.exists) await applyIce(remoteUid, snap.data().callerIce, "caller");
 
-    // Watch for new caller ICE
+    // Watch for further caller ICE
     const unsub = _gvcSigDoc(roomId, remoteUid, currentUser).onSnapshot(async snap2 => {
       if (!snap2.exists) return;
       await applyIce(remoteUid, snap2.data().callerIce, "caller");
     }, () => {});
     unsubsRef.current.push(unsub);
-  }, [roomId, currentUser, makePc, applyIce]);
+  }, [roomId, currentUser, makePc, applyIce, flushPendingIce]);
 
   // ── Main effect ────────────────────────────────────────────────────
   useEffect(() => {
     let active = true;
-    const allUsersNow = ls("nv-users", []);
-    const myRole = allUsersNow.find(u => u.username === currentUser)?.role || "student";
-    const amLecturer = myRole === "lecturer" || myRole === "admin";
 
     (async () => {
-      // 1. Camera + mic
+      // 1. Get camera + mic
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
@@ -8002,79 +7952,53 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
       }
       if (!active) { stream.getTracks().forEach(t => t.stop()); return; }
       localStreamRef.current = stream;
-      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      if (localVideoRef.current) { localVideoRef.current.srcObject = stream; }
 
-      // 2. Join room
+      // 2. Announce presence + heartbeat
       await gvcJoin(roomId, currentUser);
-      joinedAtRef.current = Date.now();
-      hbRef.current   = setInterval(() => gvcJoin(roomId, currentUser), 8000);
+      hbRef.current  = setInterval(() => gvcJoin(roomId, currentUser), 8000);
       timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
       setStatus("active");
 
-      // 3. Lecturer writes the official session start time
-      if (amLecturer && roomId.startsWith("class-")) {
-        gvcStartSession(roomId, currentUser);
-      }
-
-      // 4. Liveness / motion detection — sample own camera every 5 s
-      //    64×36 canvas pixel-diff. Mean channel diff > 10 = movement detected.
-      if (!amLecturer && roomId.startsWith("class-")) {
-        const cvs = document.createElement("canvas");
-        cvs.width = 64; cvs.height = 36;
-        livenessCanvasRef.current = cvs;
-        const c2d = cvs.getContext("2d");
-        livenessTimerRef.current = setInterval(() => {
-          const vid = localVideoRef.current;
-          if (!vid || vid.readyState < 2 || !active) return;
-          try {
-            c2d.drawImage(vid, 0, 0, 64, 36);
-            const pixels = c2d.getImageData(0, 0, 64, 36).data;
-            livenessFrames.current++;
-            if (livenessPrevData.current) {
-              let diff = 0;
-              for (let i = 0; i < pixels.length; i += 4) {
-                diff += Math.abs(pixels[i]   - livenessPrevData.current[i])
-                      + Math.abs(pixels[i+1] - livenessPrevData.current[i+1])
-                      + Math.abs(pixels[i+2] - livenessPrevData.current[i+2]);
-              }
-              // Mean absolute difference per pixel per channel
-              if ((diff / (pixels.length / 4) / 3) > 10) livenessMotion.current++;
-            }
-            livenessPrevData.current = new Uint8ClampedArray(pixels);
-          } catch(_) {}
-        }, 5000);
-      }
-
-      // 5. Watch peers presence → caller initiates
+      // 3. Watch peers — start a connection to each new one
       const unsub1 = _gvcPeersCol(roomId).onSnapshot(snap => {
         if (!active) return;
         snap.docs.forEach(d => {
           const uid = d.data().uid;
           if (!uid || uid === currentUser || pcsRef.current[uid]) return;
-          if (currentUser < uid) connectAsCaller(uid).catch(console.warn);
+          if (currentUser < uid) {
+            // We are the caller for this pair
+            connectAsCaller(uid).catch(console.warn);
+          }
+          // Callee path is triggered by the signals watcher below
         });
+        // Clean up peers who left
         const present = new Set(snap.docs.map(d => d.data().uid));
         Object.keys(pcsRef.current).forEach(uid => {
           if (!present.has(uid)) {
-            try { pcsRef.current[uid].close(); } catch(_) {}
+            try { pcsRef.current[uid].close(); } catch(e) {}
             delete pcsRef.current[uid];
-            setPeers(prev => { const n = {...prev}; delete n[uid]; return n; });
+            setPeers(prev => { const n = { ...prev }; delete n[uid]; return n; });
           }
         });
       }, () => {});
       unsubsRef.current.push(unsub1);
 
-      // 6. Watch signals → callee answers
+      // 4. Watch signals collection for offers addressed TO ME (callee path)
       const unsub2 = _gvcSigsCol(roomId).onSnapshot(snap => {
         if (!active) return;
         snap.docChanges().forEach(async change => {
           const d = change.doc.data();
+          // We care about docs where `to === currentUser` and there's an offer
           if (!d.offer || d.to !== currentUser) return;
           const remoteUid = d.from;
-          if (!remoteUid || remoteUid === currentUser || pcsRef.current[remoteUid]) return;
+          if (!remoteUid || remoteUid === currentUser) return;
+          if (pcsRef.current[remoteUid]) return; // already connected
+          // Safety: callee is always the alphabetically larger uid
           if (!(currentUser > remoteUid)) return;
-          try { await connectAsCallee(remoteUid, d.offer); }
-          catch(e) { console.warn("[GVC callee]", e.message); }
+          try {
+            await connectAsCallee(remoteUid, d.offer);
+          } catch(e) { console.warn("[GVC callee]", e.message); }
         });
       }, () => {});
       unsubsRef.current.push(unsub2);
@@ -8084,25 +8008,10 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
       active = false;
       clearInterval(hbRef.current);
       clearInterval(timerRef.current);
-      clearInterval(livenessTimerRef.current);
-      unsubsRef.current.forEach(u => { try { u(); } catch(_){} });
-      Object.values(pcsRef.current).forEach(pc => { try { pc.close(); } catch(_){} });
+      unsubsRef.current.forEach(u => { try { u(); } catch(e){} });
+      Object.values(pcsRef.current).forEach(pc => { try { pc.close(); } catch(e) {} });
       localStreamRef.current?.getTracks().forEach(t => t.stop());
       gvcLeave(roomId, currentUser);
-
-      // ── Evaluate and write virtual attendance ──────────────────────
-      if (amLecturer && roomId.startsWith("class-")) {
-        gvcEndSession(roomId);
-      }
-      if (!amLecturer && joinedAtRef.current && roomId.startsWith("class-")) {
-        const leftAt     = Date.now();
-        const total      = livenessFrames.current;
-        const motion     = livenessMotion.current;
-        // Pass liveness if: fewer than 4 frames sampled (short call, benefit of doubt)
-        //   OR at least 30% of frames showed movement
-        const livenessOk = total < 4 || (motion / total) >= 0.30;
-        attMarkVirtual({ roomId, studentUid: currentUser, joinedAt: joinedAtRef.current, leftAt, livenessOk });
-      }
     };
   }, []); // eslint-disable-line
 
@@ -8115,13 +8024,6 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
     const nowOff = !videoOff;
     localStreamRef.current?.getVideoTracks().forEach(t => { t.enabled = !nowOff; });
     setVideoOff(nowOff);
-  };
-  const changeVolume = (v) => {
-    volumeRef.current = v;
-    window._gvcVolume = v;
-    setVolume(v);
-    // Update all remote tiles' gain nodes via custom event
-    window.dispatchEvent(new CustomEvent("gvc-volume", { detail: v }));
   };
 
   const fmtDur = s => String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
@@ -8190,18 +8092,6 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
           </button>
           <div style={{ fontSize:10, color:"rgba(255,255,255,.4)", fontWeight:700 }}>{videoOff ? "Start Video" : "Stop Video"}</div>
         </div>
-        {/* Volume boost slider */}
-        <div style={{ textAlign:"center", display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
-          <div style={{ fontSize:20 }}>{volume >= 2 ? "🔊" : volume >= 1 ? "🔉" : "🔈"}</div>
-          <input
-            type="range" min="0.5" max="3" step="0.1" value={volume}
-            onChange={e => changeVolume(parseFloat(e.target.value))}
-            style={{ width:72, accentColor:"var(--accent)", cursor:"pointer" }}
-          />
-          <div style={{ fontSize:10, color:"rgba(255,255,255,.4)", fontWeight:700 }}>
-            {volume === 1 ? "Volume" : volume > 1 ? `+${Math.round((volume-1)*100)}%` : `${Math.round(volume*100)}%`}
-          </div>
-        </div>
         <div style={{ textAlign:"center" }}>
           <button onClick={onClose} style={{ width:62, height:62, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 5px", boxShadow:"0 4px 16px rgba(239,68,68,.5)" }}>📵</button>
           <div style={{ fontSize:10, color:"rgba(255,255,255,.4)", fontWeight:700 }}>End Call</div>
@@ -8211,69 +8101,24 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
   );
 }
 
-// Separate component so each remote video gets its own stable ref + audio gain.
-//
-// WHY TWO ELEMENTS:
-//   Web Audio's MediaStreamDestination produces an audio-only stream.
-//   Assigning that to a <video> srcObject gives no picture.
-//   Solution: <video muted> shows the picture from the original stream,
-//   a hidden <audio> plays the GainNode-boosted sound.
+// Each remote tile gets its own stable video element with direct srcObject assignment.
+// No Web Audio chain — that was causing a black video (dest.stream has no video tracks).
 function RemoteVideoTile({ name, stream, avatarChar }) {
   const videoRef = useRef(null);
-  const audioRef = useRef(null);   // hidden — carries boosted audio
-  const audioCtx = useRef(null);
-  const gainNode = useRef(null);
-
   useEffect(() => {
-    if (!stream) return;
-
-    // Picture: point the muted video at the original stream
-    if (videoRef.current) {
-      videoRef.current.srcObject = stream;
-      videoRef.current.play().catch(() => {});
+    const vid = videoRef.current;
+    if (!vid || !stream) return;
+    if (vid.srcObject !== stream) {
+      vid.srcObject = stream;
+      vid.play().catch(() => {});
     }
-
-    // Sound: route through a GainNode → MediaStreamDestination → <audio>
-    try {
-      const ctx  = new (window.AudioContext || window.webkitAudioContext)();
-      const gain = ctx.createGain();
-      gain.gain.value = window._gvcVolume ?? 1;
-      ctx.createMediaStreamSource(stream).connect(gain);
-      const dest = ctx.createMediaStreamDestination();
-      gain.connect(dest);
-      audioCtx.current = ctx;
-      gainNode.current = gain;
-      if (audioRef.current) {
-        audioRef.current.srcObject = dest.stream;
-        audioRef.current.play().catch(() => {});
-      }
-    } catch (e) {
-      // Web Audio unavailable — unmute the video element as fallback
-      if (videoRef.current) videoRef.current.muted = false;
-    }
-
-    return () => {
-      try { audioCtx.current?.close(); } catch (_) {}
-      audioCtx.current = null;
-      gainNode.current = null;
-    };
   }, [stream]);
-
-  // Live volume changes from the slider in GroupVideoCallModal
-  useEffect(() => {
-    const handler = (e) => { if (gainNode.current) gainNode.current.gain.value = e.detail; };
-    window.addEventListener("gvc-volume", handler);
-    return () => window.removeEventListener("gvc-volume", handler);
-  }, []);
-
   return (
     <div style={{ position:"relative", background:"#1a1a1a", borderRadius:12, overflow:"hidden", aspectRatio:"16/9", display:"flex", alignItems:"center", justifyContent:"center" }}>
       {stream
-        ? <video ref={videoRef} autoPlay playsInline muted style={{ width:"100%", height:"100%", objectFit:"cover" }} />
+        ? <video ref={videoRef} autoPlay playsInline style={{ width:"100%", height:"100%", objectFit:"cover" }} />
         : <div style={{ width:60, height:60, borderRadius:"50%", background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:26, color:"white", fontWeight:800 }}>{avatarChar}</div>
       }
-      {/* Hidden audio element — plays the GainNode-boosted sound */}
-      <audio ref={audioRef} autoPlay playsInline style={{ display:"none" }} />
       <div style={{ position:"absolute", bottom:8, left:10, background:"rgba(0,0,0,.6)", borderRadius:8, padding:"3px 9px", fontSize:11, color:"white", fontWeight:700 }}>{name}</div>
     </div>
   );
@@ -10279,15 +10124,11 @@ function VideoCallModal({ user, peer, role, onEnd, toast }) {
   const [muted, setMuted]         = useState(false);
   const [videoOff, setVideoOff]   = useState(false);
   const [connState, setConnState] = useState("");
-  const [volume, setVolume]       = useState(1);   // 1 = normal, up to 3 = 3× boost
 
   const pcRef             = useRef(null);
   const localStreamRef    = useRef(null);
   const localVideoRef     = useRef(null);
-  const remoteVideoRef    = useRef(null);  // muted — picture only
-  const remoteAudioRef    = useRef(null);  // hidden — gain-boosted sound
-  const audioCtxRef       = useRef(null);
-  const gainNodeRef       = useRef(null);
+  const remoteVideoRef    = useRef(null);
   const timerRef          = useRef(null);
   const unsubRef          = useRef(null);
   const appliedCalleeIce  = useRef(0);
@@ -10341,7 +10182,6 @@ function VideoCallModal({ user, peer, role, onEnd, toast }) {
     if (unsubRef.current)    { unsubRef.current(); unsubRef.current = null; }
     if (pcRef.current)       { try { pcRef.current.close(); } catch(e){} pcRef.current = null; }
     if (localStreamRef.current) { localStreamRef.current.getTracks().forEach(t => t.stop()); localStreamRef.current = null; }
-    if (audioCtxRef.current) { try { audioCtxRef.current.close(); } catch(e){} audioCtxRef.current = null; gainNodeRef.current = null; }
     remoteDescSet.current = false; pendingCandidates.current = [];
   }, []);
 
@@ -10371,30 +10211,9 @@ function VideoCallModal({ user, peer, role, onEnd, toast }) {
 
     pc.ontrack = (e) => {
       const remoteStream = e.streams?.[0] || new MediaStream([e.track]);
-      // Picture: assign original stream to muted video element
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = remoteStream;
         remoteVideoRef.current.play().catch(() => {});
-      }
-      // Sound: route through GainNode → hidden <audio> element
-      if (!audioCtxRef.current) {
-        try {
-          const ctx  = new (window.AudioContext || window.webkitAudioContext)();
-          const gain = ctx.createGain();
-          gain.gain.value = volume;
-          ctx.createMediaStreamSource(remoteStream).connect(gain);
-          const dest = ctx.createMediaStreamDestination();
-          gain.connect(dest);
-          audioCtxRef.current = ctx;
-          gainNodeRef.current = gain;
-          if (remoteAudioRef.current) {
-            remoteAudioRef.current.srcObject = dest.stream;
-            remoteAudioRef.current.play().catch(() => {});
-          }
-        } catch (err) {
-          // Web Audio unavailable — unmute video as fallback
-          if (remoteVideoRef.current) remoteVideoRef.current.muted = false;
-        }
       }
     };
     pc.onicecandidate = async (e) => {
@@ -10474,11 +10293,6 @@ function VideoCallModal({ user, peer, role, onEnd, toast }) {
       setVideoOff(nowOff);
     }
   };
-  const changeVolume = (v) => {
-    setVolume(v);
-    if (gainNodeRef.current) gainNodeRef.current.gain.value = v;
-  };
-
   const fmtDur = (s) => String(Math.floor(s/60)).padStart(2,"0") + ":" + String(s%60).padStart(2,"0");
   const statusColors = { calling:"#f59e0b", incoming:"#3b82f6", active:"#22c55e", ended:"#6b7280" };
 
@@ -10488,9 +10302,7 @@ function VideoCallModal({ user, peer, role, onEnd, toast }) {
 
         {/* Remote video (main) */}
         <div style={{ position:"relative", flex:1, background:"#000", minHeight:260, display:"flex", alignItems:"center", justifyContent:"center" }}>
-          <video ref={remoteVideoRef} autoPlay playsInline muted style={{ width:"100%", height:"100%", objectFit:"cover", display: status==="active" ? "block" : "none" }} />
-          {/* Hidden audio element — plays the GainNode-boosted sound */}
-          <audio ref={remoteAudioRef} autoPlay playsInline style={{ display:"none" }} />
+          <video ref={remoteVideoRef} autoPlay playsInline style={{ width:"100%", height:"100%", objectFit:"cover", display: status==="active" ? "block" : "none" }} />
 
           {/* Peer avatar placeholder when not active */}
           {status !== "active" && (
@@ -10552,18 +10364,6 @@ function VideoCallModal({ user, peer, role, onEnd, toast }) {
                   {videoOff ? "🚫" : "📷"}
                 </button>
                 <div style={{ fontSize:10, color:"rgba(255,255,255,.5)", fontWeight:700 }}>{videoOff?"Camera Off":"Camera"}</div>
-              </div>
-              {/* Volume boost slider */}
-              <div style={{ textAlign:"center", display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
-                <div style={{ fontSize:18 }}>{volume >= 2 ? "🔊" : volume >= 1 ? "🔉" : "🔈"}</div>
-                <input
-                  type="range" min="0.5" max="3" step="0.1" value={volume}
-                  onChange={e => changeVolume(parseFloat(e.target.value))}
-                  style={{ width:72, accentColor:"var(--accent)", cursor:"pointer" }}
-                />
-                <div style={{ fontSize:10, color:"rgba(255,255,255,.5)", fontWeight:700 }}>
-                  {volume === 1 ? "Volume" : volume > 1 ? `+${Math.round((volume-1)*100)}%` : `${Math.round(volume*100)}%`}
-                </div>
               </div>
               <div style={{ textAlign:"center" }}>
                 <button onClick={hangUp} style={{ width:60, height:60, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 6px", boxShadow:"0 4px 16px rgba(239,68,68,.4)" }}>📵</button>
@@ -16289,17 +16089,14 @@ function AttendanceView({ currentUser, toast, isLecturer }) {
   const pct = (days) => {
     let present=0,total=0;
     Object.values(days).forEach(d => {
-      Object.values(d).forEach(s => { total++; if(s==="present"||s==="virtual") present++; });
+      Object.values(d).forEach(s => { total++; if(s==="present") present++; });
     });
     return total===0 ? null : Math.round((present/total)*100);
   };
 
   if (!isLecturer) {
     const myDates = Object.keys(myHistory).sort().reverse().slice(0,30);
-    const attended = myDates.filter(d => {
-      const s = myHistory[d][_safeKey(currentUser)];
-      return s==="present" || s==="virtual";
-    }).length;
+    const attended = myDates.filter(d => myHistory[d][_safeKey(currentUser)]==="present").length;
     const totalMarked = myDates.filter(d => myHistory[d][_safeKey(currentUser)]).length;
     const attPct = totalMarked ? Math.round((attended/totalMarked)*100) : null;
     return (
@@ -16320,17 +16117,12 @@ function AttendanceView({ currentUser, toast, isLecturer }) {
           {myDates.map(date => {
             const status = myHistory[date][_safeKey(currentUser)];
             if (!status) return null;
-            const isVirtual = status === "virtual";
-            const isPresent = status === "present" || isVirtual;
-            const color = isPresent?"var(--success)":status==="absent"?"var(--danger)":"var(--warn)";
-            const icon  = isPresent?"✅":status==="absent"?"❌":"⚠️";
+            const color = status==="present"?"var(--success)":status==="absent"?"var(--danger)":"var(--warn)";
+            const icon  = status==="present"?"✅":status==="absent"?"❌":"⚠️";
             return (
               <div key={date} style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:10,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                 <span style={{fontSize:13}}>{new Date(date+"T00:00:00").toLocaleDateString([],{weekday:"short",month:"short",day:"numeric"})}</span>
-                <span style={{fontSize:13,fontWeight:700,color,display:"flex",alignItems:"center",gap:6}}>
-                  {icon} {isVirtual?"Present":status.charAt(0).toUpperCase()+status.slice(1)}
-                  {isVirtual&&<span style={{fontSize:10,background:"rgba(59,130,246,.15)",color:"#3b82f6",border:"1px solid rgba(59,130,246,.3)",borderRadius:6,padding:"1px 6px",fontWeight:700}}>💻 Virtual</span>}
-                </span>
+                <span style={{fontSize:13,fontWeight:700,color}}>{icon} {status.charAt(0).toUpperCase()+status.slice(1)}</span>
               </div>
             );
           })}
@@ -16339,8 +16131,6 @@ function AttendanceView({ currentUser, toast, isLecturer }) {
       </div>
     );
   }
-
-  const virtualCount = classStudents.filter(u => records[_safeKey(u.username)] === "virtual").length;
 
   return (
     <div style={{maxWidth:700,margin:"0 auto"}}>
@@ -16355,17 +16145,6 @@ function AttendanceView({ currentUser, toast, isLecturer }) {
         </div>
       </div>
 
-      {/* Virtual attendance summary banner */}
-      {virtualCount > 0 && (
-        <div style={{background:"rgba(59,130,246,.08)",border:"1.5px solid rgba(59,130,246,.25)",borderRadius:12,padding:"12px 16px",marginBottom:16,display:"flex",alignItems:"center",gap:12}}>
-          <span style={{fontSize:22}}>💻</span>
-          <div>
-            <div style={{fontWeight:800,fontSize:14,color:"#3b82f6"}}>{virtualCount} student{virtualCount!==1?"s":""} auto-marked via Virtual Class</div>
-            <div style={{fontSize:12,color:"var(--text3)"}}>Attendance was recorded automatically — student was live for ≥90% of class and passed the liveness check. You can override any entry.</div>
-          </div>
-        </div>
-      )}
-
       <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
         <button onClick={()=>quickMarkAll("present")} style={{padding:"7px 14px",borderRadius:8,background:"rgba(34,197,94,.15)",color:"var(--success)",border:"1px solid var(--success)",cursor:"pointer",fontWeight:700,fontSize:12}}>✅ All Present</button>
         <button onClick={()=>quickMarkAll("absent")} style={{padding:"7px 14px",borderRadius:8,background:"rgba(239,68,68,.1)",color:"var(--danger)",border:"1px solid var(--danger)",cursor:"pointer",fontWeight:700,fontSize:12}}>❌ All Absent</button>
@@ -16375,9 +16154,7 @@ function AttendanceView({ currentUser, toast, isLecturer }) {
       {classStudents.length===0 && <div style={{textAlign:"center",padding:40,color:"var(--text3)"}}>No students in this class yet</div>}
       {classStudents.map(student => {
         const sk = _safeKey(student.username);
-        const status   = records[sk] || "";
-        const isVirtual = status === "virtual";
-        const isPresent = status === "present" || isVirtual;
+        const status = records[sk] || "";
         return (
           <div key={student.username} className="att-row">
             <div style={{display:"flex",alignItems:"center",gap:10}}>
@@ -16385,24 +16162,16 @@ function AttendanceView({ currentUser, toast, isLecturer }) {
                 {(student.avatar||(student.displayName||student.username)[0]||"?").toUpperCase()}
               </div>
               <div>
-                <div style={{fontWeight:700,fontSize:14,display:"flex",alignItems:"center",gap:6}}>
-                  {student.displayName||student.username.split("@")[0]}
-                  {isVirtual&&<span style={{fontSize:10,background:"rgba(59,130,246,.15)",color:"#3b82f6",border:"1px solid rgba(59,130,246,.3)",borderRadius:6,padding:"1px 7px",fontWeight:700}}>💻 Virtual</span>}
-                </div>
+                <div style={{fontWeight:700,fontSize:14}}>{student.displayName||student.username.split("@")[0]}</div>
                 <div style={{fontSize:11,color:"var(--text3)"}}>{student.username}</div>
               </div>
             </div>
             <div style={{display:"flex",gap:6}}>
-              {["present","absent","late"].map(s => {
-                const active2 = (isPresent && s==="present") || (!isVirtual && status===s);
-                const col = s==="present"?"var(--success)":s==="absent"?"var(--danger)":"var(--warn)";
-                const bg  = s==="present"?"rgba(34,197,94,.15)":s==="absent"?"rgba(239,68,68,.1)":"rgba(251,146,60,.1)";
-                return (
-                  <button key={s} onClick={()=>mark(student.username,s)} style={{padding:"6px 12px",borderRadius:8,border:`1.5px solid ${active2?col:"var(--border)"}`,background:active2?bg:"transparent",color:active2?col:"var(--text3)",cursor:"pointer",fontWeight:700,fontSize:11,textTransform:"capitalize"}}>
-                    {s==="present"?"✅":s==="absent"?"❌":"⚠️"} {s}
-                  </button>
-                );
-              })}
+              {["present","absent","late"].map(s => (
+                <button key={s} onClick={()=>mark(student.username,s)} style={{padding:"6px 12px",borderRadius:8,border:`1.5px solid ${status===s?(s==="present"?"var(--success)":s==="absent"?"var(--danger)":"var(--warn)"):"var(--border)"}`,background:status===s?(s==="present"?"rgba(34,197,94,.15)":s==="absent"?"rgba(239,68,68,.1)":"rgba(251,146,60,.1)"):"transparent",color:status===s?(s==="present"?"var(--success)":s==="absent"?"var(--danger)":"var(--warn)"):"var(--text3)",cursor:"pointer",fontWeight:700,fontSize:11,textTransform:"capitalize"}}>
+                  {s==="present"?"✅":s==="absent"?"❌":"⚠️"} {s}
+                </button>
+              ))}
             </div>
           </div>
         );
