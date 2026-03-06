@@ -7711,17 +7711,398 @@ function PHNFolderModal({ currentUser, isAdmin, onClose }) {
   );
 }
 
-// ── GroupVideoCallBtn ─────────────────────────────────────────────────
-// Reusable button that opens a Jitsi Meet group video call for any room.
-// roomId: a stable unique string (class id, group id, etc.)
-// label: short label shown on button
-function GroupVideoCallBtn({ roomId, label = "Video Call", style = {} }) {
-  const [showPanel, setShowPanel] = useState(false);
-  const jitsiUrl = `https://meet.jit.si/NursingHub-${roomId.replace(/[^a-z0-9]/gi, "-")}`;
+// ════════════════════════════════════════════════════════════════════════
+// GROUP VIDEO CALL — fully embedded, on-site WebRTC mesh call
+// Firestore path: group_calls/{roomId}/participants/{userId}
+//   participant doc: { uid, joinedAt, offer?, answer?, candidates[] }
+// Each joiner creates peer connections to every other current participant.
+// ════════════════════════════════════════════════════════════════════════
+const GVC_ICE = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "turn:a.relay.metered.ca:80",              username:"free", credential:"free" },
+    { urls: "turn:a.relay.metered.ca:80?transport=tcp", username:"free", credential:"free" },
+    { urls: "turn:a.relay.metered.ca:443",             username:"free", credential:"free" },
+    { urls: "turns:a.relay.metered.ca:443",            username:"free", credential:"free" },
+  ],
+  iceCandidatePoolSize: 10,
+};
+
+// Firestore helpers for group calls
+const gvcRef      = (roomId)           => _db.collection("group_calls").doc(roomId);
+const gvcPeerRef  = (roomId, uid)      => gvcRef(roomId).collection("peers").doc(_safeKey(uid));
+const gvcSigRef   = (roomId, a, b)     => gvcRef(roomId).collection("signals").doc(_safeKey(a) + "__" + _safeKey(b));
+
+// Publish that this user is in the room (heartbeat every 8s)
+const gvcJoin = async (roomId, uid) => {
+  const ready = await _loadFirebase(); if (!ready) return;
+  await gvcPeerRef(roomId, uid).set({ uid, joinedAt: Date.now(), alive: Date.now() }, { merge: true });
+};
+const gvcLeave = async (roomId, uid) => {
+  const ready = await _loadFirebase(); if (!ready) return;
+  try { await gvcPeerRef(roomId, uid).delete(); } catch(e) {}
+};
+const gvcSendSignal = async (roomId, from, to, data) => {
+  const ready = await _loadFirebase(); if (!ready) return;
+  // Each direction gets its own doc: caller→callee
+  await gvcSigRef(roomId, from, to).set({ ...data, updatedAt: Date.now() }, { merge: true });
+};
+const gvcAddIce = async (roomId, from, to, candidate) => {
+  const ready = await _loadFirebase(); if (!ready) return;
+  const ref = gvcSigRef(roomId, from, to);
+  const snap = await ref.get().catch(()=>null);
+  const existing = snap?.exists ? (snap.data().candidates || []) : [];
+  await ref.set({ candidates: [...existing, candidate] }, { merge: true });
+};
+
+function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
+  const allUsers = ls("nv-users", []);
+  const myName   = allUsers.find(u => u.username === currentUser)?.displayName || currentUser.split("@")[0];
+
+  // peers: Map uid → { pc, stream, name }
+  const [peers,    setPeers]    = useState({});   // { uid: { name, stream } }
+  const [muted,    setMuted]    = useState(false);
+  const [videoOff, setVideoOff] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [status,   setStatus]   = useState("joining"); // joining | active | ended
+
+  const localStreamRef = useRef(null);
+  const localVideoRef  = useRef(null);
+  const pcsRef         = useRef({});   // uid → RTCPeerConnection
+  const unsubsRef      = useRef([]);
+  const hbRef          = useRef(null);
+  const timerRef       = useRef(null);
+  const pendingIce     = useRef({});   // uid → []
+  const remoteDescSet  = useRef({});   // uid → bool
+
+  const avatarChar = (uid) => {
+    const u = allUsers.find(x => x.username === uid);
+    return (u?.displayName || uid.split("@")[0])[0].toUpperCase();
+  };
+  const displayName = (uid) => {
+    const u = allUsers.find(x => x.username === uid);
+    return u?.displayName || uid.split("@")[0];
+  };
+
+  // ── Flush queued ICE candidates for a peer ─────────────────────────
+  const flushIce = useCallback(async (uid) => {
+    const pc = pcsRef.current[uid];
+    if (!pc || !remoteDescSet.current[uid]) return;
+    const queue = pendingIce.current[uid] || [];
+    for (const c of queue) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
+    }
+    pendingIce.current[uid] = [];
+  }, []);
+
+  // ── Create a peer connection to one remote participant ─────────────
+  const connectToPeer = useCallback(async (remoteUid, isCaller) => {
+    if (pcsRef.current[remoteUid]) return; // already connected
+    const localStream = localStreamRef.current;
+    if (!localStream) return;
+
+    const pc = new RTCPeerConnection(GVC_ICE);
+    pcsRef.current[remoteUid] = pc;
+    remoteDescSet.current[remoteUid] = false;
+    pendingIce.current[remoteUid] = [];
+
+    // Send local tracks
+    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+    // Receive remote stream
+    pc.ontrack = (e) => {
+      const stream = e.streams?.[0] || new MediaStream([e.track]);
+      setPeers(prev => ({ ...prev, [remoteUid]: { name: displayName(remoteUid), stream } }));
+    };
+
+    // Send ICE candidates
+    pc.onicecandidate = async (e) => {
+      if (e.candidate) {
+        await gvcAddIce(roomId, currentUser, remoteUid, e.candidate.toJSON());
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "disconnected" || pc.connectionState === "failed" || pc.connectionState === "closed") {
+        setPeers(prev => { const n = { ...prev }; delete n[remoteUid]; return n; });
+        try { pc.close(); } catch(e) {}
+        delete pcsRef.current[remoteUid];
+      }
+    };
+
+    if (isCaller) {
+      // Create offer
+      const offer = await pc.createOffer({ offerToReceiveAudio:true, offerToReceiveVideo:true });
+      await pc.setLocalDescription(offer);
+      await gvcSendSignal(roomId, currentUser, remoteUid, {
+        offer: { type: pc.localDescription.type, sdp: pc.localDescription.sdp }
+      });
+
+      // Watch for answer
+      const unsub = _db.collection("group_calls").doc(roomId).collection("signals")
+        .doc(_safeKey(remoteUid) + "__" + _safeKey(currentUser))
+        .onSnapshot(async snap => {
+          if (!snap.exists) return;
+          const d = snap.data();
+          // Apply answer
+          if (d.answer && !remoteDescSet.current[remoteUid] && pc.signalingState !== "closed") {
+            try {
+              await pc.setRemoteDescription(new RTCSessionDescription(d.answer));
+              remoteDescSet.current[remoteUid] = true;
+              await flushIce(remoteUid);
+            } catch(e) {}
+          }
+          // Apply candidates sent by remote to us
+          if (d.candidates?.length) {
+            const applied = pendingIce.current[remoteUid + "_applied"] || 0;
+            const fresh = d.candidates.slice(applied);
+            for (const c of fresh) {
+              if (remoteDescSet.current[remoteUid]) {
+                try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
+              } else {
+                pendingIce.current[remoteUid] = [...(pendingIce.current[remoteUid]||[]), c];
+              }
+            }
+            pendingIce.current[remoteUid + "_applied"] = d.candidates.length;
+          }
+        }, () => {});
+      unsubsRef.current.push(unsub);
+    }
+    // (callee path handled in the signal watcher below)
+  }, [roomId, currentUser, flushIce]);
+
+  // ── Main effect: get media, join room, watch participants ───────────
+  useEffect(() => {
+    let active = true;
+
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation:true, noiseSuppression:true },
+          video: { width:{ ideal:1280 }, height:{ ideal:720 }, facingMode:"user" },
+        });
+        if (!active) { stream.getTracks().forEach(t=>t.stop()); return; }
+        localStreamRef.current = stream;
+        if (localVideoRef.current) { localVideoRef.current.srcObject = stream; }
+
+        // Join the Firestore room
+        await gvcJoin(roomId, currentUser);
+        hbRef.current = setInterval(() => gvcJoin(roomId, currentUser), 8000);
+        timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
+        setStatus("active");
+
+        // ── Watch other participants ───────────────────────────────
+        const unsub1 = gvcRef(roomId).collection("peers")
+          .onSnapshot(snap => {
+            if (!active) return;
+            snap.docs.forEach(d => {
+              const uid = d.data().uid;
+              if (!uid || uid === currentUser) return;
+              // Only the "alphabetically smaller" uid initiates the offer
+              const iCaller = currentUser < uid;
+              connectToPeer(uid, iCaller);
+            });
+            // Remove peers that left
+            const present = new Set(snap.docs.map(d => d.data().uid));
+            Object.keys(pcsRef.current).forEach(uid => {
+              if (!present.has(uid)) {
+                const pc = pcsRef.current[uid];
+                try { pc.close(); } catch(e) {}
+                delete pcsRef.current[uid];
+                setPeers(prev => { const n={...prev}; delete n[uid]; return n; });
+              }
+            });
+          }, ()=>{});
+        unsubsRef.current.push(unsub1);
+
+        // ── Watch for offers addressed to ME (callee path) ─────────
+        const unsub2 = gvcRef(roomId).collection("signals")
+          .onSnapshot(snap => {
+            if (!active) return;
+            snap.docChanges().forEach(async change => {
+              const data = change.doc.data();
+              if (!data.offer) return;
+              // Signal doc id is "from__to" — we only process "?__me"
+              const [fromKey] = change.doc.id.split("__");
+              // Reverse-lookup uid from safeKey
+              const fromUid = allUsers.find(u => _safeKey(u.username) === fromKey)?.username;
+              if (!fromUid || fromUid === currentUser) return;
+              // Only process if we are the callee (i.e. fromUid < currentUser — caller sends to us)
+              if (!(fromUid < currentUser)) return;
+              if (pcsRef.current[fromUid]) return; // already have pc
+
+              const pc = new RTCPeerConnection(GVC_ICE);
+              pcsRef.current[fromUid] = pc;
+              remoteDescSet.current[fromUid] = false;
+              pendingIce.current[fromUid] = [];
+              localStreamRef.current?.getTracks().forEach(t => pc.addTrack(t, localStreamRef.current));
+
+              pc.ontrack = (e) => {
+                const stream = e.streams?.[0] || new MediaStream([e.track]);
+                setPeers(prev => ({ ...prev, [fromUid]: { name: displayName(fromUid), stream } }));
+              };
+              pc.onicecandidate = async (e) => {
+                if (e.candidate) await gvcAddIce(roomId, currentUser, fromUid, e.candidate.toJSON());
+              };
+              pc.onconnectionstatechange = () => {
+                if (["disconnected","failed","closed"].includes(pc.connectionState)) {
+                  setPeers(prev => { const n={...prev}; delete n[fromUid]; return n; });
+                  try { pc.close(); } catch(e) {}
+                  delete pcsRef.current[fromUid];
+                }
+              };
+
+              await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+              remoteDescSet.current[fromUid] = true;
+              await flushIce(fromUid);
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              await gvcSendSignal(roomId, currentUser, fromUid, {
+                answer: { type: pc.localDescription.type, sdp: pc.localDescription.sdp }
+              });
+
+              // Watch for ICE candidates from the caller
+              const unsub3 = gvcRef(roomId).collection("signals")
+                .doc(_safeKey(fromUid) + "__" + _safeKey(currentUser))
+                .onSnapshot(async snap2 => {
+                  if (!snap2.exists) return;
+                  const d2 = snap2.data();
+                  if (d2.candidates?.length) {
+                    const applied = pendingIce.current[fromUid + "_applied"] || 0;
+                    const fresh = d2.candidates.slice(applied);
+                    for (const c of fresh) {
+                      if (remoteDescSet.current[fromUid]) {
+                        try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
+                      } else {
+                        pendingIce.current[fromUid] = [...(pendingIce.current[fromUid]||[]), c];
+                      }
+                    }
+                    pendingIce.current[fromUid + "_applied"] = d2.candidates.length;
+                  }
+                }, () => {});
+              unsubsRef.current.push(unsub3);
+            });
+          }, ()=>{});
+        unsubsRef.current.push(unsub2);
+
+      } catch(e) {
+        if (active) { setStatus("ended"); setTimeout(onClose, 2000); }
+      }
+    })();
+
+    return () => {
+      active = false;
+      clearInterval(hbRef.current);
+      clearInterval(timerRef.current);
+      unsubsRef.current.forEach(u => u());
+      Object.values(pcsRef.current).forEach(pc => { try { pc.close(); } catch(e) {} });
+      localStreamRef.current?.getTracks().forEach(t => t.stop());
+      gvcLeave(roomId, currentUser);
+    };
+  }, []); // eslint-disable-line
+
+  const toggleMute = () => {
+    localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = muted; });
+    setMuted(m => !m);
+  };
+  const toggleVideo = () => {
+    localStreamRef.current?.getVideoTracks().forEach(t => { t.enabled = videoOff; });
+    setVideoOff(v => !v);
+  };
+  const fmtDur = s => String(Math.floor(s/60)).padStart(2,"0") + ":" + String(s%60).padStart(2,"0");
+  const peerList = Object.entries(peers); // [[uid, {name,stream}]]
+  const total = peerList.length + 1; // include self
+
+  // Layout: 1 peer → side by side, 2+ → grid
+  const gridCols = total <= 2 ? total : total <= 4 ? 2 : 3;
+
+  return (
+    <div style={{ position:"fixed", inset:0, zIndex:9999, background:"#0d0d0d", display:"flex", flexDirection:"column" }}>
+      {/* Top bar */}
+      <div style={{ padding:"12px 20px", background:"rgba(0,0,0,.6)", display:"flex", alignItems:"center", gap:12, flexShrink:0, backdropFilter:"blur(8px)", borderBottom:"1px solid rgba(255,255,255,.07)" }}>
+        <div style={{ fontSize:20 }}>📹</div>
+        <div style={{ flex:1 }}>
+          <div style={{ fontWeight:900, fontSize:15, color:"white" }}>{label}</div>
+          <div style={{ fontSize:11, color:"rgba(255,255,255,.55)", fontFamily:"'DM Mono',monospace" }}>
+            {status === "joining" ? "Connecting…" : `${total} participant${total!==1?"s":""} · ${fmtDur(duration)}`}
+          </div>
+        </div>
+        <button onClick={onClose} style={{ background:"rgba(255,255,255,.1)", border:"1px solid rgba(255,255,255,.15)", borderRadius:10, padding:"7px 14px", color:"white", fontWeight:700, fontSize:13, cursor:"pointer" }}>Leave</button>
+      </div>
+
+      {/* Video grid */}
+      <div style={{ flex:1, display:"grid", gridTemplateColumns:`repeat(${gridCols}, 1fr)`, gap:4, padding:4, overflow:"hidden", alignContent:"center" }}>
+        {/* Self tile */}
+        <div style={{ position:"relative", background:"#1a1a1a", borderRadius:12, overflow:"hidden", aspectRatio:"16/9", display:"flex", alignItems:"center", justifyContent:"center" }}>
+          <video ref={localVideoRef} autoPlay playsInline muted style={{ width:"100%", height:"100%", objectFit:"cover", display: videoOff ? "none" : "block" }} />
+          {videoOff && <div style={{ fontSize:40, color:"rgba(255,255,255,.3)" }}>🚫</div>}
+          <div style={{ position:"absolute", bottom:8, left:10, background:"rgba(0,0,0,.6)", borderRadius:8, padding:"3px 9px", fontSize:11, color:"white", fontWeight:700 }}>
+            You {muted ? "🔇" : ""}
+          </div>
+        </div>
+        {/* Remote peer tiles */}
+        {peerList.map(([uid, { name, stream }]) => (
+          <RemoteVideoTile key={uid} uid={uid} name={name} stream={stream} avatarChar={avatarChar(uid)} />
+        ))}
+        {/* Empty slots if total < 2 */}
+        {total === 1 && (
+          <div style={{ background:"#111", borderRadius:12, aspectRatio:"16/9", display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", gap:10 }}>
+            <div style={{ fontSize:36, color:"rgba(255,255,255,.15)" }}>👤</div>
+            <div style={{ fontSize:12, color:"rgba(255,255,255,.25)", fontWeight:700 }}>Waiting for others to join…</div>
+          </div>
+        )}
+      </div>
+
+      {/* Controls */}
+      <div style={{ padding:"16px 24px", background:"rgba(0,0,0,.6)", display:"flex", alignItems:"center", justifyContent:"center", gap:20, flexShrink:0, backdropFilter:"blur(8px)" }}>
+        {[
+          { icon: muted ? "🔇" : "🎙️", label: muted?"Unmute":"Mute", action: toggleMute, active: muted },
+          { icon: videoOff ? "🚫" : "📷", label: videoOff?"Start Video":"Stop Video", action: toggleVideo, active: videoOff },
+        ].map(btn => (
+          <div key={btn.label} style={{ textAlign:"center" }}>
+            <button onClick={btn.action} style={{ width:52, height:52, borderRadius:"50%", background: btn.active ? "#ef4444" : "rgba(255,255,255,.12)", border:"1.5px solid rgba(255,255,255,.15)", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 5px" }}>
+              {btn.icon}
+            </button>
+            <div style={{ fontSize:10, color:"rgba(255,255,255,.45)", fontWeight:700 }}>{btn.label}</div>
+          </div>
+        ))}
+        <div style={{ textAlign:"center" }}>
+          <button onClick={onClose} style={{ width:62, height:62, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 5px", boxShadow:"0 4px 16px rgba(239,68,68,.5)" }}>📵</button>
+          <div style={{ fontSize:10, color:"rgba(255,255,255,.45)", fontWeight:700 }}>End Call</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Separate component so each remote video element gets its own ref
+function RemoteVideoTile({ uid, name, stream, avatarChar }) {
+  const videoRef = useRef(null);
+  useEffect(() => {
+    if (videoRef.current && stream) {
+      videoRef.current.srcObject = stream;
+      videoRef.current.play().catch(()=>{});
+    }
+  }, [stream]);
+  return (
+    <div style={{ position:"relative", background:"#1a1a1a", borderRadius:12, overflow:"hidden", aspectRatio:"16/9", display:"flex", alignItems:"center", justifyContent:"center" }}>
+      {stream
+        ? <video ref={videoRef} autoPlay playsInline style={{ width:"100%", height:"100%", objectFit:"cover" }} />
+        : <div style={{ width:60, height:60, borderRadius:"50%", background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:26, color:"white", fontWeight:800 }}>{avatarChar}</div>
+      }
+      <div style={{ position:"absolute", bottom:8, left:10, background:"rgba(0,0,0,.6)", borderRadius:8, padding:"3px 9px", fontSize:11, color:"white", fontWeight:700 }}>{name}</div>
+    </div>
+  );
+}
+
+// ── GroupVideoCallBtn — button that opens the in-app group call ────────
+function GroupVideoCallBtn({ roomId, label = "Video Call", currentUser, style = {} }) {
+  const [inCall, setInCall] = useState(false);
   return (
     <>
       <button
-        onClick={() => setShowPanel(true)}
+        onClick={() => setInCall(true)}
         title={`Start group video call — ${label}`}
         style={{
           background: "linear-gradient(135deg,#1d4ed8,#3b82f6)",
@@ -7732,41 +8113,13 @@ function GroupVideoCallBtn({ roomId, label = "Video Call", style = {} }) {
           ...style,
         }}
       >📹 Video Call</button>
-
-      {showPanel && (
-        <div style={{ position:"fixed", inset:0, zIndex:10002, background:"rgba(0,0,0,.72)", display:"flex", alignItems:"center", justifyContent:"center", padding:16 }}>
-          <div style={{ background:"var(--bg)", borderRadius:20, width:"min(95vw,520px)", overflow:"hidden", boxShadow:"0 24px 64px rgba(0,0,0,.5)", border:"1.5px solid #3b82f6" }}>
-            <div style={{ padding:"14px 18px", background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", display:"flex", alignItems:"center", gap:12 }}>
-              <div style={{ width:40, height:40, borderRadius:12, background:"rgba(255,255,255,.15)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:20 }}>📹</div>
-              <div style={{ flex:1 }}>
-                <div style={{ fontWeight:900, fontSize:15, color:"white" }}>{label} — Group Video Call</div>
-                <div style={{ fontSize:11, color:"rgba(255,255,255,.75)" }}>Share the link below so others can join</div>
-              </div>
-              <button onClick={() => setShowPanel(false)} style={{ background:"rgba(255,255,255,.18)", border:"none", borderRadius:8, padding:"6px 11px", color:"white", cursor:"pointer", fontWeight:700, fontSize:14 }}>✕</button>
-            </div>
-            <div style={{ padding:"22px 20px" }}>
-              <div style={{ fontSize:13, color:"var(--text3)", marginBottom:12, lineHeight:1.6 }}>
-                Click <b>Join Video Call</b> to open a free, secure group video room. Everyone in <b>{label}</b> can join using the same link.
-              </div>
-              <div style={{ background:"var(--bg4)", border:"1.5px solid var(--border)", borderRadius:12, padding:"10px 14px", fontFamily:"'DM Mono',monospace", fontSize:11, color:"var(--text)", wordBreak:"break-all", marginBottom:16, userSelect:"all" }}>
-                {jitsiUrl}
-              </div>
-              <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
-                <button
-                  onClick={() => { window.open(jitsiUrl, "_blank"); }}
-                  style={{ flex:1, padding:"12px 0", borderRadius:12, background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", border:"none", color:"white", fontWeight:800, fontSize:14, cursor:"pointer", boxShadow:"0 4px 16px rgba(59,130,246,.4)" }}
-                >📹 Join Video Call</button>
-                <button
-                  onClick={() => { try { navigator.clipboard.writeText(jitsiUrl); } catch(e) {} }}
-                  style={{ padding:"12px 18px", borderRadius:12, background:"var(--bg4)", border:"1.5px solid var(--border)", color:"var(--text)", fontWeight:700, fontSize:13, cursor:"pointer" }}
-                >📋 Copy Link</button>
-              </div>
-              <div style={{ fontSize:11, color:"var(--text3)", marginTop:14, textAlign:"center" }}>
-                Powered by <b>Jitsi Meet</b> · No account needed · End-to-end encrypted
-              </div>
-            </div>
-          </div>
-        </div>
+      {inCall && (
+        <GroupVideoCallModal
+          roomId={roomId}
+          label={label}
+          currentUser={currentUser}
+          onClose={() => setInCall(false)}
+        />
       )}
     </>
   );
@@ -8018,7 +8371,7 @@ function PHNClassForum({ currentUser, onClose, onUnreadChange }) {
                 👨‍🏫 Lecturers
               </button>
             )}
-            <GroupVideoCallBtn roomId={PHN_FORUM_ID} label="PHN Class Forum" style={{ background:"rgba(59,130,246,.35)", border:"1.5px solid rgba(59,130,246,.6)" }} />
+            <GroupVideoCallBtn roomId={PHN_FORUM_ID} label="PHN Class Forum" currentUser={currentUser} style={{ background:"rgba(59,130,246,.35)", border:"1.5px solid rgba(59,130,246,.6)" }} />
             <button onClick={() => setShowFolder(true)} title="PHN Study Folder"
               style={{ background: "rgba(255,255,255,.22)", border: "1.5px solid rgba(255,255,255,.45)", borderRadius: 10, padding: "6px 13px", color: "white", fontSize: 12, fontWeight: 800, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
               📁 Folder
@@ -10578,7 +10931,7 @@ function Messages({ user, toast, onUnreadChange }) {
                         <div style={{ fontWeight:800, fontSize:14, color:"var(--text)" }}>{allClasses.find(c=>c.id===broadcastClass)?.label}</div>
                         <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===broadcastClass).length} students · Group chat</div>
                       </div>
-                      <GroupVideoCallBtn roomId={"class-" + broadcastClass} label={allClasses.find(c=>c.id===broadcastClass)?.label || "Class"} />
+                      <GroupVideoCallBtn roomId={"class-" + broadcastClass} label={allClasses.find(c=>c.id===broadcastClass)?.label || "Class"} currentUser={user} />
                     </div>
 
                     {/* Messages */}
@@ -10660,7 +11013,7 @@ function Messages({ user, toast, onUnreadChange }) {
                   <div style={{ fontWeight:800, fontSize:14, color:"var(--text)" }}>{allClasses.find(c=>c.id===myClassId)?.label || "Class Group Chat"}</div>
                   <div style={{ fontSize:11, color:"var(--text3)" }}>👥 {allStudents.filter(u=>u.class===myClassId).length + 1} members · Group chat</div>
                 </div>
-                <GroupVideoCallBtn roomId={"class-" + myClassId} label={allClasses.find(c=>c.id===myClassId)?.label || "Class"} />
+                <GroupVideoCallBtn roomId={"class-" + myClassId} label={allClasses.find(c=>c.id===myClassId)?.label || "Class"} currentUser={user} />
               </div>
               {/* Messages */}
               <div style={{ flex:1, overflowY:"auto", padding:"16px 20px", display:"flex", flexDirection:"column", gap:10 }}>
@@ -15102,7 +15455,7 @@ function ResearchClub({ currentUser, toast, isLecturer, isAdmin }) {
 
         {/* Private DM dropdown */}
         <div style={{display:"flex",alignItems:"center",gap:8}}>
-          <GroupVideoCallBtn roomId="research-club-main" label="Research Club" />
+          <GroupVideoCallBtn roomId="research-club-main" label="Research Club" currentUser={currentUser} />
           <select
             value={dmTarget}
             onChange={e=>setDmTarget(e.target.value)}
@@ -15284,7 +15637,7 @@ function StudyGroups({ currentUser, toast }) {
         <button onClick={()=>setActiveGroup(null)} style={{background:"none",border:"none",cursor:"pointer",fontSize:20,color:"var(--text3)"}}>←</button>
         <div style={{width:40,height:40,borderRadius:50,background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>👥</div>
         <div style={{flex:1}}><div style={{fontWeight:800,fontSize:16}}>{activeGroup.name}</div><div style={{fontSize:11,color:"var(--text3)"}}>{activeGroup.desc||myClass?.label||"Study group"}</div></div>
-        <GroupVideoCallBtn roomId={activeGroup.id} label={activeGroup.name} />
+        <GroupVideoCallBtn roomId={activeGroup.id} label={activeGroup.name} currentUser={currentUser} />
       </div>
       <div style={{flex:1,overflowY:"auto",padding:"0 4px",display:"flex",flexDirection:"column",gap:8}}>
         {msgs.map(m => {
