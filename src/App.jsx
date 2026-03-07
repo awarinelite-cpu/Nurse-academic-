@@ -18639,7 +18639,7 @@ self.addEventListener('notificationclick', e => {
         setForgotLoading(false);
         setForgotMode("code");
         // Fallback: show code on screen if email fails
-        toast(`⚠️ Email failed — your code is: ${code}  (valid 10 min)`, "warn");
+        toast("⚠️ Could not send email. Please contact admin.", "error");
       }
     } else {
       // EmailJS not yet configured — show code in toast as fallback
