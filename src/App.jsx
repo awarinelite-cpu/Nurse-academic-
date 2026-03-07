@@ -4,10 +4,9 @@ import React, { useState, useEffect, useCallback, useRef, Fragment } from "react
 // ─── EMAILJS CONFIG ──────────────────────────────────────────────────
 // EmailJS free tier: 200 emails/month — sign up at https://www.emailjs.com
 // Fill in your own IDs below after creating a free account:
-const EMAILJS_PUBLIC_KEY  = "2JgrOiZvJn9_Xdo5Y";
-const EMAILJS_SERVICE_ID  = "service_jqh2a8i";
-const EMAILJS_TEMPLATE_ID = "template_60264xt";
-
+const EMAILJS_PUBLIC_KEY  = process.env.REACT_APP_EMAILJS_KEY;
+const EMAILJS_SERVICE_ID  = process.env.REACT_APP_EMAILJS_SERVICE;
+const EMAILJS_TEMPLATE_ID = process.env.REACT_APP_EMAILJS_TEMPLATE;
 // Lazy-loads the EmailJS SDK from CDN (only once)
 let _emailjsReady = false;
 const loadEmailJS = () => new Promise((resolve, reject) => {
@@ -57,7 +56,7 @@ const sendAccessCodeEmail = async (toEmail, code, name) => {
 
 // ─── PAYSTACK CONFIG ─────────────────────────────────────────────────
 // Paste your Paystack Public Key below (starts with pk_test_ or pk_live_)
-const PAYSTACK_PUBLIC_KEY = "pk_live_25be9012b1233d358dfbab621aac09469f128cd4";
+const PAYSTACK_PUBLIC_KEY = process.env.REACT_APP_PAYSTACK_KEY;
 const PAYSTACK_AMOUNT     = 200000; // Amount in kobo (500000 = ₦5,000) — change to your price
 
 // Generates a unique NC access code like NC-XXXX-XXXX-XXXX
