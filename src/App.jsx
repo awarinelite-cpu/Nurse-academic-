@@ -544,7 +544,7 @@ const subscribeCallSignal = (username, onSignal) => {
   );
 };
 
-
+const dmMarkRead = async (me, other) => {
   const ready = await _loadFirebase(); if (!ready) return;
   try {
     const cid = _convId(me, other);
