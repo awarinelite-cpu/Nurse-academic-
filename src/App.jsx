@@ -19160,16 +19160,6 @@ self.addEventListener('notificationclick', e => {
               } catch(_) {}
             });
           }}
-            // Write "declined" onto the WebRTC signalling doc so the caller's
-            // existing snapshot watcher sees it and stops ringing
-            _loadFirebase().then(ok => {
-              if (!ok) return;
-              try {
-                _gvcSigDoc(c.roomId, c.fromUser, currentUser)
-                  .set({ declined: true }, { merge: true });
-              } catch(_) {}
-            });
-          }}
         />
       )}
       {/* ── Active DM call (answered from banner / notification) ── */}
