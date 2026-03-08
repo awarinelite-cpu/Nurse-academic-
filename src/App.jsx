@@ -8847,7 +8847,8 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
           if (!snap.exists || !active) return;
           const d = snap.data();
           // Callee declined — stop ringing
-          if (d.declined && !liveRef.current) {
+          // Callee declined — stop ringing
+          if (d.declined && !liveRef.current && status === "ringing") {
             setStatus("ended");
             setTimeout(() => { if (active) onClose(); }, 1500);
             return;
@@ -8914,12 +8915,11 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
       try { pcRef.current?.close(); } catch(_) {}
       localStreamRef.current?.getTracks().forEach(t => t.stop());
       // Clean up: clear call signals on both sides and delete signalling doc
-      clearCallSignal(myUid);
-      clearCallSignal(remoteUid);
+      clearCallSignal(myUid, roomId);
+      clearCallSignal(remoteUid, roomId);
       _loadFirebase().then(ok => {
         if (!ok) return;
-        try { _gvcSigDoc(roomId, myUid, remoteUid).delete().catch(() => {}); } catch(_) {}
-        try { _gvcSigDoc(roomId, remoteUid, myUid).delete().catch(() => {}); } catch(_) {}
+        try { _gvcSigDoc(roomId, myUid, remoteUid).set({ ended: true }, { merge: true }).catch(() => {}); } catch(_) {}
       });
     };
   }, []); // eslint-disable-line
