@@ -8257,26 +8257,25 @@ const _ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
   { urls: "stun:stun.cloudflare.com:3478" },
-  { urls: "stun:stun.relay.metered.ca:80" },
   {
     urls: "turn:global.relay.metered.ca:80",
-    username: "openrelayproject",
-    credential: "openrelayproject",
+    username: "1d2573fad62044e937cee0ab",
+    credential: "vj0Ysdvdi7F/W+qA",
   },
   {
     urls: "turn:global.relay.metered.ca:80?transport=tcp",
-    username: "openrelayproject",
-    credential: "openrelayproject",
+    username: "1d2573fad62044e937cee0ab",
+    credential: "vj0Ysdvdi7F/W+qA",
   },
   {
     urls: "turn:global.relay.metered.ca:443",
-    username: "openrelayproject",
-    credential: "openrelayproject",
+    username: "1d2573fad62044e937cee0ab",
+    credential: "vj0Ysdvdi7F/W+qA",
   },
   {
     urls: "turns:global.relay.metered.ca:443?transport=tcp",
-    username: "openrelayproject",
-    credential: "openrelayproject",
+    username: "1d2573fad62044e937cee0ab",
+    credential: "vj0Ysdvdi7F/W+qA",
   },
 ];
 const GVC_ICE = {
