@@ -525,14 +525,15 @@ const writeCallSignal = async (fromUser, toUser, callType, callerName, callerAva
   } catch(e) { console.warn("[callSignal] write failed:", e.message); }
 };
 
-const clearCallSignal = async (toUser) => {
+const clearCallSignal = async (toUser, roomId) => {
   const ready = await _loadFirebase(); if (!ready) return;
   try {
     const key = _safeKey(toUser);
-    await _db.collection("call_signals").doc(key).set({ status: "ended", ts: Date.now() }, { merge: true });
+    const payload = { status: "ended", ts: Date.now() };
+    if (roomId) payload.roomId = roomId;
+    await _db.collection("call_signals").doc(key).set(payload, { merge: true });
   } catch(e) {}
 };
-
 const subscribeCallSignal = (username, onSignal) => {
   if (!username) return () => {};
   return _mkSub(db =>
@@ -8843,6 +8844,7 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
         });
 
         // Watch for answer + callee's ICE (stored in remoteIceField)
+        // Watch for answer + callee's ICE (stored in remoteIceField)
         const unsub = _gvcSigDoc(roomId, myUid, remoteUid).onSnapshot(async snap => {
           if (!snap.exists || !active) return;
           const d = snap.data();
@@ -8857,6 +8859,21 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
           }
         }, () => {});
         unsubsRef.current.push(unsub);
+
+        // Watch the CALLER's own call_signal doc so we detect when the
+        // callee ends/declines before the call is live
+        const unsubCallerSignal = subscribeCallSignal(myUid, (signal) => {
+          if (!active) return;
+          if (
+            signal.status === "ended" &&
+            signal.roomId === roomId &&
+            !liveRef.current
+          ) {
+            setStatus("ended");
+            setTimeout(() => { if (active) onClose(); }, 1500);
+          }
+        });
+        unsubsRef.current.push(unsubCallerSignal);
 
       } else {
         // ── CALLEE PATH ───────────────────────────────────────────────
@@ -19133,11 +19150,13 @@ self.addEventListener('notificationclick', e => {
             setIncomingCall(null);
             setActiveCall({ type: c.callType, toUser: c.fromUser, toName: c.callerName, toAvatar: c.callerAvatar });
             setActiveNav("messages");
-            clearCallSignal(currentUser);
+            clearCallSignal(currentUser, c.roomId);
           }}
-          onDecline={() => {
+         onDecline={() => {
+            const c = incomingCall;
             setIncomingCall(null);
-            clearCallSignal(currentUser);
+            clearCallSignal(c.fromUser, c.roomId);
+            clearCallSignal(currentUser, c.roomId);
           }}
         />
       )}
