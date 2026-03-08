@@ -16382,18 +16382,6 @@ function ResearchClub({ currentUser, toast, isLecturer, isAdmin }) {
           >Open DM</button>
         </div>
       </div>
-
-      {/* Members chips */}
-      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
-        {members.slice(0,8).map(m=>(
-          <div key={m} style={{display:"flex",alignItems:"center",gap:5,background:"var(--bg4)",border:"1px solid var(--border)",borderRadius:20,padding:"3px 10px",fontSize:11,fontWeight:700}}>
-            <div style={{width:16,height:16,borderRadius:"50%",background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,color:"#fff",fontWeight:900}}>{avatarChar(m)}</div>
-            {displayName(m)} <span style={{opacity:.5}}>{roleTag(m)}</span>
-          </div>
-        ))}
-        {members.length>8&&<div style={{fontSize:11,color:"var(--text3)",padding:"3px 8px",borderRadius:20,background:"var(--bg4)",border:"1px solid var(--border)"}}>+{members.length-8} more</div>}
-      </div>
-
       {/* Messages */}
       <div style={{flex:1,overflowY:"auto",padding:"0 4px",display:"flex",flexDirection:"column",gap:10}}>
         {msgs.length===0&&(
