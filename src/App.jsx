@@ -8255,16 +8255,36 @@ function PHNFolderModal({ currentUser, isAdmin, onClose }) {
 const _ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
-  { urls: "stun:stun2.l.google.com:19302" },
-  { urls: "stun:stun3.l.google.com:19302" },
-  { urls: "stun:stun4.l.google.com:19302" },
-  { urls: "turn:openrelay.metered.ca:80",               username: "openrelayproject", credential: "openrelayproject" },
-  { urls: "turn:openrelay.metered.ca:80?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
-  { urls: "turn:openrelay.metered.ca:443",              username: "openrelayproject", credential: "openrelayproject" },
-  { urls: "turns:openrelay.metered.ca:443",             username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "stun:stun.cloudflare.com:3478" },
+  { urls: "stun:stun.relay.metered.ca:80" },
+  {
+    urls: "turn:global.relay.metered.ca:80",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: "turn:global.relay.metered.ca:80?transport=tcp",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: "turn:global.relay.metered.ca:443",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: "turns:global.relay.metered.ca:443?transport=tcp",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
 ];
-const GVC_ICE = { iceServers: _ICE_SERVERS, iceCandidatePoolSize: 10 };
-
+const GVC_ICE = {
+  iceServers: _ICE_SERVERS,
+  iceCandidatePoolSize: 10,
+  bundlePolicy: "max-bundle",       // bundle all tracks into one transport
+  rtcpMuxPolicy: "require",         // mux RTCP — cuts round trips in half
+  iceTransportPolicy: "all",        // try direct first, TURN as fallback
+};
 // Pair id — always smaller_larger so both sides reference the same doc
 const _gvcPairId  = (a, b) => { const [x,y] = a < b ? [a,b] : [b,a]; return _safeKey(x)+"_"+_safeKey(y); };
 const _gvcPeersCol = (roomId) => _db.collection("group_calls").doc(roomId).collection("peers");
@@ -8736,7 +8756,7 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true },
-          video: videoOnly ? { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" } : false,
+          video: videoOnly ? {   width:     { ideal: 1280, max: 1280 },   height:    { ideal: 720,  max: 720  },   frameRate: { ideal: 30,   max: 30   },   facingMode: "user", } : false,
         });
       } catch(e) {
         if (active) { setErrMsg(e.message || "Camera/mic denied"); setStatus("error"); }
@@ -8749,7 +8769,7 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
       // 2. Build RTCPeerConnection
       const pc = new RTCPeerConnection(GVC_ICE);
       pcRef.current = pc;
-      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+      // Apply low-latency encoding: low start bitrate ramps up fast,       // prioritise latency over throughput       pc.getSenders().forEach(sender => {         if (sender.track?.kind === "video") {           const params = sender.getParameters();           if (!params.encodings || params.encodings.length === 0) {             params.encodings = [{}];           }           params.encodings[0] = {             ...params.encodings[0],             maxBitrate:         2_000_000,   // 2 Mbps ceiling             maxFramerate:       30,             networkPriority:    "high",             priority:           "high",             scaleResolutionDownBy: 1.0,           };           sender.setParameters(params).catch(() => {});         }         if (sender.track?.kind === "audio") {           const params = sender.getParameters();           if (!params.encodings || params.encodings.length === 0) {             params.encodings = [{}];           }           params.encodings[0] = {             ...params.encodings[0],             maxBitrate:      128_000,   // 128 kbps for crisp audio             networkPriority: "very-high",             priority:        "very-high",           };           sender.setParameters(params).catch(() => {});         }       });
 
       // Use a ref to track live status — avoids stale closure in callbacks
       const liveRef = { current: false };
@@ -8778,6 +8798,23 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
           liveRef.current = true;
           setStatus("live");
           startTimer();
+          // Re-apply encoding params now that ICE is done — this is when they actually take effect
+          pc.getSenders().forEach(sender => {
+            const params = sender.getParameters();
+            if (!params.encodings?.length) return;
+            if (sender.track?.kind === "video") {
+              params.encodings[0].maxBitrate      = 2_000_000;
+              params.encodings[0].maxFramerate     = 30;
+              params.encodings[0].networkPriority  = "high";
+              params.encodings[0].priority         = "high";
+            }
+            if (sender.track?.kind === "audio") {
+              params.encodings[0].maxBitrate       = 128_000;
+              params.encodings[0].networkPriority  = "very-high";
+              params.encodings[0].priority         = "very-high";
+            }
+            sender.setParameters(params).catch(() => {});
+          });
         }
         if (["disconnected","failed","closed"].includes(pc.connectionState)) setStatus("ended");
       };
