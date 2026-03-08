@@ -116,7 +116,7 @@ const FIREBASE_CONFIG = {
 
 // ── FCM VAPID key — get from Firebase Console → Project Settings → Cloud Messaging → Web Push certificates ──
 // Replace the string below with your actual VAPID key
-const FCM_VAPID_KEY = "YOUR_VAPID_KEY_HERE"; // e.g. "BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3"
+const FCM_VAPID_KEY = "BKcxnd9gn28KuXuB6BTZnGRA08QYUmKamGxrWHgJLIvog7P13jMrs5WZcmnisJ5k7Dvhxeir0BK-AvpEW2fQcw8"; // e.g. "BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3"
 
 // ── Reliable notification helper ────────────────────────────────────────
 // Uses ServiceWorker registration.showNotification() when available (works
