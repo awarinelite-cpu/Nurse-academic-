@@ -8242,15 +8242,14 @@ function PHNFolderModal({ currentUser, isAdmin, onClose }) {
 
 // ════════════════════════════════════════════════════════════════════════
 // GROUP VIDEO CALL — fully embedded on-site WebRTC mesh
-//
-// Firestore layout:
+// Firestore signalling layout:
 //   group_calls/{roomId}/peers/{safeUid}          ← presence heartbeat
-//   group_calls/{roomId}/signals/{safeFrom}_{safeTo}  ← one doc per direction
+//   group_calls/{roomId}/signals/{pairId}         ← one doc per pair
 //     fields: from, to, offer?, answer?, callerIce[], calleeIce[]
 //
-// Caller  = alphabetically-smaller uid  (creates offer)
-// Callee  = alphabetically-larger  uid  (creates answer)
-// Each pair shares ONE signal doc keyed caller_callee.
+// Pair doc id = _gvcPairId(a,b) — alphabetically smaller uid first.
+// Caller = alphabetically-smaller uid (creates offer)
+// Callee = alphabetically-larger  uid (creates answer)
 // ════════════════════════════════════════════════════════════════════════
 
 const _ICE_SERVERS = [
@@ -8259,58 +8258,55 @@ const _ICE_SERVERS = [
   { urls: "stun:stun2.l.google.com:19302" },
   { urls: "stun:stun3.l.google.com:19302" },
   { urls: "stun:stun4.l.google.com:19302" },
-  // Open Relay Project — genuinely free public TURN (no signup needed)
-  { urls: "turn:openrelay.metered.ca:80",              username: "openrelayproject", credential: "openrelayproject" },
-  { urls: "turn:openrelay.metered.ca:80?transport=tcp",username: "openrelayproject", credential: "openrelayproject" },
-  { urls: "turn:openrelay.metered.ca:443",             username: "openrelayproject", credential: "openrelayproject" },
-  { urls: "turns:openrelay.metered.ca:443",            username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:80",               username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:80?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:443",              username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turns:openrelay.metered.ca:443",             username: "openrelayproject", credential: "openrelayproject" },
 ];
+const GVC_ICE = { iceServers: _ICE_SERVERS, iceCandidatePoolSize: 10 };
 
-const GVC_ICE = {
-  iceServers: _ICE_SERVERS,
-  iceCandidatePoolSize: 10,
-};
+// Pair id — always smaller_larger so both sides reference the same doc
+const _gvcPairId  = (a, b) => { const [x,y] = a < b ? [a,b] : [b,a]; return _safeKey(x)+"_"+_safeKey(y); };
+const _gvcPeersCol = (roomId) => _db.collection("group_calls").doc(roomId).collection("peers");
+const _gvcSigsCol  = (roomId) => _db.collection("group_calls").doc(roomId).collection("signals");
+const _gvcSigDoc   = (roomId, a, b) => _gvcSigsCol(roomId).doc(_gvcPairId(a, b));
 
-// Deterministic doc id for a pair — always caller(smaller)_callee(larger)
-const _gvcPairId = (a, b) => {
-  const [x, y] = a < b ? [a, b] : [b, a];
-  return _safeKey(x) + "_" + _safeKey(y);
-};
-const _gvcPeersCol  = (roomId) => _db.collection("group_calls").doc(roomId).collection("peers");
-const _gvcSigsCol   = (roomId) => _db.collection("group_calls").doc(roomId).collection("signals");
-const _gvcSigDoc    = (roomId, a, b) => _gvcSigsCol(roomId).doc(_gvcPairId(a, b));
-
-// Presence
 const gvcJoin  = async (roomId, uid) => {
-  const ready = await _loadFirebase(); if (!ready) return;
+  const ok = await _loadFirebase(); if (!ok) return;
   await _gvcPeersCol(roomId).doc(_safeKey(uid)).set({ uid, ts: Date.now() }, { merge: true });
 };
 const gvcLeave = async (roomId, uid) => {
-  const ready = await _loadFirebase(); if (!ready) return;
-  try { await _gvcPeersCol(roomId).doc(_safeKey(uid)).delete(); } catch(e) {}
+  const ok = await _loadFirebase(); if (!ok) return;
+  try { await _gvcPeersCol(roomId).doc(_safeKey(uid)).delete(); } catch(_) {}
 };
 
-// Write offer (caller → signal doc)
-const gvcWriteOffer = async (roomId, caller, callee, offer) => {
-  await _gvcSigDoc(roomId, caller, callee).set(
-    { from: caller, to: callee, offer, callerIce: [], calleeIce: [], updatedAt: Date.now() },
-    { merge: false }   // always fresh for a new call session
+// Write offer — always keyed caller→callee (caller is alphabetically smaller)
+const gvcWriteOffer = async (roomId, callerUid, calleeUid, offer) => {
+  // Ensure caller < callee alphabetically
+  const [a, b] = callerUid < calleeUid ? [callerUid, calleeUid] : [calleeUid, callerUid];
+  await _gvcSigDoc(roomId, a, b).set(
+    { from: a, to: b, offer, callerIce: [], calleeIce: [], updatedAt: Date.now() },
+    { merge: false }
   );
 };
-// Write answer (callee → signal doc)
-const gvcWriteAnswer = async (roomId, caller, callee, answer) => {
-  await _gvcSigDoc(roomId, caller, callee).set({ answer, updatedAt: Date.now() }, { merge: true });
+// Write answer — callee patches in answer field
+const gvcWriteAnswer = async (roomId, callerUid, calleeUid, answer) => {
+  const [a, b] = callerUid < calleeUid ? [callerUid, calleeUid] : [calleeUid, callerUid];
+  await _gvcSigDoc(roomId, a, b).set({ answer, updatedAt: Date.now() }, { merge: true });
 };
-// Append ICE — use arrayUnion to avoid read-then-write race condition
-const gvcAddIce = async (roomId, a, b, candidate, role) => {
-  const ready = await _loadFirebase(); if (!ready) return;
+// Append ICE candidate — role is "caller" or "callee"
+const gvcAddIce = async (roomId, uid, remoteUid, candidate, role) => {
+  const ok = await _loadFirebase(); if (!ok) return;
   try {
     const field = role === "caller" ? "callerIce" : "calleeIce";
-    const ref   = _gvcSigDoc(roomId, a, b);
-    await ref.set({ [field]: window.firebase.firestore.FieldValue.arrayUnion(candidate), updatedAt: Date.now() }, { merge: true });
+    await _gvcSigDoc(roomId, uid, remoteUid).set(
+      { [field]: window.firebase.firestore.FieldValue.arrayUnion(candidate), updatedAt: Date.now() },
+      { merge: true }
+    );
   } catch(e) { console.warn("[GVC] addIce failed:", e.message); }
 };
 
+// ── GroupVideoCallModal ───────────────────────────────────────────────────
 function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
   const allUsers = ls("nv-users", []);
 
@@ -8318,24 +8314,22 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
   const [muted,    setMuted]    = useState(false);
   const [videoOff, setVideoOff] = useState(false);
   const [duration, setDuration] = useState(0);
-  const [status,   setStatus]   = useState("joining");
+  const [status,   setStatus]   = useState("joining"); // joining | active | error
   const [errMsg,   setErrMsg]   = useState("");
 
-  const localStreamRef  = useRef(null);
-  const localVideoRef   = useRef(null);
-  const pcsRef          = useRef({});
-  const unsubsRef       = useRef([]);
-  const hbRef           = useRef(null);
-  const timerRef        = useRef(null);
-
-  // Per-peer ICE tracking
-  const appliedIce  = useRef({});   // uid_role → count applied so far
-  const pendingIce  = useRef({});   // uid → { callerIce:[], calleeIce:[] } queued before remoteDesc
+  const localStreamRef = useRef(null);
+  const localVideoRef  = useRef(null);
+  const pcsRef         = useRef({});   // uid → RTCPeerConnection
+  const unsubsRef      = useRef([]);
+  const hbRef          = useRef(null);
+  const timerRef       = useRef(null);
+  const appliedIce     = useRef({});   // pairKey_role → count of applied candidates
+  const pendingIce     = useRef({});   // uid → queued candidates before remoteDesc
 
   const dname  = (uid) => { const u = allUsers.find(x => x.username === uid); return u?.displayName || uid.split("@")[0]; };
   const avChar = (uid) => (dname(uid)[0] || "?").toUpperCase();
 
-  // ── Apply ICE from a Firestore snapshot array, queue if not yet ready ─────
+  // Apply incoming ICE, queue if remoteDescription not yet set
   const applyIce = useCallback(async (remoteUid, candidates, role) => {
     const pc = pcsRef.current[remoteUid];
     if (!pc || pc.signalingState === "closed") return;
@@ -8344,134 +8338,109 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
     const fresh = (candidates || []).slice(from);
     if (!fresh.length) return;
     appliedIce.current[key] = from + fresh.length;
-
     if (!pc.remoteDescription) {
-      // Queue until setRemoteDescription is called
-      const q = pendingIce.current[remoteUid] || { callerIce: [], calleeIce: [] };
-      const field = role === "caller" ? "callerIce" : "calleeIce";
-      q[field].push(...fresh);
-      pendingIce.current[remoteUid] = q;
+      pendingIce.current[remoteUid] = [...(pendingIce.current[remoteUid] || []), ...fresh];
       return;
     }
-    for (const c of fresh) {
-      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_) {}
-    }
+    for (const c of fresh) { try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_) {} }
   }, []);
 
-  // ── Flush pending ICE immediately after setRemoteDescription ────────────
-  const flushPendingIce = useCallback(async (remoteUid) => {
+  const flushIce = useCallback(async (remoteUid) => {
     const pc = pcsRef.current[remoteUid];
     if (!pc || !pc.remoteDescription) return;
-    const q = pendingIce.current[remoteUid];
-    if (!q) return;
-    const all = [...q.callerIce, ...q.calleeIce];
-    pendingIce.current[remoteUid] = { callerIce: [], calleeIce: [] };
-    for (const c of all) {
-      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_) {}
-    }
+    const queued = pendingIce.current[remoteUid] || [];
+    if (!queued.length) return;
+    pendingIce.current[remoteUid] = [];
+    for (const c of queued) { try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_) {} }
   }, []);
 
-  // ── Build one RTCPeerConnection ────────────────────────────────────────
+  // Build a new RTCPeerConnection for a remote peer
   const makePc = useCallback((remoteUid) => {
     if (pcsRef.current[remoteUid]) return pcsRef.current[remoteUid];
     const pc = new RTCPeerConnection(GVC_ICE);
     pcsRef.current[remoteUid] = pc;
     appliedIce.current[remoteUid + "_caller"] = 0;
     appliedIce.current[remoteUid + "_callee"] = 0;
-    pendingIce.current[remoteUid] = { callerIce: [], calleeIce: [] };
+    pendingIce.current[remoteUid] = [];
 
-    // Add local tracks to this connection
+    // Add local tracks
     localStreamRef.current?.getTracks().forEach(t => pc.addTrack(t, localStreamRef.current));
 
-    // Remote track handling — keep one stable MediaStream per peer.
-    // Audio and video often arrive as two separate ontrack events.
-    // Re-using the same MediaStream object avoids re-assigning srcObject
-    // and the resulting video freeze.
+    // Stable per-peer remote stream — audio + video arrive as separate tracks
     const remoteStream = new MediaStream();
-    pc.ontrack = (e) => {
-      if (e.streams && e.streams[0]) {
-        // Chrome/Safari provide the full stream directly — use it
-        setPeers(prev => ({ ...prev, [remoteUid]: { name: dname(remoteUid), stream: e.streams[0] } }));
-      } else {
-        // Firefox etc. deliver tracks individually — accumulate into one stream
-        e.track.onunmute = () => {
-          remoteStream.addTrack(e.track);
-          setPeers(prev => ({ ...prev, [remoteUid]: { name: dname(remoteUid), stream: remoteStream } }));
-        };
-        if (e.track.readyState === "live") {
-          remoteStream.addTrack(e.track);
-          setPeers(prev => ({ ...prev, [remoteUid]: { name: dname(remoteUid), stream: remoteStream } }));
-        }
+    pc.ontrack = (ev) => {
+      const stream = ev.streams?.[0] || remoteStream;
+      if (!ev.streams?.[0]) {
+        ev.track.onunmute = () => { remoteStream.addTrack(ev.track); setPeers(p => ({ ...p, [remoteUid]: { name: dname(remoteUid), stream: remoteStream } })); };
+        if (ev.track.readyState === "live") remoteStream.addTrack(ev.track);
       }
+      setPeers(p => ({ ...p, [remoteUid]: { name: dname(remoteUid), stream } }));
     };
 
     pc.onconnectionstatechange = () => {
       if (["disconnected","failed","closed"].includes(pc.connectionState)) {
-        setPeers(prev => { const n = { ...prev }; delete n[remoteUid]; return n; });
         try { pc.close(); } catch(_) {}
         delete pcsRef.current[remoteUid];
+        setPeers(p => { const n = { ...p }; delete n[remoteUid]; return n; });
       }
     };
     return pc;
   }, []); // eslint-disable-line
 
-  // ── Caller path ────────────────────────────────────────────────────────
+  // Caller initiates offer
   const connectAsCaller = useCallback(async (remoteUid) => {
+    if (pcsRef.current[remoteUid]) return; // already connected
     const pc = makePc(remoteUid);
-    pc.onicecandidate = async (e) => {
-      if (e.candidate) await gvcAddIce(roomId, currentUser, remoteUid, e.candidate.toJSON(), "caller");
-    };
+    pc.onicecandidate = (ev) => { if (ev.candidate) gvcAddIce(roomId, currentUser, remoteUid, ev.candidate.toJSON(), "caller"); };
+
     const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
     await pc.setLocalDescription(offer);
     await gvcWriteOffer(roomId, currentUser, remoteUid, { type: offer.type, sdp: offer.sdp });
 
+    // Watch for answer + callee ICE
     const unsub = _gvcSigDoc(roomId, currentUser, remoteUid).onSnapshot(async snap => {
       if (!snap.exists) return;
       const d = snap.data();
       if (d.answer && !pc.remoteDescription && pc.signalingState === "have-local-offer") {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(d.answer));
-          await flushPendingIce(remoteUid);                  // drain queued ICE now
-          await applyIce(remoteUid, d.calleeIce, "callee");  // apply any in Firestore
-        } catch(e) { console.warn("[GVC caller] SRD:", e.message); }
+          await flushIce(remoteUid);
+          await applyIce(remoteUid, d.calleeIce, "callee");
+        } catch(e) { console.warn("[GVC caller SRD]", e.message); }
       } else if (pc.remoteDescription) {
         await applyIce(remoteUid, d.calleeIce, "callee");
       }
     }, () => {});
     unsubsRef.current.push(unsub);
-  }, [roomId, currentUser, makePc, applyIce, flushPendingIce]);
+  }, [roomId, currentUser, makePc, applyIce, flushIce]);
 
-  // ── Callee path ────────────────────────────────────────────────────────
+  // Callee responds with answer
   const connectAsCallee = useCallback(async (remoteUid, offerData) => {
+    if (pcsRef.current[remoteUid]) return;
     const pc = makePc(remoteUid);
-    pc.onicecandidate = async (e) => {
-      if (e.candidate) await gvcAddIce(roomId, currentUser, remoteUid, e.candidate.toJSON(), "callee");
-    };
-    await pc.setRemoteDescription(new RTCSessionDescription(offerData));
-    await flushPendingIce(remoteUid);  // drain any ICE queued before setRemoteDescription
+    pc.onicecandidate = (ev) => { if (ev.candidate) gvcAddIce(roomId, currentUser, remoteUid, ev.candidate.toJSON(), "callee"); };
 
+    await pc.setRemoteDescription(new RTCSessionDescription(offerData));
+    await flushIce(remoteUid);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     await gvcWriteAnswer(roomId, remoteUid, currentUser, { type: answer.type, sdp: answer.sdp });
 
-    // Apply caller ICE already in Firestore
+    // Apply any caller ICE already in Firestore + watch for more
     const snap = await _gvcSigDoc(roomId, remoteUid, currentUser).get().catch(() => null);
     if (snap?.exists) await applyIce(remoteUid, snap.data().callerIce, "caller");
 
-    // Watch for further caller ICE
     const unsub = _gvcSigDoc(roomId, remoteUid, currentUser).onSnapshot(async snap2 => {
       if (!snap2.exists) return;
       await applyIce(remoteUid, snap2.data().callerIce, "caller");
     }, () => {});
     unsubsRef.current.push(unsub);
-  }, [roomId, currentUser, makePc, applyIce, flushPendingIce]);
+  }, [roomId, currentUser, makePc, applyIce, flushIce]);
 
-  // ── Main effect ────────────────────────────────────────────────────
   useEffect(() => {
     let active = true;
-
     (async () => {
-      // 1. Get camera + mic
+      // Get camera + mic
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
@@ -8479,59 +8448,50 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
           video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
         });
       } catch(e) {
-        setErrMsg("Camera/mic access denied. Please allow permissions and try again.");
-        setStatus("error");
+        if (active) { setErrMsg("Camera/mic access denied. Please allow permissions."); setStatus("error"); }
         return;
       }
       if (!active) { stream.getTracks().forEach(t => t.stop()); return; }
       localStreamRef.current = stream;
       if (localVideoRef.current) { localVideoRef.current.srcObject = stream; }
 
-      // 2. Announce presence + heartbeat
+      // Announce presence + heartbeat
       await gvcJoin(roomId, currentUser);
-      hbRef.current  = setInterval(() => gvcJoin(roomId, currentUser), 8000);
+      hbRef.current   = setInterval(() => gvcJoin(roomId, currentUser), 8000);
       timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
-      setStatus("active");
+      if (active) setStatus("active");
 
-      // 3. Watch peers — start a connection to each new one
+      // Watch peers — initiate call to each peer where we are the caller (smaller uid)
       const unsub1 = _gvcPeersCol(roomId).onSnapshot(snap => {
         if (!active) return;
         snap.docs.forEach(d => {
           const uid = d.data().uid;
           if (!uid || uid === currentUser || pcsRef.current[uid]) return;
-          if (currentUser < uid) {
-            // We are the caller for this pair
-            connectAsCaller(uid).catch(console.warn);
-          }
-          // Callee path is triggered by the signals watcher below
+          if (currentUser < uid) connectAsCaller(uid).catch(e => console.warn("[GVC] caller err:", e.message));
+          // Callee path is driven by the signals watcher below
         });
-        // Clean up peers who left
+        // Remove peers who left
         const present = new Set(snap.docs.map(d => d.data().uid));
         Object.keys(pcsRef.current).forEach(uid => {
           if (!present.has(uid)) {
-            try { pcsRef.current[uid].close(); } catch(e) {}
+            try { pcsRef.current[uid].close(); } catch(_) {}
             delete pcsRef.current[uid];
-            setPeers(prev => { const n = { ...prev }; delete n[uid]; return n; });
+            setPeers(p => { const n = { ...p }; delete n[uid]; return n; });
           }
         });
       }, () => {});
       unsubsRef.current.push(unsub1);
 
-      // 4. Watch signals collection for offers addressed TO ME (callee path)
+      // Watch signals for offers addressed to us (callee path)
       const unsub2 = _gvcSigsCol(roomId).onSnapshot(snap => {
         if (!active) return;
         snap.docChanges().forEach(async change => {
           const d = change.doc.data();
-          // We care about docs where `to === currentUser` and there's an offer
           if (!d.offer || d.to !== currentUser) return;
           const remoteUid = d.from;
-          if (!remoteUid || remoteUid === currentUser) return;
-          if (pcsRef.current[remoteUid]) return; // already connected
-          // Safety: callee is always the alphabetically larger uid
-          if (!(currentUser > remoteUid)) return;
-          try {
-            await connectAsCallee(remoteUid, d.offer);
-          } catch(e) { console.warn("[GVC callee]", e.message); }
+          if (!remoteUid || remoteUid === currentUser || pcsRef.current[remoteUid]) return;
+          try { await connectAsCallee(remoteUid, d.offer); }
+          catch(e) { console.warn("[GVC callee err]", e.message); }
         });
       }, () => {});
       unsubsRef.current.push(unsub2);
@@ -8541,163 +8501,137 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
       active = false;
       clearInterval(hbRef.current);
       clearInterval(timerRef.current);
-      unsubsRef.current.forEach(u => { try { u(); } catch(e){} });
-      Object.values(pcsRef.current).forEach(pc => { try { pc.close(); } catch(e) {} });
+      unsubsRef.current.forEach(u => { try { u(); } catch(_) {} });
+      Object.values(pcsRef.current).forEach(pc => { try { pc.close(); } catch(_) {} });
       localStreamRef.current?.getTracks().forEach(t => t.stop());
       gvcLeave(roomId, currentUser);
     };
   }, []); // eslint-disable-line
 
-  const toggleMute = () => {
-    const nowMuted = !muted;
-    localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = !nowMuted; });
-    setMuted(nowMuted);
-  };
-  const toggleVideo = () => {
-    const nowOff = !videoOff;
-    localStreamRef.current?.getVideoTracks().forEach(t => { t.enabled = !nowOff; });
-    setVideoOff(nowOff);
-  };
-
-  const fmtDur = s => String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
-  const peerList  = Object.entries(peers);
-  const total     = peerList.length + 1;
-  const gridCols  = total <= 1 ? 1 : total <= 2 ? 2 : total <= 4 ? 2 : 3;
+  const toggleMute  = () => { const m = !muted;  localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = !m; }); setMuted(m); };
+  const toggleVideo = () => { const v = !videoOff; localStreamRef.current?.getVideoTracks().forEach(t => { t.enabled = !v; }); setVideoOff(v); };
+  const fmtDur = s => String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");
+  const peerList = Object.entries(peers);
+  const total    = peerList.length + 1;
+  const gridCols = total <= 1 ? 1 : total <= 2 ? 2 : total <= 4 ? 2 : 3;
 
   if (status === "error") return (
-    <div style={{ position:"fixed", inset:0, zIndex:9999, background:"#0d0d0d", display:"flex", alignItems:"center", justifyContent:"center" }}>
-      <div style={{ textAlign:"center", color:"white", padding:32 }}>
-        <div style={{ fontSize:48, marginBottom:16 }}>📵</div>
-        <div style={{ fontWeight:800, fontSize:18, marginBottom:8 }}>Could not start video call</div>
-        <div style={{ fontSize:13, color:"rgba(255,255,255,.55)", marginBottom:24 }}>{errMsg}</div>
-        <button onClick={onClose} style={{ padding:"10px 24px", borderRadius:12, background:"#ef4444", border:"none", color:"white", fontWeight:700, cursor:"pointer", fontSize:14 }}>Close</button>
+    <div style={{ position:"fixed",inset:0,zIndex:9999,background:"#0d0d0d",display:"flex",alignItems:"center",justifyContent:"center" }}>
+      <div style={{ textAlign:"center",color:"white",padding:32 }}>
+        <div style={{ fontSize:48,marginBottom:16 }}>📵</div>
+        <div style={{ fontWeight:800,fontSize:18,marginBottom:8 }}>Could not start video call</div>
+        <div style={{ fontSize:13,color:"rgba(255,255,255,.55)",marginBottom:24 }}>{errMsg}</div>
+        <button onClick={onClose} style={{ padding:"10px 24px",borderRadius:12,background:"#ef4444",border:"none",color:"white",fontWeight:700,cursor:"pointer",fontSize:14 }}>Close</button>
       </div>
     </div>
   );
 
   return (
-    <div style={{ position:"fixed", inset:0, zIndex:9999, background:"#0d0d0d", display:"flex", flexDirection:"column" }}>
-      {/* Top bar */}
-      <div style={{ padding:"12px 20px", background:"rgba(0,0,0,.65)", display:"flex", alignItems:"center", gap:12, flexShrink:0, backdropFilter:"blur(8px)", borderBottom:"1px solid rgba(255,255,255,.08)" }}>
+    <div style={{ position:"fixed",inset:0,zIndex:9999,background:"#0d0d0d",display:"flex",flexDirection:"column" }}>
+      <div style={{ padding:"12px 20px",background:"rgba(0,0,0,.65)",display:"flex",alignItems:"center",gap:12,flexShrink:0,backdropFilter:"blur(8px)",borderBottom:"1px solid rgba(255,255,255,.08)" }}>
         <div style={{ fontSize:20 }}>📹</div>
         <div style={{ flex:1 }}>
-          <div style={{ fontWeight:900, fontSize:15, color:"white" }}>{label}</div>
-          <div style={{ fontSize:11, color:"rgba(255,255,255,.5)", fontFamily:"'DM Mono',monospace" }}>
-            {status === "joining" ? "Joining…" : `${total} participant${total !== 1 ? "s" : ""} · ${fmtDur(duration)}`}
+          <div style={{ fontWeight:900,fontSize:15,color:"white" }}>{label}</div>
+          <div style={{ fontSize:11,color:"rgba(255,255,255,.5)",fontFamily:"'DM Mono',monospace" }}>
+            {status==="joining"?"Joining…":`${total} participant${total!==1?"s":""} · ${fmtDur(duration)}`}
           </div>
         </div>
-        <button onClick={onClose} style={{ background:"rgba(255,255,255,.1)", border:"1px solid rgba(255,255,255,.15)", borderRadius:10, padding:"7px 16px", color:"white", fontWeight:700, fontSize:13, cursor:"pointer" }}>Leave</button>
+        <button onClick={onClose} style={{ background:"rgba(255,255,255,.1)",border:"1px solid rgba(255,255,255,.15)",borderRadius:10,padding:"7px 16px",color:"white",fontWeight:700,fontSize:13,cursor:"pointer" }}>Leave</button>
       </div>
-
-      {/* Video grid */}
-      <div style={{ flex:1, display:"grid", gridTemplateColumns:`repeat(${gridCols}, 1fr)`, gap:4, padding:4, alignContent:"center", overflow:"hidden" }}>
-        {/* Self tile */}
-        <div style={{ position:"relative", background:"#1a1a1a", borderRadius:12, overflow:"hidden", aspectRatio:"16/9", display:"flex", alignItems:"center", justifyContent:"center" }}>
-          <video ref={localVideoRef} autoPlay playsInline muted style={{ width:"100%", height:"100%", objectFit:"cover", display: videoOff ? "none" : "block" }} />
-          {videoOff && <div style={{ fontSize:40, color:"rgba(255,255,255,.25)" }}>📷</div>}
-          <div style={{ position:"absolute", bottom:8, left:10, background:"rgba(0,0,0,.65)", borderRadius:8, padding:"3px 9px", fontSize:11, color:"white", fontWeight:700 }}>
-            You{muted ? " 🔇" : ""}
-          </div>
+      <div style={{ flex:1,display:"grid",gridTemplateColumns:`repeat(${gridCols},1fr)`,gap:4,padding:4,alignContent:"center",overflow:"hidden" }}>
+        <div style={{ position:"relative",background:"#1a1a1a",borderRadius:12,overflow:"hidden",aspectRatio:"16/9",display:"flex",alignItems:"center",justifyContent:"center" }}>
+          <video ref={localVideoRef} autoPlay playsInline muted style={{ width:"100%",height:"100%",objectFit:"cover",display:videoOff?"none":"block" }} />
+          {videoOff && <div style={{ fontSize:40,color:"rgba(255,255,255,.25)" }}>📷</div>}
+          <div style={{ position:"absolute",bottom:8,left:10,background:"rgba(0,0,0,.65)",borderRadius:8,padding:"3px 9px",fontSize:11,color:"white",fontWeight:700 }}>You{muted?" 🔇":""}</div>
         </div>
-        {/* Remote tiles */}
-        {peerList.map(([uid, { name, stream }]) => (
-          <RemoteVideoTile key={uid} name={name} stream={stream} avatarChar={avChar(uid)} />
-        ))}        {/* Waiting placeholder */}
-        {total === 1 && (
-          <div style={{ background:"#111", borderRadius:12, aspectRatio:"16/9", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:10 }}>
-            <div style={{ fontSize:36, color:"rgba(255,255,255,.12)" }}>👥</div>
-            <div style={{ fontSize:12, color:"rgba(255,255,255,.22)", fontWeight:700 }}>Waiting for others to join…</div>
+        {peerList.map(([uid,{name,stream}]) => <RemoteVideoTile key={uid} name={name} stream={stream} avatarChar={avChar(uid)} />)}
+        {total===1 && (
+          <div style={{ background:"#111",borderRadius:12,aspectRatio:"16/9",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10 }}>
+            <div style={{ fontSize:36,color:"rgba(255,255,255,.12)" }}>👥</div>
+            <div style={{ fontSize:12,color:"rgba(255,255,255,.22)",fontWeight:700 }}>Waiting for others to join…</div>
           </div>
         )}
       </div>
-
-      {/* Controls */}
-      <div style={{ padding:"16px 24px", background:"rgba(0,0,0,.65)", display:"flex", alignItems:"center", justifyContent:"center", gap:24, flexShrink:0, backdropFilter:"blur(8px)" }}>
+      <div style={{ padding:"16px 24px",background:"rgba(0,0,0,.65)",display:"flex",alignItems:"center",justifyContent:"center",gap:24,flexShrink:0,backdropFilter:"blur(8px)" }}>
         <div style={{ textAlign:"center" }}>
-          <button onClick={toggleMute} style={{ width:52, height:52, borderRadius:"50%", background: muted ? "#ef4444" : "rgba(255,255,255,.12)", border:"1.5px solid rgba(255,255,255,.15)", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 5px" }}>
-            {muted ? "🔇" : "🎙️"}
-          </button>
-          <div style={{ fontSize:10, color:"rgba(255,255,255,.4)", fontWeight:700 }}>{muted ? "Unmute" : "Mute"}</div>
+          <button onClick={toggleMute} style={{ width:52,height:52,borderRadius:"50%",background:muted?"#ef4444":"rgba(255,255,255,.12)",border:"1.5px solid rgba(255,255,255,.15)",cursor:"pointer",fontSize:22,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 5px" }}>{muted?"🔇":"🎙️"}</button>
+          <div style={{ fontSize:10,color:"rgba(255,255,255,.4)",fontWeight:700 }}>{muted?"Unmute":"Mute"}</div>
         </div>
         <div style={{ textAlign:"center" }}>
-          <button onClick={toggleVideo} style={{ width:52, height:52, borderRadius:"50%", background: videoOff ? "#ef4444" : "rgba(255,255,255,.12)", border:"1.5px solid rgba(255,255,255,.15)", cursor:"pointer", fontSize:22, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 5px" }}>
-            {videoOff ? "📷" : "📹"}
-          </button>
-          <div style={{ fontSize:10, color:"rgba(255,255,255,.4)", fontWeight:700 }}>{videoOff ? "Start Video" : "Stop Video"}</div>
+          <button onClick={toggleVideo} style={{ width:52,height:52,borderRadius:"50%",background:videoOff?"#ef4444":"rgba(255,255,255,.12)",border:"1.5px solid rgba(255,255,255,.15)",cursor:"pointer",fontSize:22,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 5px" }}>{videoOff?"📷":"📹"}</button>
+          <div style={{ fontSize:10,color:"rgba(255,255,255,.4)",fontWeight:700 }}>{videoOff?"Start Video":"Stop Video"}</div>
         </div>
         <div style={{ textAlign:"center" }}>
-          <button onClick={onClose} style={{ width:62, height:62, borderRadius:"50%", background:"#ef4444", border:"none", cursor:"pointer", fontSize:24, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 5px", boxShadow:"0 4px 16px rgba(239,68,68,.5)" }}>📵</button>
-          <div style={{ fontSize:10, color:"rgba(255,255,255,.4)", fontWeight:700 }}>End Call</div>
+          <button onClick={onClose} style={{ width:62,height:62,borderRadius:"50%",background:"#ef4444",border:"none",cursor:"pointer",fontSize:24,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 5px",boxShadow:"0 4px 16px rgba(239,68,68,.5)" }}>📵</button>
+          <div style={{ fontSize:10,color:"rgba(255,255,255,.4)",fontWeight:700 }}>End Call</div>
         </div>
       </div>
     </div>
   );
 }
 
-// Each remote tile gets its own stable video element with direct srcObject assignment.
-// No Web Audio chain — that was causing a black video (dest.stream has no video tracks).
+// Stable remote video tile — direct srcObject assignment avoids video freeze
 function RemoteVideoTile({ name, stream, avatarChar }) {
   const videoRef = useRef(null);
   useEffect(() => {
     const vid = videoRef.current;
     if (!vid || !stream) return;
-    if (vid.srcObject !== stream) {
-      vid.srcObject = stream;
-      vid.play().catch(() => {});
-    }
+    if (vid.srcObject !== stream) { vid.srcObject = stream; vid.play().catch(() => {}); }
   }, [stream]);
   return (
-    <div style={{ position:"relative", background:"#1a1a1a", borderRadius:12, overflow:"hidden", aspectRatio:"16/9", display:"flex", alignItems:"center", justifyContent:"center" }}>
+    <div style={{ position:"relative",background:"#1a1a1a",borderRadius:12,overflow:"hidden",aspectRatio:"16/9",display:"flex",alignItems:"center",justifyContent:"center" }}>
       {stream
-        ? <video ref={videoRef} autoPlay playsInline style={{ width:"100%", height:"100%", objectFit:"cover" }} />
-        : <div style={{ width:60, height:60, borderRadius:"50%", background:"linear-gradient(135deg,var(--accent),var(--accent2))", display:"flex", alignItems:"center", justifyContent:"center", fontSize:26, color:"white", fontWeight:800 }}>{avatarChar}</div>
+        ? <video ref={videoRef} autoPlay playsInline style={{ width:"100%",height:"100%",objectFit:"cover" }} />
+        : <div style={{ width:60,height:60,borderRadius:"50%",background:"linear-gradient(135deg,var(--accent),var(--accent2))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:26,color:"white",fontWeight:800 }}>{avatarChar}</div>
       }
-      <div style={{ position:"absolute", bottom:8, left:10, background:"rgba(0,0,0,.6)", borderRadius:8, padding:"3px 9px", fontSize:11, color:"white", fontWeight:700 }}>{name}</div>
+      <div style={{ position:"absolute",bottom:8,left:10,background:"rgba(0,0,0,.6)",borderRadius:8,padding:"3px 9px",fontSize:11,color:"white",fontWeight:700 }}>{name}</div>
     </div>
   );
 }
 
-// ── GroupVideoCallBtn — button that opens the in-app group call ────────
-function GroupVideoCallBtn({ roomId, label = "Video Call", currentUser, style = {} }) {
+// ── GroupVideoCallBtn ──────────────────────────────────────────────────────
+function GroupVideoCallBtn({ roomId, label="Video Call", currentUser, style={} }) {
   const [inCall, setInCall] = useState(false);
   return (
     <>
-      <button
-        onClick={() => setInCall(true)}
-        title={`Start group video call — ${label}`}
-        style={{
-          background: "linear-gradient(135deg,#1d4ed8,#3b82f6)",
-          border: "none", borderRadius: 10, padding: "6px 13px",
-          color: "white", fontSize: 12, fontWeight: 800,
-          cursor: "pointer", display: "flex", alignItems: "center", gap: 5,
-          boxShadow: "0 2px 8px rgba(59,130,246,.35)", flexShrink: 0,
-          ...style,
-        }}
-      >📹 Video Call</button>
-      {inCall && (
-        <GroupVideoCallModal
-          roomId={roomId}
-          label={label}
-          currentUser={currentUser}
-          onClose={() => setInCall(false)}
-        />
-      )}
+      <button onClick={() => setInCall(true)} title={`Start group video call — ${label}`}
+        style={{ background:"linear-gradient(135deg,#1d4ed8,#3b82f6)",border:"none",borderRadius:10,padding:"6px 13px",color:"white",fontSize:12,fontWeight:800,cursor:"pointer",display:"flex",alignItems:"center",gap:5,boxShadow:"0 2px 8px rgba(59,130,246,.35)",flexShrink:0,...style }}>
+        📹 Video Call
+      </button>
+      {inCall && <GroupVideoCallModal roomId={roomId} label={label} currentUser={currentUser} onClose={() => setInCall(false)} />}
     </>
   );
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// DmCallModal — 1-on-1 voice/video call over WebRTC + Firebase signalling
-// Uses the same group-call infrastructure (gvcWriteOffer, gvcWriteAnswer,
-// gvcAddIce) but with a dedicated dm_calls/{convId} room.
+// DmCallModal — 1-on-1 voice/video call via WebRTC + Firestore signalling
+//
+// Signalling room: group_calls/dm__{safeA}__{safeB}   (reuses gvc infra)
+//   A = alphabetically-smaller of (fromUser, toUser)  → caller
+//   B = alphabetically-larger                          → callee
+//
+// The component is mounted on BOTH sides when a call is active:
+//   • Caller mounts it when they click the call button
+//   • Callee mounts it when they tap Answer on the IncomingCallBanner
+//
+// Both sides determine their role from their own username, not from props.
 // ════════════════════════════════════════════════════════════════════════
-function DmCallModal({ callType, convId, fromUser, toUser, toName, toAvatar, onClose }) {
+function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, onClose }) {
   const videoOnly = callType === "video";
-  const [muted,    setMuted]    = useState(false);
-  const [videoOff, setVideoOff] = useState(!videoOnly);
-  const [status,   setStatus]   = useState("connecting"); // connecting | ringing | live | ended | error
-  const [duration, setDuration] = useState(0);
-  const [errMsg,   setErrMsg]   = useState("");
+
+  // Determine role purely from usernames — caller is alphabetically smaller
+  const iAmCaller = fromUser < toUser;
+  const myUid     = fromUser;   // "fromUser" prop = the local user (self)
+  const remoteUid = toUser;
+
+  // Signalling room reuses group_calls infra but with a private room id
+  const roomId = "dm__" + _gvcPairId(myUid, remoteUid);
+
+  const [muted,        setMuted]        = useState(false);
+  const [videoOff,     setVideoOff]     = useState(!videoOnly);
+  const [status,       setStatus]       = useState("connecting");
+  const [duration,     setDuration]     = useState(0);
+  const [errMsg,       setErrMsg]       = useState("");
   const [remoteStream, setRemoteStream] = useState(null);
 
   const localStreamRef = useRef(null);
@@ -8706,220 +8640,208 @@ function DmCallModal({ callType, convId, fromUser, toUser, toName, toAvatar, onC
   const pcRef          = useRef(null);
   const unsubsRef      = useRef([]);
   const timerRef       = useRef(null);
-  const pendingIceRef  = useRef([]);
-  const appliedIceRef  = useRef({ caller: 0, callee: 0 });
-  const roomId = "dm_calls_" + convId;
+  const appliedRef     = useRef({ caller: 0, callee: 0 });
+  const pendingRef     = useRef([]);
+  const answeredRef    = useRef(false); // callee: prevent double-answer
 
-  // Assign remote stream to video element
+  // Attach remote stream to video element
   useEffect(() => {
     const vid = remoteVideoRef.current;
     if (!vid || !remoteStream) return;
-    if (vid.srcObject !== remoteStream) { vid.srcObject = remoteStream; vid.play().catch(()=>{}); }
+    if (vid.srcObject !== remoteStream) { vid.srcObject = remoteStream; vid.play().catch(() => {}); }
   }, [remoteStream]);
 
-  // Assign local stream to local video
+  // Attach local stream to self-preview
   useEffect(() => {
     const vid = localVideoRef.current;
     if (!vid || !localStreamRef.current) return;
-    if (vid.srcObject !== localStreamRef.current) { vid.srcObject = localStreamRef.current; vid.play().catch(()=>{}); }
+    if (vid.srcObject !== localStreamRef.current) { vid.srcObject = localStreamRef.current; vid.play().catch(() => {}); }
   });
 
-  const applyRemoteIce = async (candidates, role) => {
+  // Queue-aware ICE application
+  const applyIce = async (candidates, role) => {
     const pc = pcRef.current;
     if (!pc || pc.signalingState === "closed") return;
-    const key = role;
-    const from = appliedIceRef.current[key] || 0;
-    const fresh = (candidates||[]).slice(from);
+    const key   = role; // "caller" | "callee"
+    const start = appliedRef.current[key] || 0;
+    const fresh = (candidates || []).slice(start);
     if (!fresh.length) return;
-    appliedIceRef.current[key] = from + fresh.length;
-    if (!pc.remoteDescription) {
-      pendingIceRef.current.push(...fresh); return;
-    }
-    for (const c of fresh) { try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_){} }
+    appliedRef.current[key] = start + fresh.length;
+    if (!pc.remoteDescription) { pendingRef.current.push(...fresh); return; }
+    for (const c of fresh) { try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_) {} }
   };
 
-  const flushPending = async () => {
+  const flushIce = async () => {
     const pc = pcRef.current;
     if (!pc || !pc.remoteDescription) return;
-    const all = [...pendingIceRef.current];
-    pendingIceRef.current = [];
-    for (const c of all) { try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_){} }
+    const all = [...pendingRef.current];
+    pendingRef.current = [];
+    for (const c of all) { try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_) {} }
+  };
+
+  const startTimer = () => {
+    clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
   };
 
   useEffect(() => {
     let active = true;
-    const isCaller = fromUser < toUser; // alphabetically smaller = caller
-
-    // ── Notify recipient of incoming call (caller side only) ──────────
-    if (isCaller) {
-      writeCallSignal(fromUser, toUser, callType, toName, toAvatar, convId);
-      // Also fire a local showNotif for the recipient if they're on the same device (rare, but safe)
-      pushUserNotif(toUser, {
-        id: "call_" + Date.now(),
-        type: "call",
-        title: (callType === "video" ? "📹" : "📞") + " Incoming " + (callType === "video" ? "video" : "voice") + " call",
-        body: "from " + toName,
-        from: fromUser,
-        callType,
-        convId,
-        ts: Date.now(),
-        read: false,
-      });
-      // Browser notification for background/out-of-tab
-      showNotif(
-        (callType === "video" ? "📹" : "📞") + " Incoming call from " + toName,
-        { body: "Tap to answer", tag: "call_" + convId, requireInteraction: true, vibrate: [300,100,300,100,300], data: { type: "call", payload: { fromUser, toUser, callType, convId } } }
-      );
-    }
 
     (async () => {
+      // 1. Acquire media
+      let stream;
       try {
-        // 1. Get media
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video: videoOnly,
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true },
+          video: videoOnly ? { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" } : false,
         });
-        if (!active) { stream.getTracks().forEach(t=>t.stop()); return; }
-        localStreamRef.current = stream;
+      } catch(e) {
+        if (active) { setErrMsg(e.message || "Camera/mic denied"); setStatus("error"); }
+        return;
+      }
+      if (!active) { stream.getTracks().forEach(t => t.stop()); return; }
+      localStreamRef.current = stream;
+      stream.getVideoTracks().forEach(t => { t.enabled = videoOnly; });
 
-        // Apply initial mute/video state
-        stream.getAudioTracks().forEach(t => { t.enabled = true; });
-        stream.getVideoTracks().forEach(t => { t.enabled = videoOnly; });
+      // 2. Build RTCPeerConnection
+      const pc = new RTCPeerConnection(GVC_ICE);
+      pcRef.current = pc;
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
-        // Trigger re-render to attach local stream
-        setStatus(s => s);
-
-        // 2. Build peer connection
-        const pc = new RTCPeerConnection(GVC_ICE);
-        pcRef.current = pc;
-
-        stream.getTracks().forEach(t => pc.addTrack(t, stream));
-
-        const rs = new MediaStream();
-        pc.ontrack = (e) => {
-          if (e.streams && e.streams[0]) {
-            setRemoteStream(e.streams[0]);
-          } else {
-            e.track.onunmute = () => { rs.addTrack(e.track); setRemoteStream(new MediaStream(rs.getTracks())); };
-            if (e.track.readyState === "live") { rs.addTrack(e.track); setRemoteStream(new MediaStream(rs.getTracks())); }
-          }
-          if (active) { setStatus("live"); clearInterval(timerRef.current); timerRef.current = setInterval(()=>setDuration(d=>d+1),1000); }
-        };
-
-        pc.onconnectionstatechange = () => {
-          if (["disconnected","failed","closed"].includes(pc.connectionState) && active) {
-            setStatus("ended");
-          }
-        };
-
-        // 3. Signalling
-        if (isCaller) {
-          pc.onicecandidate = async (e) => {
-            if (e.candidate) await gvcAddIce(roomId, fromUser, toUser, e.candidate.toJSON(), "caller");
-          };
-          const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
-          await pc.setLocalDescription(offer);
-          await gvcWriteOffer(roomId, fromUser, toUser, { type: offer.type, sdp: offer.sdp });
-          setStatus("ringing");
-
-          const unsub = _gvcSigDoc(roomId, fromUser, toUser).onSnapshot(async snap => {
-            if (!snap.exists || !active) return;
-            const d = snap.data();
-            if (d.answer && !pc.remoteDescription && pc.signalingState === "have-local-offer") {
-              try {
-                await pc.setRemoteDescription(new RTCSessionDescription(d.answer));
-                await flushPending();
-                await applyRemoteIce(d.calleeIce, "callee");
-                if (active) { setStatus("live"); clearInterval(timerRef.current); timerRef.current = setInterval(()=>setDuration(d=>d+1),1000); }
-              } catch(e) { console.warn("[DmCall caller SRD]", e.message); }
-            } else if (pc.remoteDescription) {
-              await applyRemoteIce(d.calleeIce, "callee");
-            }
-          }, ()=>{});
-          unsubsRef.current.push(unsub);
-
+      // Remote track handler — accumulate tracks into one stable MediaStream
+      const rs = new MediaStream();
+      pc.ontrack = (ev) => {
+        if (!active) return;
+        if (ev.streams?.[0]) {
+          setRemoteStream(ev.streams[0]);
         } else {
-          // Callee: watch for offer
-          setStatus("ringing");
-          const checkOffer = async () => {
-            const snap = await _gvcSigDoc(roomId, toUser, fromUser).get().catch(()=>null);
-            if (!snap?.exists || !active) return;
-            const d = snap.data();
-            if (!d.offer) return;
-            pc.onicecandidate = async (e) => {
-              if (e.candidate) await gvcAddIce(roomId, toUser, fromUser, e.candidate.toJSON(), "callee");
-            };
+          rs.addTrack(ev.track);
+          ev.track.onunmute = () => setRemoteStream(new MediaStream(rs.getTracks()));
+          if (ev.track.readyState === "live") setRemoteStream(new MediaStream(rs.getTracks()));
+        }
+        if (active && status !== "live") {
+          setStatus("live");
+          startTimer();
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (!active) return;
+        if (pc.connectionState === "connected") { setStatus("live"); startTimer(); }
+        if (["disconnected","failed","closed"].includes(pc.connectionState)) setStatus("ended");
+      };
+
+      // 3. Signalling — role determined by alphabetical order of usernames
+      if (iAmCaller) {
+        // ── CALLER PATH ──────────────────────────────────────────────
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate) gvcAddIce(roomId, myUid, remoteUid, ev.candidate.toJSON(), "caller");
+        };
+
+        const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+        await pc.setLocalDescription(offer);
+        await gvcWriteOffer(roomId, myUid, remoteUid, { type: offer.type, sdp: offer.sdp });
+        if (active) setStatus("ringing");
+
+        // Notify the callee via Firestore call signal + push notification
+        writeCallSignal(myUid, remoteUid, callType, toName, toAvatar, roomId);
+        pushUserNotif(remoteUid, {
+          id: "call_" + Date.now(), type: "call",
+          title: (callType==="video"?"📹":"📞") + " Incoming " + (callType==="video"?"video":"voice") + " call",
+          body: "from " + toName, from: myUid, callType, ts: Date.now(), read: false,
+        });
+        showNotif(
+          (callType==="video"?"📹":"📞") + " Incoming call from " + toName,
+          { body:"Tap to answer", tag:"call_"+roomId, requireInteraction:true, vibrate:[300,100,300,100,300],
+            data:{ type:"call", payload:{ fromUser:myUid, toUser:remoteUid, callType } } }
+        );
+
+        // Watch for answer + callee ICE
+        const unsub = _gvcSigDoc(roomId, myUid, remoteUid).onSnapshot(async snap => {
+          if (!snap.exists || !active) return;
+          const d = snap.data();
+          if (d.answer && !pc.remoteDescription && pc.signalingState === "have-local-offer") {
+            try {
+              await pc.setRemoteDescription(new RTCSessionDescription(d.answer));
+              await flushIce();
+              await applyIce(d.calleeIce, "callee");
+              if (active) { setStatus("live"); startTimer(); }
+            } catch(e) { console.warn("[DmCall caller SRD]", e.message); }
+          } else if (pc.remoteDescription) {
+            await applyIce(d.calleeIce, "callee");
+          }
+        }, () => {});
+        unsubsRef.current.push(unsub);
+
+      } else {
+        // ── CALLEE PATH ───────────────────────────────────────────────
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate) gvcAddIce(roomId, myUid, remoteUid, ev.candidate.toJSON(), "callee");
+        };
+
+        if (active) setStatus("connecting");
+
+        // Fetch the offer written by the caller (pairId: callerUid_calleeUid)
+        const doAnswer = async () => {
+          if (!active || answeredRef.current) return;
+          const snap = await _gvcSigDoc(roomId, remoteUid, myUid).get().catch(() => null);
+          if (!snap?.exists) return;
+          const d = snap.data();
+          if (!d.offer || answeredRef.current) return;
+          answeredRef.current = true;
+
+          try {
             await pc.setRemoteDescription(new RTCSessionDescription(d.offer));
-            await flushPending();
+            await flushIce();
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
-            await gvcWriteAnswer(roomId, toUser, fromUser, { type: answer.type, sdp: answer.sdp });
-            await applyRemoteIce(d.callerIce, "caller");
-            const unsub = _gvcSigDoc(roomId, toUser, fromUser).onSnapshot(async snap2 => {
-              if (!snap2.exists || !active) return;
-              await applyRemoteIce(snap2.data().callerIce, "caller");
-            }, ()=>{});
-            unsubsRef.current.push(unsub);
-            if (active) { setStatus("live"); clearInterval(timerRef.current); timerRef.current = setInterval(()=>setDuration(d=>d+1),1000); }
-          };
-          // Poll for offer with short retries
-          let tries = 0;
-          const poll = setInterval(async () => {
-            if (!active || tries++ > 30) { clearInterval(poll); return; }
-            const snap = await _gvcSigDoc(roomId, toUser, fromUser).get().catch(()=>null);
-            if (snap?.exists && snap.data().offer && pcRef.current?.signalingState === "stable") {
-              clearInterval(poll);
-              await checkOffer();
-            }
-          }, 800);
-          unsubsRef.current.push(() => clearInterval(poll));
+            await gvcWriteAnswer(roomId, remoteUid, myUid, { type: answer.type, sdp: answer.sdp });
+            await applyIce(d.callerIce, "caller");
+            if (active) { setStatus("live"); startTimer(); }
 
-          // Also listen for new signals
-          const unsub2 = _gvcSigDoc(roomId, toUser, fromUser).onSnapshot(async snap => {
-            if (!snap.exists || !active) return;
-            if (snap.data().offer && pcRef.current?.signalingState === "stable") {
-              await checkOffer();
-            }
-          }, ()=>{});
-          unsubsRef.current.push(unsub2);
-        }
-      } catch(e) {
-        if (active) { setErrMsg(e.message || "Could not access camera/microphone"); setStatus("error"); }
+            // Watch for further caller ICE
+            const unsub = _gvcSigDoc(roomId, remoteUid, myUid).onSnapshot(async snap2 => {
+              if (!snap2.exists || !active) return;
+              await applyIce(snap2.data().callerIce, "caller");
+            }, () => {});
+            unsubsRef.current.push(unsub);
+          } catch(e) { console.warn("[DmCall callee SRD]", e.message); }
+        };
+
+        // Try immediately, then watch for the offer to arrive
+        await doAnswer();
+        const unsub = _gvcSigDoc(roomId, remoteUid, myUid).onSnapshot(async snap => {
+          if (!snap.exists || !active || answeredRef.current) return;
+          if (snap.data().offer) await doAnswer();
+        }, () => {});
+        unsubsRef.current.push(unsub);
       }
     })();
 
     return () => {
       active = false;
       clearInterval(timerRef.current);
-      unsubsRef.current.forEach(u => { try { typeof u === "function" && u(); } catch(_){} });
-      pcRef.current && (() => { try { pcRef.current.close(); } catch(_){} })();
+      unsubsRef.current.forEach(u => { try { u(); } catch(_) {} });
+      try { pcRef.current?.close(); } catch(_) {}
       localStreamRef.current?.getTracks().forEach(t => t.stop());
-      // Clear call signal so recipient stops ringing
+      // Clean up signal docs + call signals
       clearCallSignal(toUser);
       clearCallSignal(fromUser);
-      // Clean up signal docs
       _loadFirebase().then(ok => {
         if (!ok) return;
-        try { _gvcSigDoc(roomId, fromUser, toUser).delete().catch(()=>{}); } catch(_){}
-        try { _gvcSigDoc(roomId, toUser, fromUser).delete().catch(()=>{}); } catch(_){}
+        try { _gvcSigDoc(roomId, myUid, remoteUid).delete().catch(() => {}); } catch(_) {}
+        try { _gvcSigDoc(roomId, remoteUid, myUid).delete().catch(() => {}); } catch(_) {}
       });
     };
   }, []); // eslint-disable-line
 
-  const toggleMute = () => {
-    const now = !muted;
-    localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = !now; });
-    setMuted(now);
-  };
-  const toggleVideo = () => {
-    const now = !videoOff;
-    localStreamRef.current?.getVideoTracks().forEach(t => { t.enabled = !now; });
-    setVideoOff(now);
-  };
-  const fmtDur = s => String(Math.floor(s/60)).padStart(2,"0") + ":" + String(s%60).padStart(2,"0");
+  const toggleMute  = () => { const m = !muted;  localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = !m;  }); setMuted(m);  };
+  const toggleVideo = () => { const v = !videoOff; localStreamRef.current?.getVideoTracks().forEach(t => { t.enabled = !v; }); setVideoOff(v); };
+  const fmtDur = s => String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");
+  const isVoiceOnly = !videoOnly || videoOff;
 
   if (status === "error") return (
-    <div style={{ position:"fixed",inset:0,zIndex:9999,background:"rgba(0,0,0,.92)",display:"flex",alignItems:"center",justifyContent:"center" }}>
+    <div style={{ position:"fixed",inset:0,zIndex:9999,background:"rgba(0,0,0,.93)",display:"flex",alignItems:"center",justifyContent:"center" }}>
       <div style={{ textAlign:"center",color:"white",padding:32,maxWidth:320 }}>
         <div style={{ fontSize:52,marginBottom:16 }}>📵</div>
         <div style={{ fontWeight:800,fontSize:18,marginBottom:8 }}>Call failed</div>
@@ -8929,47 +8851,40 @@ function DmCallModal({ callType, convId, fromUser, toUser, toName, toAvatar, onC
     </div>
   );
 
-  const isVoiceOnly = !videoOnly || videoOff;
-
   return (
     <div style={{ position:"fixed",inset:0,zIndex:9999,background:"#0d0d0d",display:"flex",flexDirection:"column" }}>
       {/* Top bar */}
       <div style={{ padding:"14px 20px",background:"rgba(0,0,0,.7)",display:"flex",alignItems:"center",gap:14,flexShrink:0,backdropFilter:"blur(10px)",borderBottom:"1px solid rgba(255,255,255,.08)" }}>
-        <div style={{ fontSize:22 }}>{videoOnly ? "📹" : "📞"}</div>
+        <div style={{ fontSize:22 }}>{videoOnly?"📹":"📞"}</div>
         <div style={{ flex:1 }}>
           <div style={{ fontWeight:900,fontSize:15,color:"white" }}>{toName}</div>
           <div style={{ fontSize:11,color:"rgba(255,255,255,.5)",fontFamily:"'DM Mono',monospace" }}>
-            {status==="connecting"?"Connecting…":status==="ringing"?"Ringing…":status==="live"?`${fmtDur(duration)}`:status==="ended"?"Call ended":""}
+            {status==="connecting"?"Connecting…":status==="ringing"?"Ringing…":status==="live"?fmtDur(duration):status==="ended"?"Call ended":""}
           </div>
         </div>
       </div>
 
-      {/* Main area */}
+      {/* Main content */}
       <div style={{ flex:1,position:"relative",display:"flex",alignItems:"center",justifyContent:"center",overflow:"hidden" }}>
-        {/* Remote */}
-        {remoteStream && !isVoiceOnly ? (
-          <video ref={remoteVideoRef} autoPlay playsInline style={{ width:"100%",height:"100%",objectFit:"cover" }} />
-        ) : (
-          <div style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:20 }}>
-            {/* Avatar */}
-            <div style={{ width:100,height:100,borderRadius:"50%",background:"linear-gradient(135deg,var(--accent,#0ea5e9),var(--accent2,#6366f1))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:44,fontWeight:900,color:"white",boxShadow:"0 0 0 6px rgba(255,255,255,.08),0 0 40px rgba(14,165,233,.25)" }}>
-              {toAvatar}
-            </div>
-            <div style={{ fontWeight:800,fontSize:20,color:"white" }}>{toName}</div>
-            {/* Animated signal rings while ringing/connecting */}
-            {(status==="ringing"||status==="connecting") && (
-              <div style={{ position:"relative",width:120,height:40,display:"flex",alignItems:"center",justifyContent:"center",gap:8 }}>
-                {[0,1,2].map(i=>(
-                  <div key={i} style={{ width:10,height:10,borderRadius:"50%",background:"rgba(255,255,255,.5)",animation:`dmCallPulse 1.2s ${i*0.2}s ease-in-out infinite` }} />
-                ))}
+        {remoteStream && !isVoiceOnly
+          ? <video ref={remoteVideoRef} autoPlay playsInline style={{ width:"100%",height:"100%",objectFit:"cover" }} />
+          : (
+            <div style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:20 }}>
+              <div style={{ width:100,height:100,borderRadius:"50%",background:"linear-gradient(135deg,var(--accent,#0077b6),var(--accent2,#6366f1))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:44,fontWeight:900,color:"white",boxShadow:"0 0 0 6px rgba(255,255,255,.08),0 0 40px rgba(14,165,233,.25)" }}>
+                {toAvatar}
               </div>
-            )}
-            {status==="live" && <div style={{ fontSize:13,color:"rgba(255,255,255,.55)",fontFamily:"'DM Mono',monospace" }}>{fmtDur(duration)}</div>}
-            {status==="ended" && <div style={{ fontSize:14,color:"rgba(255,255,255,.45)",marginTop:8 }}>Call ended</div>}
-          </div>
-        )}
-
-        {/* Self preview (video call) */}
+              <div style={{ fontWeight:800,fontSize:20,color:"white" }}>{toName}</div>
+              {(status==="ringing"||status==="connecting") && (
+                <div style={{ display:"flex",gap:8 }}>
+                  {[0,1,2].map(i=><div key={i} style={{ width:10,height:10,borderRadius:"50%",background:"rgba(255,255,255,.5)",animation:`dmCallPulse 1.2s ${i*0.2}s ease-in-out infinite` }} />)}
+                </div>
+              )}
+              {status==="live"     && <div style={{ fontSize:13,color:"rgba(255,255,255,.55)",fontFamily:"'DM Mono',monospace" }}>{fmtDur(duration)}</div>}
+              {status==="ended"    && <div style={{ fontSize:14,color:"rgba(255,255,255,.45)" }}>Call ended</div>}
+            </div>
+          )
+        }
+        {/* Self-preview PiP for video calls */}
         {videoOnly && !videoOff && (
           <div style={{ position:"absolute",bottom:90,right:16,width:110,height:78,borderRadius:12,overflow:"hidden",border:"2px solid rgba(255,255,255,.2)",background:"#111",boxShadow:"0 4px 20px rgba(0,0,0,.5)" }}>
             <video ref={localVideoRef} autoPlay playsInline muted style={{ width:"100%",height:"100%",objectFit:"cover" }} />
@@ -8980,34 +8895,22 @@ function DmCallModal({ callType, convId, fromUser, toUser, toName, toAvatar, onC
       {/* Controls */}
       <div style={{ padding:"20px 24px 28px",background:"rgba(0,0,0,.7)",display:"flex",alignItems:"center",justifyContent:"center",gap:28,flexShrink:0,backdropFilter:"blur(10px)" }}>
         <div style={{ textAlign:"center" }}>
-          <button onClick={toggleMute} style={{ width:56,height:56,borderRadius:"50%",background:muted?"#ef4444":"rgba(255,255,255,.14)",border:"1.5px solid rgba(255,255,255,.18)",cursor:"pointer",fontSize:24,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 6px" }}>
-            {muted?"🔇":"🎙️"}
-          </button>
+          <button onClick={toggleMute} style={{ width:56,height:56,borderRadius:"50%",background:muted?"#ef4444":"rgba(255,255,255,.14)",border:"1.5px solid rgba(255,255,255,.18)",cursor:"pointer",fontSize:24,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 6px" }}>{muted?"🔇":"🎙️"}</button>
           <div style={{ fontSize:10,color:"rgba(255,255,255,.4)",fontWeight:700 }}>{muted?"Unmute":"Mute"}</div>
         </div>
         {videoOnly && (
           <div style={{ textAlign:"center" }}>
-            <button onClick={toggleVideo} style={{ width:56,height:56,borderRadius:"50%",background:videoOff?"#ef4444":"rgba(255,255,255,.14)",border:"1.5px solid rgba(255,255,255,.18)",cursor:"pointer",fontSize:24,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 6px" }}>
-              {videoOff?"📷":"📹"}
-            </button>
+            <button onClick={toggleVideo} style={{ width:56,height:56,borderRadius:"50%",background:videoOff?"#ef4444":"rgba(255,255,255,.14)",border:"1.5px solid rgba(255,255,255,.18)",cursor:"pointer",fontSize:24,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 6px" }}>{videoOff?"📷":"📹"}</button>
             <div style={{ fontSize:10,color:"rgba(255,255,255,.4)",fontWeight:700 }}>{videoOff?"Camera On":"Camera Off"}</div>
           </div>
         )}
         <div style={{ textAlign:"center" }}>
-          <button onClick={onClose} style={{ width:66,height:66,borderRadius:"50%",background:"#ef4444",border:"none",cursor:"pointer",fontSize:26,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 6px",boxShadow:"0 4px 18px rgba(239,68,68,.55)" }}>
-            📵
-          </button>
+          <button onClick={onClose} style={{ width:66,height:66,borderRadius:"50%",background:"#ef4444",border:"none",cursor:"pointer",fontSize:26,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 6px",boxShadow:"0 4px 18px rgba(239,68,68,.55)" }}>📵</button>
           <div style={{ fontSize:10,color:"rgba(255,255,255,.4)",fontWeight:700 }}>End Call</div>
         </div>
       </div>
 
-      {/* Keyframe animation */}
-      <style>{`
-        @keyframes dmCallPulse {
-          0%,100% { opacity:.25; transform:scale(.85); }
-          50% { opacity:1; transform:scale(1.2); }
-        }
-      `}</style>
+      <style>{`@keyframes dmCallPulse{0%,100%{opacity:.25;transform:scale(.85);}50%{opacity:1;transform:scale(1.2);}}`}</style>
     </div>
   );
 }
@@ -12170,7 +12073,6 @@ function Messages({ user, toast, onUnreadChange }) {
           {dmCall && (
             <DmCallModal
               callType={dmCall.type}
-              convId={_convId(user, dmCall.toUser)}
               fromUser={user}
               toUser={dmCall.toUser}
               toName={dmCall.toName}
@@ -19171,7 +19073,6 @@ self.addEventListener('notificationclick', e => {
       {activeCall && (
         <DmCallModal
           callType={activeCall.type}
-          convId={activeCall.convId || _convId(currentUser, activeCall.toUser)}
           fromUser={currentUser}
           toUser={activeCall.toUser}
           toName={activeCall.toName}
