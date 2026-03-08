@@ -18179,9 +18179,7 @@ self.addEventListener('notificationclick', e => {
   );
 });
       `;
-      const swBlob=new Blob([swCode],{type:"application/javascript"});
-      const swUrl=URL.createObjectURL(swBlob);
-      navigator.serviceWorker.register(swUrl).then(reg=>{
+      navigator.serviceWorker.register('/firebase-messaging-sw.js').then(reg=>{
         window._swReg = reg;
         // Listen for SW messages (e.g. user clicked notification → open Messages)
         navigator.serviceWorker.addEventListener('message', ev => {
