@@ -8843,11 +8843,15 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
           body: "from " + myName, from: myUid, callType, ts: Date.now(), read: false,
         });
 
-        // Watch for answer + callee's ICE (stored in remoteIceField)
-        // Watch for answer + callee's ICE (stored in remoteIceField)
         const unsub = _gvcSigDoc(roomId, myUid, remoteUid).onSnapshot(async snap => {
           if (!snap.exists || !active) return;
           const d = snap.data();
+          // Callee declined — stop ringing
+          if (d.declined && !liveRef.current) {
+            setStatus("ended");
+            setTimeout(() => { if (active) onClose(); }, 1500);
+            return;
+          }
           if (d.answer && !pc.remoteDescription && pc.signalingState === "have-local-offer") {
             try {
               await pc.setRemoteDescription(new RTCSessionDescription(d.answer));
@@ -8859,22 +8863,6 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
           }
         }, () => {});
         unsubsRef.current.push(unsub);
-
-        // Watch the CALLER's own call_signal doc so we detect when the
-        // callee ends/declines before the call is live
-        const unsubCallerSignal = subscribeCallSignal(myUid, (signal) => {
-          if (!active) return;
-          if (
-            signal.status === "ended" &&
-            signal.roomId === roomId &&
-            !liveRef.current
-          ) {
-            setStatus("ended");
-            setTimeout(() => { if (active) onClose(); }, 1500);
-          }
-        });
-        unsubsRef.current.push(unsubCallerSignal);
-
       } else {
         // ── CALLEE PATH ───────────────────────────────────────────────
         pc.onicecandidate = (ev) => {
@@ -12298,7 +12286,7 @@ function Messages({ user, toast, onUnreadChange }) {
   );
 }
 
-function Notifications({ currentUser, onRead }) {
+function Notifications({ currentUser, onRead, onNavigate }) {
   const [notifs, setNotifs] = useState(()=>ls("nv-notifications",[]));
   const [pushNotifs] = useSharedData("nv-push-notifs", []);
 
@@ -12311,6 +12299,14 @@ function Notifications({ currentUser, onRead }) {
 
   const del = (id) => { const u=notifs.filter(n=>n.id!==id); setNotifs(u); saveMyData("notifications","nv-notifications",u); };
   const clearAll = () => { setNotifs([]); saveMyData("notifications","nv-notifications",[]); };
+
+  const handleClick = (n) => {
+    if (!onNavigate) return;
+    if (n.type === "dm")              onNavigate("messages");
+    else if (n.type === "group_chat") onNavigate("messages");
+    else if (n.type === "handout")    onNavigate("handouts");
+    else if (n.type === "assignment") onNavigate("assignments");
+  };
 
   const typeIcon = (type) => { if(type==="handout")return"📄"; if(type==="announcement")return"📢"; if(type==="urgent")return"🚨"; if(type==="warning")return"⚠️"; if(type==="success")return"✅"; return"🔔"; };
   const typeColor = (type) => { if(type==="handout")return"var(--accent)"; if(type==="announcement"||type==="warning")return"var(--warn)"; if(type==="urgent")return"#ef4444"; if(type==="success")return"#22c55e"; return"var(--text3)"; };
@@ -12348,7 +12344,7 @@ function Notifications({ currentUser, onRead }) {
       ) : (
         <div>
           {notifs.map((n,i)=>(
-            <div key={n.id} className="card" style={{marginBottom:10,borderLeft:`3px solid ${typeColor(n.type)}`,animation:`fadeUp .3s ease ${i*.04}s both`,opacity:n.read ? 0.85 : 1}}>
+            <div key={n.id} className="card" onClick={()=>handleClick(n)} style={{cursor:"pointer",marginBottom:10,borderLeft:`3px solid ${typeColor(n.type)}`,animation:`fadeUp .3s ease ${i*.04}s both`,opacity:n.read ? 0.85 : 1}}>
               <div style={{display:"flex",gap:12,alignItems:"flex-start"}}>
                 <div style={{fontSize:22,flexShrink:0,marginTop:2}}>{typeIcon(n.type)}</div>
                 <div style={{flex:1}}>
@@ -12356,7 +12352,7 @@ function Notifications({ currentUser, onRead }) {
                   <div style={{fontSize:13,color:"var(--text2)",marginBottom:6}}>{n.body}</div>
                   <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>{n.date} · {n.time}</div>
                 </div>
-                <button className="btn btn-sm" style={{flexShrink:0}} onClick={()=>del(n.id)}>✕</button>
+                <button className="btn btn-sm" style={{flexShrink:0}} onClick={(e)=>{e.stopPropagation();del(n.id);}}>✕</button>
               </div>
             </div>
           ))}
@@ -12365,7 +12361,6 @@ function Notifications({ currentUser, onRead }) {
     </div>
   );
 }
-
 
 // ════════════════════════════════════════════════════════════════════
 // ─── CBT EXAM SYSTEM ─────────────────────────────────────────────────
@@ -17517,7 +17512,7 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
       case "messages":     return <Messages user={currentUser} toast={toast} onUnreadChange={setUnreadDM} />;
       case "research-club": return <ResearchClub currentUser={currentUser} toast={toast} isLecturer={true} isAdmin={false} />;
       case "study-groups": return <StudyGroups currentUser={currentUser} toast={toast} />;
-      case "notifications":return <Notifications currentUser={currentUser} onRead={()=>setUnreadNotifs(0)} />;
+      case "notifications":return <Notifications currentUser={currentUser} onRead={()=>setUnreadNotifs(0)} onNavigate={navigate} />;
       case "announcements":return <LecturerAnnouncements toast={toast} currentUser={currentUser} />;
       case "students":     return <LecturerStudents currentUser={currentUser} toast={toast} classes={myClasses} />;
       case "grades":       return <LecturerGradebook currentUser={currentUser} toast={toast} />;
@@ -18723,7 +18718,7 @@ self.addEventListener('notificationclick', e => {
       case "messages": return <Messages user={currentUser} toast={toast} onUnreadChange={setUnreadDM} />;
       case "research-club": return <ResearchClub currentUser={currentUser} toast={toast} isLecturer={isLecturer} isAdmin={isAdmin} />;
       case "research-request": return <ResearchRequestPage currentUser={currentUser} toast={toast} />;
-      case "notifications": return <Notifications currentUser={currentUser} onRead={()=>setUnreadNotifs(0)} />;
+      case "notifications": return <Notifications currentUser={currentUser} onRead={()=>setUnreadNotifs(0)} onNavigate={navigate} />;
       case "profile": return <StudentProfile currentUser={currentUser} toast={toast} />;
       case "student-id": return <StudentIDCard currentUser={currentUser} toast={toast} />;
       case "payment-history": return <PaymentHistory currentUser={currentUser} />;
@@ -19152,11 +19147,28 @@ self.addEventListener('notificationclick', e => {
             setActiveNav("messages");
             clearCallSignal(currentUser, c.roomId);
           }}
-         onDecline={() => {
+          onDecline={() => {
             const c = incomingCall;
             setIncomingCall(null);
-            clearCallSignal(c.fromUser, c.roomId);
             clearCallSignal(currentUser, c.roomId);
+            // Tell the caller's snapshot watcher that the call was declined
+            _loadFirebase().then(ok => {
+              if (!ok) return;
+              try {
+                _gvcSigDoc(c.roomId, c.fromUser, currentUser)
+                  .set({ declined: true }, { merge: true });
+              } catch(_) {}
+            });
+          }}
+            // Write "declined" onto the WebRTC signalling doc so the caller's
+            // existing snapshot watcher sees it and stops ringing
+            _loadFirebase().then(ok => {
+              if (!ok) return;
+              try {
+                _gvcSigDoc(c.roomId, c.fromUser, currentUser)
+                  .set({ declined: true }, { merge: true });
+              } catch(_) {}
+            });
           }}
         />
       )}
