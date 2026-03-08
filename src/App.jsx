@@ -8257,26 +8257,25 @@ const _ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
   { urls: "stun:stun.cloudflare.com:3478" },
-  { urls: "stun:stun.relay.metered.ca:80" },
   {
     urls: "turn:global.relay.metered.ca:80",
-    username: "openrelayproject",
-    credential: "openrelayproject",
+    username: "1d2573fad62044e937cee0ab",
+    credential: "vj0Ysdvdi7F/W+qA",
   },
   {
     urls: "turn:global.relay.metered.ca:80?transport=tcp",
-    username: "openrelayproject",
-    credential: "openrelayproject",
+    username: "1d2573fad62044e937cee0ab",
+    credential: "vj0Ysdvdi7F/W+qA",
   },
   {
     urls: "turn:global.relay.metered.ca:443",
-    username: "openrelayproject",
-    credential: "openrelayproject",
+    username: "1d2573fad62044e937cee0ab",
+    credential: "vj0Ysdvdi7F/W+qA",
   },
   {
     urls: "turns:global.relay.metered.ca:443?transport=tcp",
-    username: "openrelayproject",
-    credential: "openrelayproject",
+    username: "1d2573fad62044e937cee0ab",
+    credential: "vj0Ysdvdi7F/W+qA",
   },
 ];
 const GVC_ICE = {
@@ -8847,7 +8846,8 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
           if (!snap.exists || !active) return;
           const d = snap.data();
           // Callee declined — stop ringing
-          if (d.declined && !liveRef.current) {
+          // Callee declined — stop ringing
+          if (d.declined && !liveRef.current && status === "ringing") {
             setStatus("ended");
             setTimeout(() => { if (active) onClose(); }, 1500);
             return;
@@ -8914,12 +8914,11 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
       try { pcRef.current?.close(); } catch(_) {}
       localStreamRef.current?.getTracks().forEach(t => t.stop());
       // Clean up: clear call signals on both sides and delete signalling doc
-      clearCallSignal(myUid);
-      clearCallSignal(remoteUid);
+      clearCallSignal(myUid, roomId);
+      clearCallSignal(remoteUid, roomId);
       _loadFirebase().then(ok => {
         if (!ok) return;
-        try { _gvcSigDoc(roomId, myUid, remoteUid).delete().catch(() => {}); } catch(_) {}
-        try { _gvcSigDoc(roomId, remoteUid, myUid).delete().catch(() => {}); } catch(_) {}
+        try { _gvcSigDoc(roomId, myUid, remoteUid).set({ ended: true }, { merge: true }).catch(() => {}); } catch(_) {}
       });
     };
   }, []); // eslint-disable-line
@@ -12373,20 +12372,16 @@ function Notifications({ currentUser, onRead, onNavigate }) {
 //   Inline "ANS: B" or separate answers column
 const parseCbtQuestions = (qText, ansText = "") => {
   const ansLines = ansText.trim().split("\n").map(l => l.trim()).filter(Boolean);
-
-  // Normalize: collapse multiple blank lines to one, trim each line
   const normalized = qText.trim().split("\n").map(l => l.trimEnd()).join("\n");
 
-  // ── Strategy 1: split on blank lines ──────────────────────────────
+  // Strategy 1: split on blank lines
   let rawBlocks = normalized.split(/\n[ \t]*\n+/).map(b => b.trim()).filter(Boolean);
 
-  // ── Strategy 2: if single block, try to re-split on question number patterns ──
+  // Strategy 2: no blank lines — split on question-number patterns
   if (rawBlocks.length <= 1) {
-    // Detect question-start lines: "1.", "1)", "Q:", "Q1.", "Question 1", etc.
     const qStartRe = /(?:^|\n)((?:Q(?:uestion)?\s*\.?\d*\s*[:.\-)]?\s*|\d+\s*[.):]\s*).{5,})/gi;
     const matches = [...normalized.matchAll(qStartRe)];
     if (matches.length > 1) {
-      // Split on each question-start position
       const positions = matches.map(m => m.index + (m[0].startsWith("\n") ? 1 : 0));
       rawBlocks = positions.map((pos, i) => {
         const end = positions[i + 1] ?? normalized.length;
@@ -12395,11 +12390,11 @@ const parseCbtQuestions = (qText, ansText = "") => {
     }
   }
 
-  // ── Strategy 3: fallback — treat whole thing as one question ──────
+  // Strategy 3: fallback — whole text is one question
   if (rawBlocks.length === 0) rawBlocks = [normalized];
 
-  const OPTION_RE  = /^[ \t]*[\(\[]?\s*([AaBbCcDd]|[1-4])\s*[\)\]:.\-][ \t]*(.+)$/;
-  const ANS_RE     = /^[ \t]*(?:ANS(?:WER)?|Ans(?:wer)?)\s*[:.\-)]?\s*:?\s*([A-Da-d1-4])\b/i;
+  const OPTION_RE  = /^[\(\[]?\s*([AaBbCcDd]|[1-4])\s*[\)\]:.\-]\s*(.+)$/;
+  const ANS_RE     = /^(?:ANS(?:WER)?|Ans(?:wer)?)\s*[:.\-)]?\s*:?\s*([A-Da-d1-4])\b/i;
   const QNUM_STRIP = /^(?:Q(?:uestion)?\s*\.?\d*\s*[:.\-)]?\s*|\d+\s*[.):] ?)/i;
 
   const items = rawBlocks.map((block, idx) => {
@@ -12407,7 +12402,6 @@ const parseCbtQuestions = (qText, ansText = "") => {
     let q = "", options = ["", "", "", ""], ans = 0, foundAns = false;
 
     for (const line of lines) {
-      // ── Answer declaration ──
       const ansMatch = line.match(ANS_RE);
       if (ansMatch) {
         const a = ansMatch[1].toUpperCase();
@@ -12415,8 +12409,6 @@ const parseCbtQuestions = (qText, ansText = "") => {
         if (mapped !== undefined) { ans = mapped; foundAns = true; }
         continue;
       }
-
-      // ── Option line ──
       const optMatch = line.match(OPTION_RE);
       if (optMatch) {
         const letter = optMatch[1].toUpperCase();
@@ -12424,15 +12416,12 @@ const parseCbtQuestions = (qText, ansText = "") => {
         const oi = { A:0, B:1, C:2, D:3, "1":0, "2":1, "3":2, "4":3 }[letter];
         if (oi !== undefined && text) { options[oi] = text; continue; }
       }
-
-      // ── Question text — strip leading number/Q prefix if present ──
       if (!q) {
         const stripped = line.replace(QNUM_STRIP, "").trim();
         if (stripped && !line.match(OPTION_RE)) { q = stripped; }
       }
     }
 
-    // Override answer from answers-column textarea if provided
     if (ansLines[idx]) {
       const a = ansLines[idx][0]?.toUpperCase();
       const mapped = { A:0, B:1, C:2, D:3, "1":0, "2":1, "3":2, "4":3 }[a];
@@ -12478,7 +12467,6 @@ function CbtExamManager({ toast, currentUser }) {
   // Load live data — lecturers only see their own exams
   useEffect(() => {
     const u1 = subscribeCbtExams(list => {
-      // Filter: only show exams created by this lecturer
       setExams(list.filter(e => e.createdBy === currentUser));
       setLoading(false);
     });
@@ -12603,12 +12591,10 @@ function CbtExamManager({ toast, currentUser }) {
   // ── Archive check: exam is archived if published > 24h ago ──
   const isArchived = (exam) => {
     if (!exam.published) return false;
-    // If endTime is set, expire when current time passes it
     if (exam.endTime) {
       const end = new Date(exam.endTime).getTime();
-      return !isNaN(end) && Date.now() > end;
+      if (!isNaN(end) && Date.now() > end) return true;
     }
-    // Fallback: archive after 24h
     return exam.publishedAt && (Date.now()-exam.publishedAt > 24*60*60*1000);
   };
   const isNotStartedYet = (exam) => {
@@ -12616,7 +12602,7 @@ function CbtExamManager({ toast, currentUser }) {
     const start = new Date(exam.startTime).getTime();
     return !isNaN(start) && Date.now() < start;
   };
-  const getStatus  = (exam) => {
+  const getStatus = (exam) => {
     if (!exam.published) return { label:"📋 Draft", color:"var(--text3)", bg:"rgba(128,128,128,.1)" };
     if (isNotStartedYet(exam)) return { label:"⏳ Scheduled", color:"var(--accent)", bg:"rgba(0,119,182,.1)" };
     if (isArchived(exam)) return { label:"🗄️ Expired", color:"var(--warn)", bg:"rgba(251,146,60,.12)" };
@@ -12701,20 +12687,18 @@ function CbtExamManager({ toast, currentUser }) {
             <input className="inp" style={{marginBottom:0}} type="number" min="5" max="300" value={form.duration} onChange={e=>setForm(f=>({...f,duration:Math.max(1,+e.target.value)}))} />
           </div>
         </div>
-        {/* ── Exam Schedule ── */}
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:10}}>
           <div>
-            <label className="lbl">📅 Start Date & Time</label>
+            <label className="lbl">Start Date & Time</label>
             <input className="inp" style={{marginBottom:0}} type="datetime-local" value={form.startTime||""} onChange={e=>setForm(f=>({...f,startTime:e.target.value}))} />
             <div style={{fontSize:10,color:"var(--text3)",marginTop:3}}>Students cannot open exam before this time</div>
           </div>
           <div>
-            <label className="lbl">⏰ End Date & Time (Expiry)</label>
+            <label className="lbl">End Date & Time (Expiry)</label>
             <input className="inp" style={{marginBottom:0}} type="datetime-local" value={form.endTime||""} onChange={e=>setForm(f=>({...f,endTime:e.target.value}))} />
             <div style={{fontSize:10,color:"var(--text3)",marginTop:3}}>Exam becomes inaccessible after this time</div>
           </div>
         </div>
-        {/* ── Results Visibility ── */}
         <div style={{marginTop:10,padding:"10px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg4)"}}>
           <label style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer"}}>
             <div style={{position:"relative",width:40,height:22,flexShrink:0}}>
@@ -12723,8 +12707,8 @@ function CbtExamManager({ toast, currentUser }) {
               <div style={{position:"absolute",top:3,left:form.showResultsImmediately?20:3,width:16,height:16,borderRadius:"50%",background:"white",transition:"left .2s",boxShadow:"0 1px 4px rgba(0,0,0,.25)"}} />
             </div>
             <div>
-              <div style={{fontWeight:700,fontSize:13}}>📊 Show Results Immediately After Exam</div>
-              <div style={{fontSize:11,color:"var(--text3)"}}>{form.showResultsImmediately?"Students see score & answers right away":"Students only see a submission confirmation — no score or answers revealed"}</div>
+              <div style={{fontWeight:700,fontSize:13}}>Show Results Immediately After Exam</div>
+              <div style={{fontSize:11,color:"var(--text3)"}}>{form.showResultsImmediately?"Students see score & answers right away":"Students only see a submission confirmation — results hidden until lecturer releases"}</div>
             </div>
           </label>
         </div>
@@ -12968,8 +12952,8 @@ function CbtExamManager({ toast, currentUser }) {
             <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>
               {classes.find(c=>c.id===selExam.classId)?.label} · {selExam.questions.length}Q · {selExam.duration}min
               {selExam.publishedAt&&<span style={{marginLeft:8}}>Published: {new Date(selExam.publishedAt).toLocaleString()}</span>}
-              {selExam.startTime&&<span style={{marginLeft:8,color:"var(--accent)"}}>🕐 Starts: {new Date(selExam.startTime).toLocaleString()}</span>}
-              {selExam.endTime&&<span style={{marginLeft:8,color:"var(--warn)"}}>⏰ Expires: {new Date(selExam.endTime).toLocaleString()}</span>}
+              {selExam.startTime&&<span style={{marginLeft:8,color:"var(--accent)"}}>Start: {new Date(selExam.startTime).toLocaleString()}</span>}
+              {selExam.endTime&&<span style={{marginLeft:8,color:"var(--warn)"}}>Expires: {new Date(selExam.endTime).toLocaleString()}</span>}
             </div>
           </div>
           <span style={{fontSize:11,padding:"3px 10px",borderRadius:20,background:status.bg,color:status.color,fontWeight:700}}>{status.label}</span>
@@ -13578,14 +13562,9 @@ function CbtStudentView({ toast, currentUser }) {
   const fmtTime       = (s) => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
   const urgent        = timeLeft<=60&&timeLeft>0;
 
-  // Only show exams that have started (startTime has passed or not set) and not yet expired
   const isExamOpen = (e) => {
-    if (!e.published) return false;
-    if (isArchived(e)) return false;
-    if (e.startTime) {
-      const start = new Date(e.startTime).getTime();
-      if (!isNaN(start) && Date.now() < start) return false;
-    }
+    if (!e.published || isArchived(e)) return false;
+    if (e.startTime) { const s = new Date(e.startTime).getTime(); if (!isNaN(s) && Date.now() < s) return false; }
     return true;
   };
   const available = exams.filter(e=>e.classId===myClass&&isExamOpen(e));
@@ -13697,7 +13676,7 @@ function CbtStudentView({ toast, currentUser }) {
           </div>
         </div>
         <div style={{background:"rgba(239,68,68,.07)",border:"1px solid rgba(239,68,68,.25)",borderRadius:9,padding:"10px 14px",marginBottom:14,fontSize:12,color:"var(--danger)",fontWeight:700,textAlign:"center"}}>
-          ⚠️ All anti-malpractice measures are mandatory and cannot be bypassed. Violations are recorded and reported to your lecturer in real time.
+          All anti-malpractice measures are mandatory and cannot be bypassed. Violations are recorded and reported to your lecturer in real time.
         </div>
         <div style={{fontSize:12,color:"var(--text3)",textAlign:"center",marginBottom:16}}>
           By clicking Start, you confirm you have read and understood the exam rules.
@@ -13852,37 +13831,37 @@ function CbtStudentView({ toast, currentUser }) {
           )}
           {myResult.violations>0&&<div style={{marginTop:14,fontSize:12,color:"var(--danger)",fontWeight:700}}>🚨 {myResult.violations} violation{myResult.violations>1?"s":""} recorded during this exam.</div>}
         </div>
-        {showResults && <>
-          <div style={{fontWeight:800,fontSize:14,marginBottom:10}}>📋 Answer Review</div>
-          {shuffledQs.map((sq,i)=>{
-            const chosen       = answers[i];
-            const chosenOrigOpt = chosen!==null&&chosen!==undefined ? sq.displayOptions[chosen]?.origOptIdx : null;
-            const correct      = chosenOrigOpt===sq.origAns;
-            return (
-              <div key={i} className="card" style={{marginBottom:10,borderLeft:`3px solid ${chosenOrigOpt!==null?correct?"var(--success)":"var(--danger)":"var(--border)"}`}}>
-                <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:8}}>
-                  <span style={{fontSize:16}}>{chosenOrigOpt!==null?correct?"✅":"❌":"⬜"}</span>
-                  <div style={{fontWeight:700,fontSize:13,flex:1}}>{i+1}. {sq.q}</div>
-                </div>
-                <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
-                  {sq.displayOptions.map((opt,di)=>{
-                    const isCorrectOpt = opt.origOptIdx===sq.origAns;
-                    const isChosen     = di===chosen;
-                    return (
-                      <span key={di} style={{fontSize:11,padding:"3px 9px",borderRadius:6,
-                        background:isCorrectOpt?"rgba(34,197,94,.15)":isChosen&&!isCorrectOpt?"rgba(239,68,68,.1)":"transparent",
-                        border:`1px solid ${isCorrectOpt?"var(--success)":isChosen&&!isCorrectOpt?"var(--danger)":"var(--border)"}`,
-                        color:isCorrectOpt?"var(--success)":isChosen&&!isCorrectOpt?"var(--danger)":"var(--text3)",
-                        fontWeight:isCorrectOpt?800:400
-                      }}>{"ABCD"[di]}. {opt.text}{isCorrectOpt?" ✓":""}{isChosen&&!isCorrectOpt?" ✗":""}</span>
-                    );
-                  })}
-                </div>
-                {(chosen===null||chosen===undefined)&&<div style={{fontSize:11,color:"var(--text3)",marginTop:5,fontStyle:"italic"}}>— Not answered</div>}
+        {showResults && <div style={{fontWeight:800,fontSize:14,marginBottom:10}}>Answer Review</div>}
+        {showResults && <div>
+        {shuffledQs.map((sq,i)=>{
+          const chosen       = answers[i];
+          const chosenOrigOpt = chosen!==null&&chosen!==undefined ? sq.displayOptions[chosen]?.origOptIdx : null;
+          const correct      = chosenOrigOpt===sq.origAns;
+          return (
+            <div key={i} className="card" style={{marginBottom:10,borderLeft:`3px solid ${chosenOrigOpt!==null?correct?"var(--success)":"var(--danger)":"var(--border)"}`}}>
+              <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:8}}>
+                <span style={{fontSize:16}}>{chosenOrigOpt!==null?correct?"✅":"❌":"⬜"}</span>
+                <div style={{fontWeight:700,fontSize:13,flex:1}}>{i+1}. {sq.q}</div>
               </div>
-            );
-          })}
-        </>}
+              <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+                {sq.displayOptions.map((opt,di)=>{
+                  const isCorrectOpt = opt.origOptIdx===sq.origAns;
+                  const isChosen     = di===chosen;
+                  return (
+                    <span key={di} style={{fontSize:11,padding:"3px 9px",borderRadius:6,
+                      background:isCorrectOpt?"rgba(34,197,94,.15)":isChosen&&!isCorrectOpt?"rgba(239,68,68,.1)":"transparent",
+                      border:`1px solid ${isCorrectOpt?"var(--success)":isChosen&&!isCorrectOpt?"var(--danger)":"var(--border)"}`,
+                      color:isCorrectOpt?"var(--success)":isChosen&&!isCorrectOpt?"var(--danger)":"var(--text3)",
+                      fontWeight:isCorrectOpt?800:400
+                    }}>{"ABCD"[di]}. {opt.text}{isCorrectOpt?" ✓":""}{isChosen&&!isCorrectOpt?" ✗":""}</span>
+                  );
+                })}
+              </div>
+              {(chosen===null||chosen===undefined)&&<div style={{fontSize:11,color:"var(--text3)",marginTop:5,fontStyle:"italic"}}>— Not answered</div>}
+            </div>
+          );
+        })}
+        </div>}
         <button className="btn btn-accent" onClick={()=>{setMode("list");setActiveExam(null);setMyResult(null);}}>← Back to Exams</button>
       </div>
     );
@@ -19235,16 +19214,6 @@ self.addEventListener('notificationclick', e => {
             setIncomingCall(null);
             clearCallSignal(currentUser, c.roomId);
             // Tell the caller's snapshot watcher that the call was declined
-            _loadFirebase().then(ok => {
-              if (!ok) return;
-              try {
-                _gvcSigDoc(c.roomId, c.fromUser, currentUser)
-                  .set({ declined: true }, { merge: true });
-              } catch(_) {}
-            });
-          }}
-            // Write "declined" onto the WebRTC signalling doc so the caller's
-            // existing snapshot watcher sees it and stops ringing
             _loadFirebase().then(ok => {
               if (!ok) return;
               try {
