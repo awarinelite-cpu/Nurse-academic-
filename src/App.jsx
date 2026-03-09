@@ -2670,41 +2670,106 @@ function AdminSkills({ toast }) {
       const n = parseFloat(t); return isNaN(n)?0:n;
     };
 
-    // An ALL-CAPS line with no trailing mark and no leading number
-    // that is NOT a known section keyword = sub-topic heading
+    // Split a line of inline MCQ options: "a. Text     b. Text     c. Text     d. Text"
+    const parseInlineOptions = (line) => {
+      const opts = [];
+      const re = /([a-d])\.\s+(.+?)(?=\s{2,}[a-d]\.\s|\s*$)/gi;
+      let m;
+      while ((m = re.exec(line)) !== null) {
+        opts.push({ letter: m[1].toUpperCase(), text: m[2].trim() });
+      }
+      return opts;
+    };
+
     const isSubTopicHeading = (line) => {
       if (!line.trim()) return false;
       if (/^(?:PROCEDURE\s+STATION|INSTRUCTION|ACTIVITIES|QUESTION\s+STATION|Total\s+Marks)/i.test(line)) return false;
-      if (/^\d+[.)]\s/.test(line)) return false;         // numbered activity
-      if (/\(\d.*mark/i.test(line)) return false;        // has a mark
-      // Must be mostly uppercase letters (allow spaces, comma, apostrophe, /)
+      if (/^\d+[.)]\s/.test(line)) return false;
+      if (/\(\d.*mark/i.test(line)) return false;
       const upper = line.replace(/[^A-Za-z]/g,"");
       if (upper.length < 3) return false;
       const upperRatio = (upper.match(/[A-Z]/g)||[]).length / upper.length;
-      return upperRatio >= 0.85 && line.length < 80;
+      return upperRatio >= 0.85 && line.length < 90;
     };
 
-    // A group label: line with no number, no mark, mixed case or ALL-CAPS,
-    // inside an ACTIVITIES block (e.g. "Preparation", "Procedure (...)", "Finishing")
     const isGroupLabel = (line) => {
       if (!line.trim()) return false;
       if (/^\d+[.)]\s/.test(line)) return false;
       if (/\(\d.*mark/i.test(line)) return false;
-      if (/^[a-z][.)]\s/.test(line)) return false;
-      return true; // anything else that isn't a numbered step
+      if (/^[a-d]\.\s/.test(line)) return false;
+      return true;
     };
 
-    // ── split into PROCEDURE STATION blocks ──────────────────────────
-    const stationBlocks = rawText.split(/(?=^PROCEDURE\s+STATION[\s:]+)/mi).map(b=>b.trim()).filter(Boolean);
-    const blocks = stationBlocks.length > 1 ? stationBlocks : [rawText];
+    // ── Split text into top-level blocks on PROCEDURE STATION: or QUESTION STATION: ──
+    const blocks = rawText
+      .split(/(?=^(?:PROCEDURE|QUESTION)\s+STATION[\s:]+)/mi)
+      .map(b=>b.trim()).filter(Boolean);
 
     const items = blocks.map(block => {
       const lines = block.split("\n").map(l => l.trimEnd());
+      const firstLine = lines[0].trim();
+
+      // ── Standalone QUESTION STATION block ──────────────────────────
+      const isQBlock = /^QUESTION\s+STATION/i.test(firstLine);
+      if (isQBlock) {
+        const heading = firstLine.replace(/^QUESTION\s+STATION[\s:]*/i,"").trim() || "Question Station";
+        const questionStation = [];
+        let i = 1;
+        while (i < lines.length) {
+          const line = lines[i].trim();
+          i++;
+          if (!line) continue;
+          if (/^Total\s+Marks/i.test(line)) continue;
+
+          // Inline options line (starts with "a.")
+          const inlineOpts = /^[a-d]\.\s+/i.test(line) ? parseInlineOptions(line) : null;
+          if (inlineOpts && inlineOpts.length && questionStation.length) {
+            const lastQ = questionStation[questionStation.length-1];
+            if (lastQ.type==="fill" || lastQ.type==="text") {
+              // Promote to fill+mcq or mcq
+              lastQ.type = lastQ.isFill ? "fill" : "mcq";
+              lastQ.options = inlineOpts;
+            } else if (lastQ.type==="mcq") {
+              lastQ.options = inlineOpts;
+            }
+            continue;
+          }
+
+          // Numbered question line
+          const qm = line.match(/^(\d+)[.)]\s+(.+)$/);
+          if (qm) {
+            const qText = qm[2].trim();
+            const isFill = /\.{4,}/.test(qText);
+            // Check if next line has inline options
+            const nextLine = (lines[i]||"").trim();
+            const hasNextOpts = /^[a-d]\.\s+/i.test(nextLine);
+            const type = hasNextOpts ? (isFill?"fill":"mcq") : (isFill?"fill":"text");
+            questionStation.push({ type, isFill, q:qText, options:[], ans:null, qNum: parseInt(qm[1]) });
+            continue;
+          }
+
+          // Old-style one-per-line option (fallback)
+          const oldOpt = line.match(/^([a-d])[.)]\s+(.+)$/i);
+          if (oldOpt && questionStation.length) {
+            const lastQ = questionStation[questionStation.length-1];
+            if (lastQ.type==="mcq"||lastQ.type==="fill") {
+              lastQ.options.push({ letter: oldOpt[1].toUpperCase(), text: oldOpt[2].trim() });
+            }
+          }
+        }
+        return {
+          isQuestionStation: true,
+          heading, instructions:[], subTopics:[], activities:[], questionStation,
+          totalMarks:""
+        };
+      }
+
+      // ── PROCEDURE STATION block ─────────────────────────────────────
       let heading = "";
       let instructions = [];
-      let subTopics = [];   // array of {title, activities, totalMarks, totalMarksNum}
+      let subTopics = [];
       let questionStation = [];
-      let mode = "heading"; // heading | instructions | subtopic_activities
+      let mode = "heading";
       let currentGroup = "";
       let currentSubTopic = null;
       let globalQIdx = 0;
@@ -2713,7 +2778,7 @@ function AdminSkills({ toast }) {
         currentSubTopic = { title, activities: [], totalMarks: "", totalMarksNum: 0 };
         subTopics.push(currentSubTopic);
         currentGroup = "";
-        mode = "subtopic_wait"; // waiting for ACTIVITIES keyword
+        mode = "subtopic_wait";
       };
 
       for (let i = 0; i < lines.length; i++) {
@@ -2721,7 +2786,6 @@ function AdminSkills({ toast }) {
         const line = raw.trim();
         if (!line) continue;
 
-        // ── Section keywords ────────────────────────────────────────
         if (/^PROCEDURE\s+STATION[\s:]*/i.test(line)) {
           heading = line.replace(/^PROCEDURE\s+STATION[\s:]*/i,"").trim();
           mode = "heading"; continue;
@@ -2729,9 +2793,8 @@ function AdminSkills({ toast }) {
         if (/^INSTRUCTION(S)?\s+TO\s+CANDIDATE/i.test(line)) { mode = "instructions"; continue; }
         if (/^ACTIVITIES\s*$/i.test(line)) {
           mode = "subtopic_activities";
-          // If no sub-topic yet, create a default one
           if (!currentSubTopic) {
-            currentSubTopic = { title: "", activities: [], totalMarks: "", totalMarksNum: 0 };
+            currentSubTopic = { title:"", activities:[], totalMarks:"", totalMarksNum:0 };
             subTopics.push(currentSubTopic);
           }
           continue;
@@ -2739,8 +2802,7 @@ function AdminSkills({ toast }) {
         if (/^QUESTION\s+STATION/i.test(line)) { mode = "questions"; continue; }
         if (/^Total\s+Marks/i.test(line)) {
           const tm = line.match(/([\d.½¼¾\/]+)\s*Marks?/i);
-          const numStr = tm ? tm[1] : "";
-          const val = parseMark(numStr);
+          const val = parseMark(tm?tm[1]:"");
           if (currentSubTopic) {
             currentSubTopic.totalMarks = line;
             currentSubTopic.totalMarksNum = val || currentSubTopic.activities.reduce((s,a)=>s+(a.markVal||0),0);
@@ -2748,114 +2810,110 @@ function AdminSkills({ toast }) {
           mode = "subtopic_wait"; continue;
         }
 
-        // ── Heading continuation ─────────────────────────────────────
         if (mode === "heading" && heading && !/^(?:INSTRUCTION|ACTIVIT|QUESTION)/i.test(line)) {
           heading += " " + line; continue;
         }
-
-        // ── Instructions ─────────────────────────────────────────────
         if (mode === "instructions") {
-          // Check if this is actually a sub-topic heading
-          if (isSubTopicHeading(line) && !instructions.length) { pushSubTopic(line); continue; }
           if (isSubTopicHeading(line)) { pushSubTopic(line); continue; }
           const clean = line.replace(/^[➤►>•\-*]\s*/,"").trim();
           if (clean) instructions.push(clean);
           continue;
         }
-
-        // ── Waiting for next section (after Total Marks) ─────────────
         if (mode === "subtopic_wait" || mode === "heading") {
           if (isSubTopicHeading(line)) { pushSubTopic(line); continue; }
           if (/^INSTRUCTION/i.test(line)) { mode = "instructions"; continue; }
           continue;
         }
-
-        // ── Activities inside a sub-topic ────────────────────────────
         if (mode === "subtopic_activities") {
-          // New sub-topic heading inside activities (rare but valid)
-          if (isSubTopicHeading(line) && !(/^\d+[.)]/.test(line))) {
-            pushSubTopic(line); continue;
-          }
-
+          if (isSubTopicHeading(line) && !(/^\d+[.)]/.test(line))) { pushSubTopic(line); continue; }
           const actM = line.match(/^(\d+[a-z]?)[.)]\s+(.+)$/i);
           const subM = line.match(/^([a-z])[.)]\s+(.+)$/i);
-
           if (actM) {
             const raw2 = actM[2].trim();
             const mm = raw2.match(/\(([½¼¾\d.\/\s]+\s*mark[s]?)\)\s*$/i);
             const text = mm ? raw2.replace(mm[0],"").trim() : raw2;
             const markStr = mm ? mm[1].trim() : "";
             currentSubTopic.activities.push({
-              num: actM[1], group: currentGroup, text, mark: markStr,
-              markVal: parseMark(markStr), subItems: []
+              num:actM[1], group:currentGroup, text, mark:markStr,
+              markVal:parseMark(markStr), subItems:[]
             });
-          } else if (subM && currentSubTopic && currentSubTopic.activities.length > 0) {
+          } else if (subM && currentSubTopic && currentSubTopic.activities.length>0) {
             const raw2 = subM[2].trim();
             const mm = raw2.match(/\(([½¼¾\d.\/\s]+\s*mark[s]?)\)\s*$/i);
             const text = mm ? raw2.replace(mm[0],"").trim() : raw2;
             const markStr = mm ? mm[1].trim() : "";
             const parent = currentSubTopic.activities[currentSubTopic.activities.length-1];
-            if (!parent.subItems) parent.subItems = [];
-            parent.subItems.push({ letter: subM[1], text, mark: markStr, markVal: parseMark(markStr) });
+            if (!parent.subItems) parent.subItems=[];
+            parent.subItems.push({ letter:subM[1], text, mark:markStr, markVal:parseMark(markStr) });
           } else if (isGroupLabel(line)) {
-            currentGroup = line; // e.g. "Preparation", "Procedure (...)", "Finishing"
+            currentGroup = line;
           }
           continue;
         }
-
-        // ── Question station ─────────────────────────────────────────
         if (mode === "questions") {
-          const optM = line.match(/^([a-d])[.)]\s+(.+)$/i);
-          const lastQ = questionStation.length ? questionStation[questionStation.length-1] : null;
-          if (optM && lastQ && lastQ.type==="mcq") {
-            lastQ.options.push({ letter: optM[1].toUpperCase(), text: optM[2].trim() });
-          } else if (!optM && line) {
-            const lookahead = lines.slice(i+1,i+6).join("\n");
-            const hasMcq = /^[a-d][.)]\s/im.test(lookahead);
-            const cleanQ = line.replace(/^\d+[.)\s]*/,"").trim();
-            if (hasMcq) {
-              questionStation.push({ type:"mcq", q:cleanQ, options:[], ans:null, qNum:globalQIdx+1 });
-              globalQIdx++;
-            } else if (cleanQ) {
-              const isFill = /[…_]{3,}|Mention\s+\d+/i.test(cleanQ);
-              questionStation.push({ type:isFill?"fill":"text", q:cleanQ, ans:"" });
+          // Inline options: "a. Text     b. Text     c. Text"
+          if (/^[a-d]\.\s+/i.test(line)) {
+            const opts = parseInlineOptions(line);
+            if (opts.length && questionStation.length) {
+              const lastQ = questionStation[questionStation.length-1];
+              lastQ.options = opts;
+              if (lastQ.type==="text"||lastQ.type==="fill") lastQ.type = lastQ.isFill?"fill":"mcq";
+            } else {
+              // Old-style single option per line fallback
+              const oldOpt = line.match(/^([a-d])[.)]\s+(.+)$/i);
+              if (oldOpt && questionStation.length) {
+                questionStation[questionStation.length-1].options.push({ letter:oldOpt[1].toUpperCase(), text:oldOpt[2].trim() });
+              }
             }
+            continue;
+          }
+          const qm = line.match(/^(\d+)[.)]\s+(.+)$/);
+          if (qm) {
+            const qText = qm[2].trim();
+            const isFill = /\.{4,}/.test(qText);
+            const nextLine = (lines[i+1]||"").trim();
+            const hasNextOpts = /^[a-d]\.\s+/i.test(nextLine);
+            const type = hasNextOpts ? (isFill?"fill":"mcq") : (isFill?"fill":"text");
+            questionStation.push({ type, isFill, q:qText, options:[], ans:null, qNum:parseInt(qm[1]) });
+            continue;
+          }
+          // Plain text question (no number)
+          if (line && !/^Total\s+Marks/i.test(line)) {
+            const isFill = /\.{4,}/.test(line);
+            questionStation.push({ type:isFill?"fill":"text", isFill, q:line, options:[], ans:null, qNum:globalQIdx+1 });
+            globalQIdx++;
           }
           continue;
         }
       }
 
-      // Fallback: if no subTopics parsed, treat flat activities as a single unnamed sub-topic
-      // (backward compat for old format with single ACTIVITIES block)
-      if (!subTopics.length) { subTopics = [{ title:"", activities:[], totalMarks:"", totalMarksNum:0 }]; }
-
-      // Compute totalMarksNum from activities if missing
+      if (!subTopics.length) subTopics = [{ title:"", activities:[], totalMarks:"", totalMarksNum:0 }];
       subTopics.forEach(st => {
-        if (!st.totalMarksNum) {
-          st.totalMarksNum = st.activities.reduce((s,a) => s+(a.markVal||0)+(a.subItems||[]).reduce((ss,si)=>ss+(si.markVal||0),0), 0);
-        }
+        if (!st.totalMarksNum)
+          st.totalMarksNum = st.activities.reduce((s,a)=>s+(a.markVal||0)+(a.subItems||[]).reduce((ss,si)=>ss+(si.markVal||0),0),0);
       });
-
-      // Also keep flat activities[] for backward compat (combine all sub-topics)
-      const allActivities = subTopics.flatMap(st => st.activities);
-
+      const allActivities = subTopics.flatMap(st=>st.activities);
       if (!heading) heading = lines.find(l=>l.trim()) || "OSCE Station";
       return {
-        heading: heading.trim(), instructions, subTopics, activities: allActivities,
-        questionStation, totalMarks: subTopics.map(s=>s.totalMarks).filter(Boolean).join(" | ")
+        heading:heading.trim(), instructions, subTopics, activities:allActivities,
+        questionStation, totalMarks:subTopics.map(s=>s.totalMarks).filter(Boolean).join(" | ")
       };
     }).filter(i => i.heading);
 
     setParsedOsce(items);
+    const qsCount  = items.filter(i=>i.isQuestionStation).length;
+    const procCount = items.filter(i=>!i.isQuestionStation).length;
+    const subCount  = items.reduce((s,i)=>s+(i.subTopics||[]).length,0);
     if (!items.length) toast("No stations parsed — check format","error");
-    else toast("✅ " + items.length + " station(s) parsed — " + items.reduce((s,i)=>s+(i.subTopics||[]).length,0) + " sub-topics found!","success");
+    else toast(`✅ ${procCount} procedure station${procCount!==1?"s":""}, ${qsCount} question station${qsCount!==1?"s":""} parsed!`,"success");
   };
 
   const importOsce = () => {
     if (!parsedOsce.length) return;
     const newItems = parsedOsce.map(p=>({ id: Date.now()+Math.random(), name: p.heading,
       heading: p.heading, instructions: p.instructions||[], activities: p.activities||[],
-      subTopics: p.subTopics||[], questionStation: p.questionStation||[], totalMarks: p.totalMarks||"" }));
+      subTopics: p.subTopics||[], questionStation: p.questionStation||[], totalMarks: p.totalMarks||"",
+      isQuestionStation: p.isQuestionStation||false }));
     const u = [...skills, ...newItems];
     setSkills(u); saveShared("skills", u);
     setParsedOsce([]); setOsceText(""); setOsceAnswersText("");
@@ -2937,7 +2995,10 @@ function AdminSkills({ toast }) {
               <div key={i} style={{padding:"10px 14px",borderTop:"1px solid var(--border)"}}>
                 <div style={{fontWeight:800,fontSize:13,color:"var(--accent)",marginBottom:3}}>🩺 {c.heading}</div>
                 <div style={{fontSize:11,color:"var(--text3)"}}>
-                  {c.instructions.length} instruction{c.instructions.length!==1?"s":""} · {(c.subTopics||[]).length} sub-topic{(c.subTopics||[]).length!==1?"s":""} · {c.activities.length} activities · {c.questionStation.length} Q-station items{c.totalMarks?` · ${c.totalMarks}`:""}
+                  {c.isQuestionStation
+                    ? <span style={{color:"var(--accent)",fontWeight:700}}>❓ Question Station · {c.questionStation.length} question{c.questionStation.length!==1?"s":""}</span>
+                    : <>{c.instructions.length} instruction{c.instructions.length!==1?"s":""} · {(c.subTopics||[]).length} sub-topic{(c.subTopics||[]).length!==1?"s":""} · {c.activities.length} activities · {c.questionStation.length} Q-station items{c.totalMarks?` · ${c.totalMarks}`:""}</>
+                  }
                 </div>
               </div>
             ))}
@@ -10937,11 +10998,14 @@ function LabReferenceView() {
 }
 function SkillsView() {
   const [skillsDb] = useSharedData("nv-skillsdb", DEFAULT_SKILLS);
-  // ticked keys: "stationIdx-subTopicIdx-activityIdx"  e.g. "0-1-4"
+  // tick keys: "stationIdx-subTopicIdx-activityIdx"
   const [ticked, setTicked] = useState(()=>ls("nv-skills-done",{}));
-  const [expanded, setExpanded] = useState({});       // stationIdx -> bool (open/closed)
+  const [expanded, setExpanded] = useState({});
   const [expandAll, setExpandAll] = useState(false);
   const [osceSearch, setOsceSearch] = useState("");
+  // Q-station state: { [stationIdx-qIdx]: selectedLetter }
+  const [qAnswers, setQAnswers] = useState(()=>ls("nv-skills-qans",{}));
+  const [qRevealed, setQRevealed] = useState({});
 
   // ── mark helpers ───────────────────────────────────────────────────
   const parseMark = (s) => {
@@ -10962,77 +11026,166 @@ function SkillsView() {
     return Number.isInteger(v) ? String(v) : v.toFixed(2).replace(/\.?0+$/,"");
   };
 
-  // ── per-station computed values ────────────────────────────────────
+  // ── per-station stats ──────────────────────────────────────────────
   const stationStats = (s, si) => {
-    const subTopics = s.subTopics && s.subTopics.length ? s.subTopics : null;
+    if (s.isQuestionStation) return { totalActs:0, tickedActs:0, maxMarks:0, earnedMarks:0 };
+    const subTopics = s.subTopics&&s.subTopics.length ? s.subTopics : null;
     if (!subTopics) {
-      // Legacy flat activities
       const acts = s.activities||[];
-      const totalActs = acts.length;
       const tickedActs = acts.filter((_,ai)=>ticked[`${si}-0-${ai}`]||ticked[`${si}-${ai}`]).length;
-      const maxMarks = acts.reduce((sum,a)=>sum+(parseMark(a.mark)||0),0);
-      const earnedMarks = acts.reduce((sum,a,ai)=>{
-        const k=`${si}-0-${ai}`;
-        const kLeg=`${si}-${ai}`;
-        return sum + (ticked[k]||ticked[kLeg] ? (parseMark(a.mark)||0) : 0);
-      },0);
-      return { totalActs, tickedActs, maxMarks, earnedMarks };
+      const maxMarks = acts.reduce((s,a)=>s+(parseMark(a.mark)||0),0);
+      const earnedMarks = acts.reduce((s,a,ai)=>s+(ticked[`${si}-0-${ai}`]||ticked[`${si}-${ai}`]?parseMark(a.mark)||0:0),0);
+      return { totalActs:acts.length, tickedActs, maxMarks, earnedMarks };
     }
     let totalActs=0, tickedActs=0, maxMarks=0, earnedMarks=0;
     subTopics.forEach((st,sti)=>{
       (st.activities||[]).forEach((a,ai)=>{
         totalActs++;
-        const k=`${si}-${sti}-${ai}`;
-        const done=!!ticked[k];
-        if (done) { tickedActs++; earnedMarks += parseMark(a.mark)||0; }
-        maxMarks += parseMark(a.mark)||0;
+        const done=!!ticked[`${si}-${sti}-${ai}`];
+        if (done){ tickedActs++; earnedMarks+=parseMark(a.mark)||0; }
+        maxMarks+=parseMark(a.mark)||0;
       });
     });
     return { totalActs, tickedActs, maxMarks, earnedMarks };
   };
 
-  const toggle = (si, sti, ai) => {
+  const toggle = (si,sti,ai) => {
     const k=`${si}-${sti}-${ai}`;
     const u={...ticked,[k]:!ticked[k]};
     setTicked(u); saveMyData("skills-done","nv-skills-done",u);
   };
 
-  const resetStation = (si, s) => {
+  const resetStation = (si,s) => {
     const u={...ticked};
-    const subTopics = s.subTopics&&s.subTopics.length ? s.subTopics : null;
-    if (subTopics) {
-      subTopics.forEach((st,sti)=>{ (st.activities||[]).forEach((_,ai)=>{ delete u[`${si}-${sti}-${ai}`]; }); });
+    if (s.subTopics&&s.subTopics.length) {
+      s.subTopics.forEach((st,sti)=>{ (st.activities||[]).forEach((_,ai)=>{ delete u[`${si}-${sti}-${ai}`]; }); });
     } else {
       (s.activities||[]).forEach((_,ai)=>{ delete u[`${si}-0-${ai}`]; delete u[`${si}-${ai}`]; });
     }
     setTicked(u); saveMyData("skills-done","nv-skills-done",u);
   };
 
+  const pickAnswer = (si,qi,letter) => {
+    const k=`${si}-${qi}`;
+    const u={...qAnswers,[k]:letter};
+    setQAnswers(u); saveMyData("skills-qans","nv-skills-qans",u);
+  };
+  const revealQ = (si,qi) => setQRevealed(r=>({...r,[`${si}-${qi}`]:true}));
+
   const toggleSection = (si) => setExpanded(e=>({...e,[si]:!e[si]}));
 
-  // search across headings + sub-topic titles + activity text
   const filteredSkills = osceSearch.trim()
     ? skillsDb.filter(s=>{
         const q=osceSearch.trim().toLowerCase();
         if ((s.heading||s.name||"").toLowerCase().includes(q)) return true;
-        return (s.subTopics||[]).some(st=>
-          (st.title||"").toLowerCase().includes(q)||
-          (st.activities||[]).some(a=>(a.text||"").toLowerCase().includes(q))
-        );
+        if (s.isQuestionStation) return (s.questionStation||[]).some(qs=>(qs.q||"").toLowerCase().includes(q));
+        return (s.subTopics||[]).some(st=>(st.title||"").toLowerCase().includes(q)||(st.activities||[]).some(a=>(a.text||"").toLowerCase().includes(q)));
       })
     : skillsDb;
 
-  // global totals
-  const globalStats = skillsDb.reduce((acc,s,si)=>{
+  const globalStats = skillsDb.filter(s=>!s.isQuestionStation).reduce((acc,s,i)=>{
+    const si=skillsDb.indexOf(s);
     const st=stationStats(s,si);
     acc.totalActs+=st.totalActs; acc.tickedActs+=st.tickedActs;
     acc.maxMarks+=st.maxMarks;   acc.earnedMarks+=st.earnedMarks;
     return acc;
   },{totalActs:0,tickedActs:0,maxMarks:0,earnedMarks:0});
 
+  // ── Question station renderer (shared by standalone & embedded) ────
+  const renderQuestionStation = (qs, si, label) => {
+    if (!qs||!qs.length) return null;
+    return (
+      <div style={{marginTop:6}}>
+        {label&&<div style={{fontWeight:800,fontSize:11,color:"var(--text3)",marginBottom:10,
+          textTransform:"uppercase",letterSpacing:.8,paddingTop:10,borderTop:"1px dashed var(--border)"}}>
+          ❓ {label}
+        </div>}
+        {qs.map((q,qi)=>{
+          const k=`${si}-${qi}`;
+          const picked = qAnswers[k];
+          const revealed = !!qRevealed[k];
+          const hasMcq = q.options&&q.options.length>0;
+          const isFill = q.type==="fill"||q.isFill;
+
+          return (
+            <div key={qi} style={{marginBottom:12,background:"var(--bg4)",borderRadius:10,
+              padding:"12px 14px",border:"1px solid var(--border)"}}>
+              {/* Question number + text */}
+              <div style={{fontWeight:700,fontSize:13,marginBottom:hasMcq?10:0,lineHeight:1.6}}>
+                <span style={{color:"var(--accent)",fontWeight:800,marginRight:5}}>{q.qNum||qi+1}.</span>
+                {isFill
+                  ? <span>{q.q.replace(/\.{4,}/,"").trim()}
+                      <span style={{display:"inline-block",minWidth:120,borderBottom:"2px solid var(--accent)",
+                        margin:"0 6px",verticalAlign:"bottom",height:18,background:"transparent"}} />
+                    </span>
+                  : <span>{q.q}</span>
+                }
+              </div>
+
+              {/* MCQ options */}
+              {hasMcq&&(
+                <div style={{display:"flex",flexDirection:"column",gap:6,marginTop:4}}>
+                  {q.options.map((opt,oi)=>{
+                    const isSel = picked===opt.letter;
+                    const isRight = revealed && q.ans===opt.letter;
+                    const isWrong = revealed && isSel && q.ans!==opt.letter;
+                    const noAns = !q.ans; // answer key not provided
+                    return (
+                      <div key={oi}
+                        onClick={()=>!revealed&&pickAnswer(si,qi,opt.letter)}
+                        style={{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",
+                          borderRadius:7,cursor:revealed?"default":"pointer",transition:"all .15s",
+                          background:isRight?"rgba(34,197,94,.12)":isWrong?"rgba(239,68,68,.08)":isSel?"rgba(62,142,149,.1)":"transparent",
+                          border:`1px solid ${isRight?"var(--success)":isWrong?"var(--danger)":isSel?"var(--accent)":"var(--border)"}`}}>
+                        <div style={{width:22,height:22,borderRadius:"50%",flexShrink:0,
+                          display:"flex",alignItems:"center",justifyContent:"center",
+                          fontSize:11,fontWeight:800,
+                          background:isRight?"var(--success)":isWrong?"var(--danger)":isSel?"var(--accent)":"transparent",
+                          color:isRight||isWrong||isSel?"#fff":"var(--text3)",
+                          border:`2px solid ${isRight?"var(--success)":isWrong?"var(--danger)":isSel?"var(--accent)":"var(--border2)"}`}}>
+                          {opt.letter}
+                        </div>
+                        <span style={{fontSize:13,flex:1,
+                          color:isRight?"var(--success)":isWrong?"var(--danger)":"var(--text2)",
+                          fontWeight:isRight?700:400}}>{opt.text}</span>
+                        {isRight&&<span style={{fontSize:11,color:"var(--success)",fontWeight:800,flexShrink:0}}>✓</span>}
+                        {isWrong&&<span style={{fontSize:11,color:"var(--danger)",fontWeight:800,flexShrink:0}}>✗</span>}
+                        {revealed&&noAns&&isSel&&<span style={{fontSize:11,color:"var(--accent)",fontWeight:800,flexShrink:0}}>←</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Fill-in answer box (no options) */}
+              {isFill&&!hasMcq&&(
+                <div style={{marginTop:8,padding:"6px 10px",background:"rgba(62,142,149,.06)",
+                  borderRadius:7,border:"1px dashed rgba(62,142,149,.3)",fontSize:12,
+                  color:"var(--text3)",fontStyle:"italic"}}>
+                  Fill-in-the-blank — write your answer
+                </div>
+              )}
+
+              {/* Reveal / check button */}
+              {hasMcq&&!revealed&&picked&&(
+                <button className="btn btn-sm btn-accent" style={{marginTop:8,fontSize:11,padding:"4px 12px"}}
+                  onClick={()=>q.ans&&revealQ(si,qi)}>
+                  {q.ans?"Check Answer":"Select above"}
+                </button>
+              )}
+              {revealed&&<div style={{marginTop:6,fontSize:11,color:"var(--success)",fontWeight:700}}>
+                ✅ {q.ans?"Answer: "+q.ans:"Your choice recorded"}
+              </div>}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  // ── Main render ────────────────────────────────────────────────────
   return (
     <div>
-      {/* Header row */}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,flexWrap:"wrap",gap:8}}>
         <div className="sec-title" style={{marginBottom:0}}>✅ OSCE Clinical Checklist for RN</div>
         <div style={{display:"flex",gap:6}}>
@@ -11040,23 +11193,23 @@ function SkillsView() {
           <button className="btn btn-sm" onClick={()=>{setExpandAll(false);setExpanded(skillsDb.reduce((o,_,i)=>({...o,[i]:true}),{}));}}>Collapse All</button>
         </div>
       </div>
-      <div className="sec-sub">Tap a station to open its checklist · tick each procedure step to record your score</div>
+      <div className="sec-sub">Tap a station to open its checklist · tick each numbered procedure step to record your score</div>
 
       {/* Search */}
       <div style={{display:"flex",gap:8,marginBottom:14,marginTop:8}}>
         <div style={{position:"relative",flex:1}}>
           <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",fontSize:15,color:"var(--text3)",pointerEvents:"none"}}>🔍</span>
-          <input className="inp" style={{marginBottom:0,paddingLeft:34}} placeholder="Search station or procedure…" value={osceSearch} onChange={e=>setOsceSearch(e.target.value)} />
+          <input className="inp" style={{marginBottom:0,paddingLeft:34}} placeholder="Search station, procedure or question…" value={osceSearch} onChange={e=>setOsceSearch(e.target.value)} />
         </div>
         {osceSearch&&<button className="btn btn-sm" onClick={()=>setOsceSearch("")}>✕ Clear</button>}
       </div>
       {osceSearch&&<div style={{fontSize:11,color:"var(--text3)",marginBottom:10}}>{filteredSkills.length} result{filteredSkills.length!==1?"s":""} for "{osceSearch}"</div>}
 
-      {/* Overall progress card */}
+      {/* Overall progress (procedures only) */}
       <div className="card" style={{marginBottom:16,padding:"12px 16px"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-          <span style={{fontSize:12,color:"var(--text3)",fontWeight:700}}>Overall Progress</span>
-          <div style={{display:"flex",gap:14,alignItems:"center"}}>
+          <span style={{fontSize:12,color:"var(--text3)",fontWeight:700}}>Procedure Progress</span>
+          <div style={{display:"flex",gap:14}}>
             <span style={{fontSize:12,fontWeight:800,color:"var(--accent)"}}>{globalStats.tickedActs}/{globalStats.totalActs} steps</span>
             {globalStats.maxMarks>0&&<span style={{fontSize:12,fontWeight:800,color:"var(--success)"}}>{fmtMark(globalStats.earnedMarks)}/{fmtMark(globalStats.maxMarks)} marks</span>}
           </div>
@@ -11064,7 +11217,9 @@ function SkillsView() {
         <div className="progress-wrap">
           <div className="progress-fill" style={{width:`${globalStats.totalActs>0?(globalStats.tickedActs/globalStats.totalActs)*100:0}%`,background:"linear-gradient(90deg,var(--accent),var(--accent2))"}} />
         </div>
-        <div style={{fontSize:10,color:"var(--text3)",marginTop:4}}>Tick each numbered procedure step — group labels and instructions are not ticked</div>
+        <div style={{fontSize:10,color:"var(--text3)",marginTop:4}}>
+          Only numbered procedure steps have tick boxes · instructions and group labels are for reference only
+        </div>
       </div>
 
       {skillsDb.length===0&&(
@@ -11078,34 +11233,78 @@ function SkillsView() {
         </div>
       )}
 
-      {/* Station cards */}
       {filteredSkills.map((s)=>{
         const si = skillsDb.indexOf(s);
-        const stats = stationStats(s, si);
         const isOpen = expandAll ? expanded[si]!==true : expanded[si]===true;
-        const subTopics = s.subTopics && s.subTopics.length ? s.subTopics : null;
-        const pct = stats.maxMarks>0 ? Math.round((stats.earnedMarks/stats.maxMarks)*100) : (stats.totalActs>0 ? Math.round((stats.tickedActs/stats.totalActs)*100) : 0);
+
+        // ════════════════════════════════════════════════════════════
+        // STANDALONE QUESTION STATION
+        // ════════════════════════════════════════════════════════════
+        if (s.isQuestionStation) {
+          const qs = s.questionStation||[];
+          return (
+            <div key={s.id||si} className="card" style={{marginBottom:14,borderLeft:"4px solid var(--purple,#8b5cf6)"}}>
+              <div style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",padding:"2px 0"}}
+                onClick={()=>toggleSection(si)}>
+                <div style={{width:38,height:38,borderRadius:9,background:"rgba(139,92,246,.12)",display:"flex",
+                  alignItems:"center",justifyContent:"center",fontSize:19,flexShrink:0}}>❓</div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:800,fontSize:14,color:"var(--purple,#8b5cf6)",lineHeight:1.3}}>
+                    QUESTION STATION: {s.heading}
+                  </div>
+                  <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>
+                    {qs.length} question{qs.length!==1?"s":""} ·{" "}
+                    {qs.filter(q=>q.options&&q.options.length).length} MCQ ·{" "}
+                    {qs.filter(q=>q.isFill).length} fill-in-blank
+                  </div>
+                </div>
+                <span style={{fontSize:14,color:"var(--text3)",transition:"transform .2s",display:"inline-block",
+                  transform:isOpen?"rotate(0deg)":"rotate(-90deg)"}}>▾</span>
+              </div>
+
+              {isOpen&&(
+                <div style={{marginTop:14,borderTop:"1px solid var(--border)",paddingTop:14}}>
+                  {renderQuestionStation(qs, si, null)}
+                  <div style={{marginTop:10,display:"flex",justifyContent:"flex-end"}}>
+                    <button className="btn btn-sm" style={{fontSize:11,color:"var(--text3)"}}
+                      onClick={e=>{e.stopPropagation();setQAnswers(qa=>{const u={...qa};qs.forEach((_,qi)=>{delete u[`${si}-${qi}`];});return u;});setQRevealed(r=>{const u={...r};qs.forEach((_,qi)=>{delete u[`${si}-${qi}`];});return u;});}}>
+                      🔄 Reset answers
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        }
+
+        // ════════════════════════════════════════════════════════════
+        // PROCEDURE STATION
+        // ════════════════════════════════════════════════════════════
+        const stats = stationStats(s, si);
+        const subTopics = s.subTopics&&s.subTopics.length ? s.subTopics : null;
+        const pct = stats.maxMarks>0 ? Math.round((stats.earnedMarks/stats.maxMarks)*100) : (stats.totalActs>0?Math.round((stats.tickedActs/stats.totalActs)*100):0);
         const allDone = stats.totalActs>0 && stats.tickedActs===stats.totalActs;
 
         return (
           <div key={s.id||si} className="card" style={{marginBottom:14,borderLeft:"4px solid var(--accent)"}}>
-
-            {/* ── Station heading row (no tick box) ── */}
+            {/* Station heading */}
             <div style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",padding:"2px 0"}}
               onClick={()=>toggleSection(si)}>
-              <div style={{width:38,height:38,borderRadius:9,background:"rgba(62,142,149,.12)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:19,flexShrink:0}}>🩺</div>
+              <div style={{width:38,height:38,borderRadius:9,background:"rgba(62,142,149,.12)",display:"flex",
+                alignItems:"center",justifyContent:"center",fontSize:19,flexShrink:0}}>🩺</div>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontWeight:800,fontSize:14,color:"var(--accent)",lineHeight:1.3}}>
                   PROCEDURE STATION: {s.heading||s.name}
                 </div>
                 <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>
                   {stats.tickedActs}/{stats.totalActs} steps ticked
-                  {stats.maxMarks>0&&<span style={{marginLeft:8,color:pct>=70?"var(--success)":pct>=50?"var(--warn)":"var(--text3)",fontWeight:700}}>
+                  {stats.maxMarks>0&&<span style={{marginLeft:8,fontWeight:700,
+                    color:pct>=70?"var(--success)":pct>=50?"var(--warn)":"var(--text3)"}}>
                     · {fmtMark(stats.earnedMarks)}/{fmtMark(stats.maxMarks)} marks ({pct}%)
                   </span>}
                   {subTopics&&<span style={{marginLeft:8}}>· {subTopics.length} topic{subTopics.length!==1?"s":""}</span>}
+                  {(s.questionStation||[]).length>0&&<span style={{marginLeft:8}}>· {s.questionStation.length} Q</span>}
                 </div>
-                {/* Mini progress bar */}
                 {stats.totalActs>0&&(
                   <div style={{marginTop:5,height:4,background:"var(--bg4)",borderRadius:4,overflow:"hidden"}}>
                     <div style={{height:"100%",borderRadius:4,transition:"width .3s",
@@ -11115,21 +11314,21 @@ function SkillsView() {
                 )}
               </div>
               <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
-                {allDone&&<span style={{fontSize:11,fontWeight:700,color:"var(--success)"}}>✅ Done</span>}
-                <span style={{fontSize:14,color:"var(--text3)",transition:"transform .2s",display:"inline-block",transform:isOpen?"rotate(0deg)":"rotate(-90deg)"}}>▾</span>
+                {allDone&&<span style={{fontSize:11,fontWeight:700,color:"var(--success)"}}>✅</span>}
+                <span style={{fontSize:14,color:"var(--text3)",transition:"transform .2s",display:"inline-block",
+                  transform:isOpen?"rotate(0deg)":"rotate(-90deg)"}}>▾</span>
               </div>
             </div>
 
-            {/* ── Expanded body ── */}
             {isOpen&&(
               <div style={{marginTop:14,borderTop:"1px solid var(--border)",paddingTop:14}}>
 
-                {/* Instructions — no tick boxes */}
+                {/* Instructions — read only, no tick */}
                 {(s.instructions||[]).length>0&&(
-                  <div style={{marginBottom:16,background:"rgba(62,142,149,.06)",borderRadius:10,padding:"10px 14px",border:"1px solid rgba(62,142,149,.2)"}}>
-                    <div style={{fontWeight:800,fontSize:11,color:"var(--accent)",marginBottom:8,textTransform:"uppercase",letterSpacing:.8}}>
-                      📋 Instruction to Candidate
-                    </div>
+                  <div style={{marginBottom:16,background:"rgba(62,142,149,.06)",borderRadius:10,
+                    padding:"10px 14px",border:"1px solid rgba(62,142,149,.2)"}}>
+                    <div style={{fontWeight:800,fontSize:11,color:"var(--accent)",marginBottom:8,
+                      textTransform:"uppercase",letterSpacing:.8}}>📋 Instruction to Candidate</div>
                     {(s.instructions||[]).map((ins,ii)=>(
                       <div key={ii} style={{display:"flex",gap:8,alignItems:"flex-start",fontSize:13,marginBottom:5,lineHeight:1.55}}>
                         <span style={{color:"var(--accent)",flexShrink:0,marginTop:1}}>➤</span>
@@ -11142,71 +11341,64 @@ function SkillsView() {
                 {/* Sub-topics */}
                 {subTopics ? subTopics.map((st,sti)=>{
                   const stActs = st.activities||[];
+                  const stMax = st.totalMarksNum || stActs.reduce((s,a)=>s+(parseMark(a.mark)||0),0);
+                  const stEarned = stActs.reduce((s,a,ai)=>s+(ticked[`${si}-${sti}-${ai}`]?parseMark(a.mark)||0:0),0);
                   const stTicked = stActs.filter((_,ai)=>ticked[`${si}-${sti}-${ai}`]).length;
-                  const stMax = st.totalMarksNum || stActs.reduce((sum,a)=>sum+(parseMark(a.mark)||0),0);
-                  const stEarned = stActs.reduce((sum,a,ai)=>sum+(ticked[`${si}-${sti}-${ai}`]?parseMark(a.mark)||0:0),0);
                   let lastGroup = null;
-
                   return (
                     <div key={sti} style={{marginBottom:18}}>
-                      {/* Sub-topic title — no tick box */}
+                      {/* Sub-topic title — no tick */}
                       {st.title&&(
                         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
-                          background:"var(--accent)",borderRadius:8,padding:"8px 12px",marginBottom:10}}>
-                          <div style={{fontWeight:800,fontSize:13,color:"#fff",letterSpacing:.3}}>
-                            {st.title}
-                          </div>
-                          <div style={{fontSize:11,color:"rgba(255,255,255,.85)",fontWeight:700,whiteSpace:"nowrap",marginLeft:8}}>
-                            {fmtMark(stEarned)}/{fmtMark(stMax)} marks
+                          background:"var(--accent)",borderRadius:8,padding:"8px 14px",marginBottom:10}}>
+                          <div style={{fontWeight:800,fontSize:13,color:"#fff"}}>{st.title}</div>
+                          <div style={{fontSize:11,color:"rgba(255,255,255,.85)",fontWeight:700,
+                            whiteSpace:"nowrap",marginLeft:8}}>
+                            {fmtMark(stEarned)}/{fmtMark(stMax)} marks · {stTicked}/{stActs.length} steps
                           </div>
                         </div>
                       )}
-
-                      {/* Activities with group labels */}
+                      {/* Activities */}
                       {stActs.map((act,ai)=>{
                         const k=`${si}-${sti}-${ai}`;
                         const done=!!ticked[k];
-                        const showGroup = act.group && act.group !== lastGroup;
-                        if (showGroup) lastGroup = act.group;
-
+                        const showGroup = act.group && act.group!==lastGroup;
+                        if (showGroup) lastGroup=act.group;
                         return (
                           <React.Fragment key={ai}>
                             {/* Group label — no tick box */}
                             {showGroup&&(
-                              <div style={{fontSize:11,fontWeight:800,color:"var(--text3)",textTransform:"uppercase",
-                                letterSpacing:.8,padding:"6px 4px 4px",marginTop:ai>0?8:0,
+                              <div style={{fontSize:11,fontWeight:800,color:"var(--text3)",
+                                textTransform:"uppercase",letterSpacing:.8,
+                                padding:"6px 4px 4px",marginTop:ai>0?8:0,
                                 borderBottom:"1px solid var(--border)",marginBottom:4}}>
                                 {act.group}
                               </div>
                             )}
-                            {/* Numbered procedure step — HAS tick box */}
+                            {/* Numbered step — HAS tick box */}
                             <div onClick={()=>toggle(si,sti,ai)}
                               style={{display:"flex",alignItems:"flex-start",gap:10,padding:"8px 10px",
                                 borderRadius:8,cursor:"pointer",marginBottom:3,transition:"all .15s",
                                 background:done?"rgba(62,142,149,.08)":"transparent",
                                 border:`1px solid ${done?"rgba(62,142,149,.3)":"transparent"}`}}>
-                              {/* Tick checkbox */}
                               <div style={{width:22,height:22,borderRadius:6,flexShrink:0,marginTop:1,
                                 border:`2px solid ${done?"var(--accent)":"var(--border2)"}`,
                                 background:done?"var(--accent)":"transparent",
                                 display:"flex",alignItems:"center",justifyContent:"center",transition:"all .2s"}}>
                                 {done&&<span style={{color:"#fff",fontSize:11,fontWeight:900}}>✓</span>}
                               </div>
-                              {/* Step text */}
                               <div style={{flex:1,lineHeight:1.5}}>
                                 <span style={{fontSize:13,fontWeight:done?700:400,
-                                  color:done?"var(--text)":"var(--text2)",
-                                  textDecoration:done?"none":"none"}}>
+                                  color:done?"var(--text)":"var(--text2)"}}>
                                   <span style={{color:"var(--accent)",fontWeight:800}}>{act.num}.</span> {act.text}
                                 </span>
                               </div>
-                              {/* Mark badge */}
                               {act.mark&&(
-                                <div style={{flexShrink:0,fontSize:11,fontWeight:800,
+                                <div style={{flexShrink:0,fontSize:11,fontWeight:800,whiteSpace:"nowrap",
                                   color:done?"var(--accent)":"var(--text3)",
                                   background:done?"rgba(62,142,149,.15)":"var(--bg4)",
                                   border:`1px solid ${done?"rgba(62,142,149,.4)":"var(--border)"}`,
-                                  borderRadius:5,padding:"2px 7px",transition:"all .2s",whiteSpace:"nowrap"}}>
+                                  borderRadius:5,padding:"2px 7px",transition:"all .2s"}}>
                                   {act.mark}
                                 </div>
                               )}
@@ -11214,8 +11406,7 @@ function SkillsView() {
                           </React.Fragment>
                         );
                       })}
-
-                      {/* Sub-topic total marks */}
+                      {/* Sub-topic total */}
                       {st.totalMarks&&(
                         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
                           marginTop:8,padding:"6px 10px",background:"var(--bg4)",borderRadius:7,
@@ -11229,12 +11420,11 @@ function SkillsView() {
                     </div>
                   );
                 }) : (
-                  /* Legacy flat activities (no sub-topics) */
+                  /* Legacy flat activities */
                   <div>
                     {(s.activities||[]).map((act,ai)=>{
-                      const k=`${si}-0-${ai}`;
-                      const kLeg=`${si}-${ai}`;
-                      const done=!!(ticked[k]||ticked[kLeg]);
+                      const k=`${si}-0-${ai}`; const kL=`${si}-${ai}`;
+                      const done=!!(ticked[k]||ticked[kL]);
                       return (
                         <div key={ai} onClick={()=>toggle(si,0,ai)}
                           style={{display:"flex",alignItems:"flex-start",gap:10,padding:"8px 10px",
@@ -11253,7 +11443,7 @@ function SkillsView() {
                             </span>
                           </div>
                           {act.mark&&(
-                            <div style={{flexShrink:0,fontSize:11,fontWeight:800,
+                            <div style={{flexShrink:0,fontSize:11,fontWeight:800,whiteSpace:"nowrap",
                               color:done?"var(--accent)":"var(--text3)",
                               background:done?"rgba(62,142,149,.15)":"var(--bg4)",
                               border:`1px solid ${done?"rgba(62,142,149,.4)":"var(--border)"}`,
@@ -11273,7 +11463,11 @@ function SkillsView() {
                   </div>
                 )}
 
-                {/* Reset button */}
+                {/* Embedded question station */}
+                {(s.questionStation||[]).length>0&&
+                  renderQuestionStation(s.questionStation, si, "Question Station")}
+
+                {/* Reset */}
                 <div style={{marginTop:10,display:"flex",justifyContent:"flex-end"}}>
                   <button className="btn btn-sm" style={{fontSize:11,color:"var(--text3)"}}
                     onClick={e=>{e.stopPropagation();resetStation(si,s);}}>
