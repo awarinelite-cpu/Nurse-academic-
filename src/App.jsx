@@ -1698,7 +1698,7 @@ function AdminPanel({ toast, currentUser }) {
         {TABS.map(t=><div key={t.key} className={`admin-tab${tab===t.key?" active":""}`} onClick={()=>setTab(t.key)}>{t.label}</div>)}
       </div>
       {tab==="overview" && <AdminOverview toast={toast} />}
-      {tab==="users" && <AdminUsers toast={toast} />}
+      {tab==="users" && <AdminUsers toast={toast} currentUser={currentUser} />}
       {tab==="classes" && <AdminClasses toast={toast} />}
       {tab==="drugs" && <AdminDrugs toast={toast} />}
       {tab==="labs" && <AdminLabs toast={toast} />}
@@ -1804,7 +1804,7 @@ function AdminOverview({ toast }) {
 }
 
 // ── Admin Users ──────────────────────────────────────────────────────
-function AdminUsers({ toast }) {
+function AdminUsers({ toast, currentUser }) {
   const [users, setUsers] = useSharedData("nv-users", []);
   const [edit, setEdit] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
@@ -1814,9 +1814,18 @@ function AdminUsers({ toast }) {
   const [showPw, setShowPw] = useState({});
   const [viewUser, setViewUser] = useState(null);
 
+  // Determine if logged-in admin is super-admin or sub-admin
+  const me = users.find(u => u.username === currentUser);
+  const isSuperAdmin = me?.role === "admin";
+  const isSubAdmin   = me?.role === "sub-admin";
+  // A "protected" account is any super-admin — sub-admin cannot touch these
+  const isProtected = (u) => u?.role === "admin";
+
   const save = () => {
     if (!form.username||!form.password) return toast("Email & password required","error");
     if (!edit && users.find(u=>u.username===form.username)) return toast("Email already registered","error");
+    if (isSubAdmin && form.role === "admin") return toast("You cannot assign the Admin role","error");
+    if (isSubAdmin && edit && isProtected(users.find(u=>u.username===edit))) return toast("You cannot edit a Super Admin account","error");
     let u;
     const entry = {...form, displayName: form.displayName||form.username.split("@")[0]};
     if (edit) { u = users.map(x=>x.username===edit?{...x,...entry}:x); toast("User profile updated ✅","success"); }
@@ -1827,13 +1836,15 @@ function AdminUsers({ toast }) {
 
   const del = (username) => {
     if (username==="admin@gmail.com") return toast("Cannot delete the main admin account","error");
+    const target = users.find(u=>u.username===username);
+    if (isSubAdmin && isProtected(target)) return toast("You cannot delete a Super Admin account","error");
     if (!confirm(`Permanently delete "${username}"? This cannot be undone.`)) return;
     const u = users.filter(x=>x.username!==username);
     setUsers(u); saveShared("users",u); toast("User deleted","success");
     if (viewUser?.username===username) setViewUser(null);
   };
 
-  const roleColor = (r) => r==="admin"?"tag-purple":r==="lecturer"?"tag-warn":"tag-accent";
+  const roleColor = (r) => r==="admin"||r==="sub-admin"?"tag-purple":r==="lecturer"?"tag-warn":"tag-accent";
   const filtered = users.filter(u=>
     u.username.toLowerCase().includes(search.toLowerCase()) ||
     (u.displayName||"").toLowerCase().includes(search.toLowerCase())
@@ -1856,43 +1867,50 @@ function AdminUsers({ toast }) {
       </div>
 
       <div style={{display:"flex",flexDirection:"column",gap:8}}>
-        {filtered.map(u=>(
-          <div key={u.username} className="card" style={{padding:"12px 16px",borderLeft:`3px solid ${u.role==="admin"?"var(--purple)":u.role==="lecturer"?"var(--warn)":"var(--accent)"}`}}>
-            <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
-              <div className="user-av" style={{flexShrink:0}}>{(u.displayName||u.username)[0].toUpperCase()}</div>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{fontWeight:700,fontSize:14,marginBottom:2}}>{u.displayName||u.username.split("@")[0]}</div>
-                <div style={{fontSize:12,color:"var(--text3)",marginBottom:3}}>📧 {u.username}</div>
-                <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
-                  <span className={`tag ${roleColor(u.role||"student")}`}>{u.role||"student"}</span>
-                  {u.class&&<span style={{fontSize:11,color:"var(--accent2)"}}>🏫 {classes.find(c=>c.id===u.class)?.label||u.class}</span>}
-                  {u.isPublicHealth&&<span style={{fontSize:11,background:"rgba(46,125,50,.15)",color:"#2e7d32",borderRadius:8,padding:"1px 7px",fontWeight:700}}>🌍 PHN</span>}
-                  <span style={{fontSize:11,color:"var(--text3)"}}>📅 {u.joined||"—"}</span>
+        {filtered.map(u=>{
+          const protected_ = isProtected(u);
+          const canAct = isSuperAdmin || !protected_;
+          return (
+            <div key={u.username} className="card" style={{padding:"12px 16px",borderLeft:`3px solid ${u.role==="admin"||u.role==="sub-admin"?"var(--purple)":u.role==="lecturer"?"var(--warn)":"var(--accent)"}`}}>
+              <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+                <div className="user-av" style={{flexShrink:0}}>{(u.displayName||u.username)[0].toUpperCase()}</div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:700,fontSize:14,marginBottom:2}}>{u.displayName||u.username.split("@")[0]}</div>
+                  <div style={{fontSize:12,color:"var(--text3)",marginBottom:3}}>
+                    📧 {isSubAdmin && protected_ ? "🔒 Hidden" : u.username}
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                    <span className={`tag ${roleColor(u.role||"student")}`}>{u.role||"student"}</span>
+                    {u.class&&<span style={{fontSize:11,color:"var(--accent2)"}}>🏫 {classes.find(c=>c.id===u.class)?.label||u.class}</span>}
+                    {u.isPublicHealth&&<span style={{fontSize:11,background:"rgba(46,125,50,.15)",color:"#2e7d32",borderRadius:8,padding:"1px 7px",fontWeight:700}}>🌍 PHN</span>}
+                    <span style={{fontSize:11,color:"var(--text3)"}}>📅 {u.joined||"—"}</span>
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:6,flexShrink:0}}>
+                  {canAct && <button className="btn btn-sm btn-accent" onClick={()=>setViewUser(u)}>👁 View</button>}
+                  {canAct && <button className="btn btn-sm" onClick={()=>{
+                    setEdit(u.username);
+                    setForm({username:u.username,password:u.password,role:u.role||"student",class:u.class||"",displayName:u.displayName||"",matricNumber:u.matricNumber||"",isPublicHealth:!!u.isPublicHealth});
+                    setShowAdd(true);
+                  }}>✏️ Edit</button>}
+                  {canAct && <button
+                    className="btn btn-sm"
+                    title={u.isPublicHealth ? "Remove PHN status" : "Mark as Public Health Nursing student"}
+                    style={{background:u.isPublicHealth?"rgba(46,125,50,.15)":"transparent",color:"#2e7d32",border:"1px solid #2e7d32",fontWeight:700}}
+                    onClick={()=>{
+                      const updated = users.map(x=>x.username===u.username?{...x,isPublicHealth:!x.isPublicHealth,class:!x.isPublicHealth?"publichealth":(x.class==="publichealth"?"":x.class)}:x);
+                      setUsers(updated); saveShared("users",updated);
+                      toast(u.isPublicHealth?"PHN status removed":"✅ Marked as PHN student","success");
+                    }}>
+                    {u.isPublicHealth?"🌍 Un-PHN":"🌍 PHN"}
+                  </button>}
+                  {canAct && <button className="btn btn-sm btn-danger" onClick={()=>del(u.username)}>🗑️</button>}
+                  {!canAct && <span style={{fontSize:11,color:"var(--text3)",fontStyle:"italic",padding:"4px 8px"}}>🔒 Protected</span>}
                 </div>
               </div>
-              <div style={{display:"flex",gap:6,flexShrink:0}}>
-                <button className="btn btn-sm btn-accent" onClick={()=>setViewUser(u)}>👁 View</button>
-                <button className="btn btn-sm" onClick={()=>{
-                  setEdit(u.username);
-                  setForm({username:u.username,password:u.password,role:u.role||"student",class:u.class||"",displayName:u.displayName||"",matricNumber:u.matricNumber||"",isPublicHealth:!!u.isPublicHealth});
-                  setShowAdd(true);
-                }}>✏️ Edit</button>
-                <button
-                  className="btn btn-sm"
-                  title={u.isPublicHealth ? "Remove PHN status" : "Mark as Public Health Nursing student"}
-                  style={{background:u.isPublicHealth?"rgba(46,125,50,.15)":"transparent",color:"#2e7d32",border:"1px solid #2e7d32",fontWeight:700}}
-                  onClick={()=>{
-                    const updated = users.map(x=>x.username===u.username?{...x,isPublicHealth:!x.isPublicHealth,class:!x.isPublicHealth?"publichealth":(x.class==="publichealth"?"":x.class)}:x);
-                    setUsers(updated); saveShared("users",updated);
-                    toast(u.isPublicHealth?"PHN status removed":"✅ Marked as PHN student","success");
-                  }}>
-                  {u.isPublicHealth?"🌍 Un-PHN":"🌍 PHN"}
-                </button>
-                <button className="btn btn-sm btn-danger" onClick={()=>del(u.username)}>🗑️</button>
-              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
         {filtered.length===0&&<div style={{textAlign:"center",padding:"40px",color:"var(--text3)",fontSize:13}}>No users found.</div>}
       </div>
 
@@ -1911,8 +1929,9 @@ function AdminUsers({ toast }) {
             </div>
             <div style={{background:"var(--bg4)",borderRadius:10,padding:"12px 14px",display:"flex",flexDirection:"column",gap:10}}>
               {[
-                {lbl:"📧 Email / Username", val: viewUser.username},
-                {lbl:"🔑 Password", val: showPw[viewUser.username] ? viewUser.password : "••••••••", action: ()=>setShowPw(p=>({...p,[viewUser.username]:!p[viewUser.username]})), actionLabel: showPw[viewUser.username]?"🙈 Hide":"👁 Show"},
+                {lbl:"📧 Email / Username", val: isSubAdmin && isProtected(viewUser) ? "🔒 Hidden" : viewUser.username},
+                {lbl:"🔑 Password", val: (isSuperAdmin && showPw[viewUser.username]) ? viewUser.password : "🔒 Hidden",
+                  ...(isSuperAdmin ? {action:()=>setShowPw(p=>({...p,[viewUser.username]:!p[viewUser.username]})), actionLabel:showPw[viewUser.username]?"🙈 Hide":"👁 Show"} : {})},
                 {lbl:"👤 Display Name", val: viewUser.displayName||viewUser.username.split("@")[0]},
                 {lbl:"🎓 Matric No.", val: viewUser.matricNumber||"—"},
                 {lbl:"🏫 Class", val: classes.find(c=>c.id===viewUser.class)?.label||"No class assigned"},
@@ -1929,12 +1948,14 @@ function AdminUsers({ toast }) {
               ))}
             </div>
             <div style={{display:"flex",gap:8,marginTop:14}}>
-              <button className="btn btn-accent" style={{flex:1}} onClick={()=>{
-                setEdit(viewUser.username);
-                setForm({username:viewUser.username,password:viewUser.password,role:viewUser.role||"student",class:viewUser.class||"",displayName:viewUser.displayName||"",matricNumber:viewUser.matricNumber||"",isPublicHealth:!!viewUser.isPublicHealth});
-                setShowAdd(true); setViewUser(null);
-              }}>✏️ Edit Profile</button>
-              <button className="btn btn-danger" onClick={()=>del(viewUser.username)}>🗑️ Delete</button>
+              {(isSuperAdmin || !isProtected(viewUser)) && <>
+                <button className="btn btn-accent" style={{flex:1}} onClick={()=>{
+                  setEdit(viewUser.username);
+                  setForm({username:viewUser.username,password:viewUser.password,role:viewUser.role||"student",class:viewUser.class||"",displayName:viewUser.displayName||"",matricNumber:viewUser.matricNumber||"",isPublicHealth:!!viewUser.isPublicHealth});
+                  setShowAdd(true); setViewUser(null);
+                }}>✏️ Edit Profile</button>
+                <button className="btn btn-danger" onClick={()=>del(viewUser.username)}>🗑️ Delete</button>
+              </>}
               <button className="btn" onClick={()=>setViewUser(null)}>Close</button>
             </div>
           </div>
@@ -1964,44 +1985,9 @@ function AdminUsers({ toast }) {
             <select className="inp" value={form.role} onChange={e=>setForm({...form,role:e.target.value})}>
               <option value="student">Student</option>
               <option value="lecturer">Lecturer</option>
-              <option value="admin">Admin</option>
+              <option value="sub-admin">Sub Admin</option>
+              {isSuperAdmin && <option value="admin">Admin</option>}
             </select>
-            <label className="lbl">🏫 Class</label>
-            <select className="inp" value={form.class} onChange={e=>setForm({...form,class:e.target.value})}>
-              <option value="">— No class —</option>
-              {classes.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
-            </select>
-            {/* ── PHN toggle for admin ── */}
-            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(46,125,50,.07)",border:"1.5px solid #2e7d32",borderRadius:10,padding:"10px 14px",marginBottom:4}}>
-              <div>
-                <div style={{fontWeight:700,fontSize:13,color:"#2e7d32"}}>🌍 Public Health Nursing Student</div>
-                <div style={{fontSize:11,color:"var(--text3)"}}>Auto-assigns to PHN Forum & sets class to Public Health</div>
-              </div>
-              <button
-                type="button"
-                onClick={()=>setForm(f=>({...f,isPublicHealth:!f.isPublicHealth,class:!f.isPublicHealth?"publichealth":(f.class==="publichealth"?"":f.class)}))}
-                style={{
-                  width:44,height:24,borderRadius:12,border:"none",cursor:"pointer",transition:"all .25s",flexShrink:0,
-                  background:form.isPublicHealth?"#2e7d32":"var(--border2)",position:"relative",
-                }}>
-                <span style={{
-                  position:"absolute",top:2,left:form.isPublicHealth?22:2,width:20,height:20,
-                  borderRadius:"50%",background:"white",transition:"left .25s",boxShadow:"0 1px 4px rgba(0,0,0,.25)"
-                }}/>
-              </button>
-            </div>
-            <div style={{display:"flex",gap:8}}>
-              <button className="btn btn-purple" style={{flex:1}} onClick={save}>💾 Save</button>
-              <button className="btn" onClick={()=>setShowAdd(false)}>Cancel</button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Admin Classes ────────────────────────────────────────────────────
 function AdminClasses({ toast }) {
   const [classes, setClasses] = useSharedData("nv-classes", DEFAULT_CLASSES);
   const [edit, setEdit] = useState(null);
@@ -19197,12 +19183,12 @@ self.addEventListener('notificationclick', e => {
     const localUser = localUsers.find(u => u.username === username && u.password === password);
     if (localUser) {
       // Instant login from cache
-      if (loginType === "admin" && localUser.role !== "admin") return toast("Not an admin account", "error");
+      if (loginType === "admin" && localUser.role !== "admin" && localUser.role !== "sub-admin") return toast("Not an admin account", "error");
     window.__currentUser = localUser.username;
       setCurrentUserRef(username); setCurrentUser(username);
-      setIsAdmin(localUser.role === "admin"); setIsLecturer(localUser.role === "lecturer");
+      setIsAdmin(localUser.role === "admin" || localUser.role === "sub-admin"); setIsLecturer(localUser.role === "lecturer");
       setPage("app");
-      lsSet("nv-session-user",username); lsSet("nv-session-page","app"); lsSet("nv-session-admin",localUser.role==="admin"); lsSet("nv-session-lecturer",localUser.role==="lecturer");
+      lsSet("nv-session-user",username); lsSet("nv-session-page","app"); lsSet("nv-session-admin",localUser.role==="admin"||localUser.role==="sub-admin"); lsSet("nv-session-lecturer",localUser.role==="lecturer");
       toast(`Welcome back! 👋`, "success");
       // Auto-mark admin/lecturer as research club member in localStorage for badge display
       if (localUser.role === "admin" || localUser.role === "lecturer") {
@@ -19229,11 +19215,11 @@ self.addEventListener('notificationclick', e => {
       ]);
       const remoteUser = (fresh||[]).find(u => u.username === username && u.password === password);
       if (!remoteUser) return toast("Invalid email or password", "error");
-      if (loginType === "admin" && remoteUser.role !== "admin") return toast("Not an admin account", "error");
+      if (loginType === "admin" && remoteUser.role !== "admin" && remoteUser.role !== "sub-admin") return toast("Not an admin account", "error");
       setCurrentUserRef(username); setCurrentUser(username);
-      setIsAdmin(remoteUser.role === "admin"); setIsLecturer(remoteUser.role === "lecturer");
+      setIsAdmin(remoteUser.role === "admin" || remoteUser.role === "sub-admin"); setIsLecturer(remoteUser.role === "lecturer");
       setPage("app");
-      lsSet("nv-session-user",username); lsSet("nv-session-page","app"); lsSet("nv-session-admin",remoteUser.role==="admin"); lsSet("nv-session-lecturer",remoteUser.role==="lecturer");
+      lsSet("nv-session-user",username); lsSet("nv-session-page","app"); lsSet("nv-session-admin",remoteUser.role==="admin"||remoteUser.role==="sub-admin"); lsSet("nv-session-lecturer",remoteUser.role==="lecturer");
       toast(`Welcome back! 👋`, "success");
       if (remoteUser.role === "admin" || remoteUser.role === "lecturer") {
         try { localStorage.setItem("rc-member-"+username.replace(/[^a-z0-9]/gi,"_"), "1"); } catch{}
