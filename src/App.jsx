@@ -2641,6 +2641,168 @@ function AdminPQ({ toast }) {
   );
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// Universal OSCE Checklist Parser
+// Recognises: "PROCEDURE STATION:", numbered/ALL-CAPS headings, blank-line blocks
+// Parses: instructions, activities with marks (½ ¼ fractions), question stations
+// ══════════════════════════════════════════════════════════════════════
+const parseOsceText = (rawText, answersRaw = "") => {
+  if (!rawText.trim()) return [];
+
+  const parseMark = (s) => {
+    if (!s) return 0;
+    const t = (s+"").trim().replace(/mark[s]?/gi,"").trim();
+    if (t==="½"||t==="1/2") return 0.5;
+    if (t==="¼"||t==="1/4") return 0.25;
+    if (t==="¾"||t==="3/4") return 0.75;
+    const fr = t.match(/^(\d+)\s*\/\s*(\d+)$/);
+    if (fr) return parseInt(fr[1])/parseInt(fr[2]);
+    const n = parseFloat(t); return isNaN(n)?0:n;
+  };
+
+  const parseAnswers = (raw) => {
+    if (!raw) return [];
+    return raw.split("\n").map(l=>l.trim()).filter(Boolean).map(l => {
+      const m = l.match(/^(?:\d+[.)\s]+)?([A-Da-d])[.)\s]*/);
+      return m ? m[1].toUpperCase() : l.replace(/^\d+[.)\s]*/,"").trim();
+    });
+  };
+  const answerKey = parseAnswers(answersRaw);
+  let globalQIdx = 0;
+
+  // ── Split into station blocks ──────────────────────────────────────
+  let blocks = [];
+  // Strategy 1: explicit PROCEDURE STATION: header
+  const explicitSplit = rawText.split(/(?=^PROCEDURE\s+STATION[\s:]+)/mi).map(b=>b.trim()).filter(Boolean);
+  if (explicitSplit.length > 1) {
+    blocks = explicitSplit;
+  } else {
+    // Strategy 2: triple blank lines
+    const blankSplit = rawText.split(/\n{3,}/).map(b=>b.trim()).filter(Boolean);
+    if (blankSplit.length > 1) {
+      blocks = blankSplit;
+    } else {
+      // Strategy 3: detect ALL-CAPS station titles or "STATION N:"
+      const lines = rawText.split("\n");
+      const splitPoints = [];
+      for (let i = 0; i < lines.length; i++) {
+        const l = lines[i].trim();
+        if (!l) continue;
+        const isHdr =
+          /^STATION\s*\d+/i.test(l) ||
+          /^\d+[.):\-]\s+[A-Z][A-Z\s]{5,}$/.test(l) ||
+          (/^[A-Z][A-Z\s,\/\-]{8,}$/.test(l) && !/^INSTRUCTION|^ACTIVITIES|^QUESTION|^TOTAL/i.test(l) && l.length < 90);
+        if (isHdr) splitPoints.push(i);
+      }
+      if (splitPoints.length > 1) {
+        blocks = splitPoints.map((start, idx) => {
+          const end = splitPoints[idx+1] ?? lines.length;
+          return lines.slice(start, end).join("\n").trim();
+        }).filter(Boolean);
+      } else {
+        blocks = [rawText];
+      }
+    }
+  }
+
+  // ── Parse one block ────────────────────────────────────────────────
+  const parseBlock = (block) => {
+    const lines = block.split("\n").map(l => l.trim());
+    let heading = "", instructions = [], activities = [], questionStation = [], totalMarks = "", totalMarksNum = 0;
+    let mode = "heading";
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line) continue;
+
+      if (/^INSTRUCTION(S)?\s+TO\s+CANDIDATE/i.test(line)) { mode = "instructions"; continue; }
+      if (/^ACTIVITIES\s*$/i.test(line) || /^ACTIVITIES\s*\(/i.test(line)) { mode = "activities"; continue; }
+      if (/^QUESTION\s+STATION/i.test(line)) { mode = "questions"; continue; }
+      if (/^Total\s+Marks/i.test(line)) {
+        totalMarks = line;
+        const tm = line.match(/([\d.]+(?:\/[\d.]+)?)/);
+        if (tm) totalMarksNum = parseMark(tm[1]);
+        mode = "done"; continue;
+      }
+
+      if (/^PROCEDURE\s+STATION[\s:]*/i.test(line)) {
+        heading = line.replace(/^PROCEDURE\s+STATION[\s:]*/i, "").trim();
+        mode = "heading_seen"; continue;
+      }
+      if (/^STATION\s*\d+\s*[:.\-]?\s*/i.test(line)) {
+        heading = line.replace(/^STATION\s*\d+\s*[:.\-]?\s*/i, "").trim() || line.trim();
+        mode = "heading_seen"; continue;
+      }
+      if (mode === "heading" || mode === "heading_seen") {
+        if (!heading) { heading = line.replace(/^(?:Title|PROCEDURE STATION)[\s:]*/i,"").replace(/^\d+[.):\-]\s*/,"").trim(); mode = "heading_seen"; continue; }
+        if (mode === "heading_seen" && !/^(?:INSTRUCTION|ACTIVIT|QUESTION|TOTAL)/i.test(line)) { heading += " " + line; continue; }
+      }
+
+      if (mode === "instructions") {
+        const clean = line.replace(/^[➤►>•\-*]\s*/,"").trim();
+        if (clean) instructions.push(clean);
+        continue;
+      }
+
+      if (mode === "activities") {
+        const actM = line.match(/^(\d+[a-z]?)[.)]\s+(.+)$/i);
+        const subM = line.match(/^([a-z])[.)]\s+(.+)$/i);
+        const bulletM = !actM && !subM && /^[➤►>•\-*]\s+/.test(line);
+        if (actM) {
+          const raw = actM[2].trim();
+          const mm = raw.match(/\(([½¼¾\d.\/\s]+\s*marks?)\)\s*$/i);
+          const text = mm ? raw.replace(mm[0],"").trim() : raw;
+          activities.push({ num: actM[1], text, mark: mm?mm[1]:"", markVal: parseMark(mm?mm[1]:""), subItems: [] });
+        } else if (subM && activities.length > 0) {
+          const raw = subM[2].trim();
+          const mm = raw.match(/\(([½¼¾\d.\/\s]+\s*marks?)\)\s*$/i);
+          const text = mm ? raw.replace(mm[0],"").trim() : raw;
+          const parent = activities[activities.length-1];
+          if (!parent.subItems) parent.subItems = [];
+          parent.subItems.push({ letter: subM[1], text, mark: mm?mm[1]:"", markVal: parseMark(mm?mm[1]:"") });
+        } else if (bulletM) {
+          const raw = line.replace(/^[➤►>•\-*]\s*/,"").trim();
+          const mm = raw.match(/\(([½¼¾\d.\/\s]+\s*marks?)\)\s*$/i);
+          const text = mm ? raw.replace(mm[0],"").trim() : raw;
+          activities.push({ num: String(activities.length+1), text, mark: mm?mm[1]:"", markVal: parseMark(mm?mm[1]:""), subItems: [] });
+        }
+        continue;
+      }
+
+      if (mode === "questions") {
+        const optM = line.match(/^([a-d])[.)]\s+(.+)$/i);
+        const lastQ = questionStation.length > 0 ? questionStation[questionStation.length-1] : null;
+        if (optM && lastQ && lastQ.type === "mcq") {
+          lastQ.options.push({ letter: optM[1].toUpperCase(), text: optM[2].trim() });
+        } else if (!optM && line.trim()) {
+          const lookahead = lines.slice(i+1, i+6).join("\n");
+          const hasMcq = /^[a-d][.)]/im.test(lookahead);
+          const cleanQ = line.replace(/^\d+[.)\s]*/,"").trim();
+          if (hasMcq) {
+            questionStation.push({ type:"mcq", q:cleanQ, options:[], ans:answerKey[globalQIdx]||null, qNum:globalQIdx+1 });
+            globalQIdx++;
+          } else if (cleanQ) {
+            const isFill = /[…_]{3,}|Mention\s+\d+/i.test(cleanQ);
+            questionStation.push({ type:isFill?"fill":"text", q:cleanQ, ans:answerKey[globalQIdx]||"" });
+            if (isFill) globalQIdx++;
+          }
+        }
+        continue;
+      }
+    }
+
+    if (!heading) heading = lines.find(l => l.trim()) || "OSCE Station";
+    if (!totalMarksNum) {
+      totalMarksNum = activities.reduce((s,a)=>{
+        return s + (a.markVal||0) + (a.subItems||[]).reduce((ss,si)=>ss+(si.markVal||0),0);
+      },0);
+    }
+    return { heading: heading.trim(), instructions, activities, questionStation, totalMarks, totalMarksNum };
+  };
+
+  return blocks.map(b => parseBlock(b)).filter(i => i.heading && (i.activities.length > 0 || i.instructions.length > 0));
+};
+
 // ── Admin Skills ─────────────────────────────────────────────────────
 function AdminSkills({ toast }) {
   const [skills, setSkills] = useSharedData("nv-skillsdb", DEFAULT_SKILLS);
@@ -2655,100 +2817,17 @@ function AdminSkills({ toast }) {
 
   // ── Parser: same rich format as NC OSCE ──
   const parseSchoolOsce = () => {
-    const rawText = osceText.trim();
-    if (!rawText) { toast("Paste OSCE content first","error"); return; }
-    const answersRaw = osceAnswersText.trim();
-    const stationBlocks = rawText.split(/(?=^PROCEDURE STATION[\s:])/mi).filter(b=>b.trim());
-    const blocks = stationBlocks.length > 1 ? stationBlocks : [rawText];
-    const parseAnswers = (raw) => {
-      if (!raw) return [];
-      return raw.split("\n").map(l=>l.trim()).filter(Boolean).map(l => {
-        const m = l.match(/^(?:\d+[.)\s]+)?([A-Da-d])[.)\s]*/);
-        if (m) return m[1].toUpperCase();
-        return l.replace(/^\d+[.)\s]*/,"").trim();
-      });
-    };
-    const answerKey = parseAnswers(answersRaw);
-    let globalQIdx = 0;
-
-    const items = blocks.map(block => {
-      const lines = block.split("\n").map(l => l.trim());
-      let heading = "", instructions = [], activities = [], questionStation = [], totalMarks = "";
-      let mode = "heading";
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (!line) continue;
-        if (line.match(/^INSTRUCTION(S)? TO CANDIDATE/i)) { mode = "instructions"; continue; }
-        if (line.match(/^ACTIVITIES$/i)) { mode = "activities"; continue; }
-        if (line.match(/^QUESTION STATION[\s:]*/i)) { mode = "questions"; continue; }
-        if (line.match(/^Total Marks/i)) { totalMarks = line; mode = "done"; continue; }
-        if (line.match(/^PROCEDURE STATION[\s:]*/i)) {
-          heading = line.replace(/^PROCEDURE STATION[\s:]*/i,"").trim();
-          mode = "heading_seen"; continue;
-        }
-        if ((mode === "heading" || mode === "heading_seen") && !heading) {
-          heading = line.replace(/^Title[\s:]*/i,"").trim(); continue;
-        }
-        if (mode === "heading_seen" && heading && !line.match(/^(?:INSTRUCTION|ACTIVIT|QUESTION)/i)) {
-          heading += " " + line; continue;
-        }
-        if (mode === "instructions") {
-          const clean = line.replace(/^[➤►>•\-]\s*/,"").trim();
-          if (clean) instructions.push(clean);
-          continue;
-        }
-        if (mode === "activities") {
-          const actM = line.match(/^(\d+[a-z]?)[.)]\s+(.+)$/i);
-          const subM = line.match(/^([a-z])[.)]\s+(.+)$/i);
-          if (actM) {
-            const text = actM[2].trim();
-            const markM = text.match(/\(([^)]+marks?)\)\s*$/i);
-            activities.push({ num: actM[1], text: markM ? text.replace(markM[0],"").trim() : text, mark: markM ? markM[1] : "", subItems: [] });
-          } else if (subM && activities.length > 0) {
-            const text = subM[2].trim();
-            const markM = text.match(/\(([^)]+marks?)\)\s*$/i);
-            const parent = activities[activities.length-1];
-            if (!parent.subItems) parent.subItems = [];
-            parent.subItems.push({ letter: subM[1], text: markM ? text.replace(markM[0],"").trim() : text, mark: markM ? markM[1] : "" });
-          }
-          continue;
-        }
-        if (mode === "questions") {
-          const optM = line.match(/^([a-d])[.)]\s+(.+)$/i);
-          const lastQ = questionStation.length > 0 ? questionStation[questionStation.length-1] : null;
-          if (optM && lastQ && lastQ.type === "mcq") {
-            lastQ.options.push({ letter: optM[1].toUpperCase(), text: optM[2].trim() });
-          } else if (!optM && line.trim()) {
-            const lookahead = lines.slice(i+1, i+6).join("\n");
-            const hasMcqOptions = lookahead.match(/^[a-d][.)]\s/im);
-            const cleanQ = line.replace(/^\d+[.)\s]*/,"").trim();
-            if (hasMcqOptions) {
-              const ans = answerKey[globalQIdx] || null;
-              questionStation.push({ type:"mcq", q: cleanQ, options:[], ans, qNum: globalQIdx+1 });
-              globalQIdx++;
-            } else if (cleanQ) {
-              const isFill = cleanQ.match(/[…_]{3,}/) || cleanQ.match(/Mention \d+/i);
-              questionStation.push({ type: isFill ? "fill" : "text", q: cleanQ, ans: answerKey[globalQIdx] || "" });
-              if (isFill) globalQIdx++;
-            }
-          }
-          continue;
-        }
-      }
-      if (!heading) heading = lines.find(l=>l.trim()) || "OSCE Station";
-      return { heading: heading.trim(), instructions, activities, questionStation, totalMarks };
-    }).filter(i => i.heading);
-
+    const items = parseOsceText(osceText, osceAnswersText);
     setParsedOsce(items);
     if (!items.length) toast("No stations parsed — check format","error");
     else toast("✅ " + items.length + " station(s) parsed!","success");
   };
-
   const importOsce = () => {
     if (!parsedOsce.length) return;
     const newItems = parsedOsce.map(p=>({ id: Date.now()+Math.random(), name: p.heading,
       heading: p.heading, instructions: p.instructions||[], activities: p.activities||[],
-      questionStation: p.questionStation||[], totalMarks: p.totalMarks||"" }));
+      questionStation: p.questionStation||[], totalMarks: p.totalMarks||"",
+      totalMarksNum: p.totalMarksNum||0 }));
     const u = [...skills, ...newItems];
     setSkills(u); saveShared("skills", u);
     setParsedOsce([]); setOsceText(""); setOsceAnswersText("");
@@ -7450,119 +7529,12 @@ function AdminNursingExams({ toast }) {
   // ── OSCE helpers ──
   // Rich OSCE parser — handles PROCEDURE STATION format with instructions, activities (marks), question station, and answers
   const parseOsce = () => {
-    const rawText = osceText.trim();
-    const answersRaw = osceAnswersText.trim();
-    if (!rawText) { toast("Paste OSCE content first","error"); return; }
-
-    // Split into individual station blocks
-    const stationBlocks = rawText.split(/(?=^PROCEDURE STATION[\s:])/mi).filter(b=>b.trim());
-    const blocks = stationBlocks.length > 1 ? stationBlocks : [rawText];
-
-    // Parse answers text — one per line, letter or "A. text" format
-    const parseAnswers = (raw) => {
-      if (!raw) return [];
-      return raw.split("\n").map(l=>l.trim()).filter(Boolean).map(l => {
-        const m = l.match(/^(?:\d+[.)\s]+)?([A-Da-d])[.)\s]*/);
-        if (m) return m[1].toUpperCase();
-        return l.replace(/^\d+[.)\s]*/,"").trim();
-      });
-    };
-    const answerKey = parseAnswers(answersRaw);
-    let globalQIdx = 0; // tracks MCQ index across stations for answer key
-
-    const items = blocks.map((block) => {
-      const lines = block.split("\n").map(l => l.trim());
-      let heading = "", instructions = [], activities = [], questionStation = [], totalMarks = "";
-      let mode = "heading";
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (!line) continue;
-
-        // Section headers
-        if (line.match(/^INSTRUCTION(S)? TO CANDIDATE/i)) { mode = "instructions"; continue; }
-        if (line.match(/^ACTIVITIES$/i)) { mode = "activities"; continue; }
-        if (line.match(/^QUESTION STATION[\s:]*/i)) { mode = "questions"; continue; }
-        if (line.match(/^Total Marks/i)) { totalMarks = line; mode = "done"; continue; }
-
-        // Title line
-        if (line.match(/^PROCEDURE STATION[\s:]*/i)) {
-          heading = line.replace(/^PROCEDURE STATION[\s:]*/i,"").trim();
-          mode = "heading_seen"; continue;
-        }
-        if ((mode === "heading" || mode === "heading_seen") && !heading) {
-          heading = line.replace(/^Title[\s:]*/i,"").trim(); continue;
-        }
-        if (mode === "heading_seen" && heading && !line.match(/^(?:INSTRUCTION|ACTIVIT|QUESTION)/i)) {
-          // multi-line title
-          heading += " " + line; continue;
-        }
-
-        if (mode === "instructions") {
-          const clean = line.replace(/^[➤►>•\-]\s*/,"").trim();
-          if (clean) instructions.push(clean);
-          continue;
-        }
-
-        if (mode === "activities") {
-          // Main numbered item: "1. Text (½ mark)" or "17." sub items
-          const actM = line.match(/^(\d+[a-z]?)[.)]\s+(.+)$/i);
-          const subM = line.match(/^([a-z])[.)]\s+(.+)$/i);
-          if (actM) {
-            const text = actM[2].trim();
-            const markM = text.match(/\(([^)]+marks?)\)\s*$/i);
-            activities.push({ num: actM[1], text: markM ? text.replace(markM[0],"").trim() : text, mark: markM ? markM[1] : "", subItems: [] });
-          } else if (subM && activities.length > 0) {
-            const text = subM[2].trim();
-            const markM = text.match(/\(([^)]+marks?)\)\s*$/i);
-            const parent = activities[activities.length-1];
-            if (!parent.subItems) parent.subItems = [];
-            parent.subItems.push({ letter: subM[1], text: markM ? text.replace(markM[0],"").trim() : text, mark: markM ? markM[1] : "" });
-          }
-          continue;
-        }
-
-        if (mode === "questions") {
-          const optM = line.match(/^([a-d])[.)]\s+(.+)$/i);
-          const lastQ = questionStation.length > 0 ? questionStation[questionStation.length-1] : null;
-
-          if (optM && lastQ && lastQ.type === "mcq") {
-            lastQ.options.push({ letter: optM[1].toUpperCase(), text: optM[2].trim() });
-          } else if (!optM && line.trim()) {
-            const lookahead = lines.slice(i+1, i+6).join("\n");
-            const hasMcqOptions = lookahead.match(/^[a-d][.)]\s/im);
-            const cleanQ = line.replace(/^\d+[.)\s]*/,"").trim();
-            if (hasMcqOptions) {
-              const ans = answerKey[globalQIdx] || null;
-              questionStation.push({ type:"mcq", q: cleanQ, options:[], ans, qNum: globalQIdx+1 });
-              globalQIdx++;
-            } else if (cleanQ) {
-              // Fill-in-blank or free response (has blanks like ……… or ___)
-              const isFill = cleanQ.match(/[…_]{3,}/) || cleanQ.match(/Mention \d+/i);
-              questionStation.push({ type: isFill ? "fill" : "text", q: cleanQ, ans: answerKey[globalQIdx] || "" });
-              if (isFill) globalQIdx++;
-            }
-          }
-          continue;
-        }
-      }
-
-      if (!heading) heading = lines.find(l=>l.trim()) || "OSCE Station";
-      // Legacy steps for backward compat
-      const steps = activities.map(a => {
-        const parts = [`${a.num}. ${a.text}${a.mark ? " ("+a.mark+")" : ""}`];
-        if (a.subItems && a.subItems.length) a.subItems.forEach(s => parts.push(`   ${s.letter}. ${s.text}${s.mark?" ("+s.mark+")":""}`));
-        return parts;
-      }).flat();
-
-      return { heading: heading.trim(), instructions, activities, questionStation, totalMarks, steps };
-    }).filter(i => i.heading);
-
+    if (!osceText.trim()) { toast("Paste OSCE content first","error"); return; }
+    const items = parseOsceText(osceText, osceAnswersText);
     setParsedOsce(items);
     if (!items.length) toast("No stations parsed — check format","error");
     else toast("✅ " + items.length + " OSCE station(s) parsed!","success");
   };
-
   const importOsce = () => {
     if(!parsedOsce.length) return;
     const newChecks = parsedOsce.map(p=>({
@@ -10831,30 +10803,279 @@ function LabReferenceView() {
 function SkillsView() {
   const [skillsDb] = useSharedData("nv-skillsdb", DEFAULT_SKILLS);
   const [ticked, setTicked] = useState(()=>ls("nv-skills-done",{}));
-  const [expanded, setExpanded] = useState(()=>{
-    // Start all collapsed — user opens what they need
-    const o = {}; return o;
-  });
+  const [scores, setScores]  = useState(()=>ls("nv-skills-scores",{}));
+  const [expanded, setExpanded] = useState({});
   const [expandAll, setExpandAll] = useState(false);
   const [revealedQS, setRevealedQS] = useState({});
   const [mcqAnswers, setMcqAnswers] = useState({});
   const [osceSearch, setOsceSearch] = useState("");
+  const [selStation, setSelStation] = useState(null); // null = list, index = station view
+
+  // ── Mark helpers ──────────────────────────────────────────────────
+  const parseMark = (s) => {
+    if (!s) return 0;
+    const t = (s+"").trim().replace(/mark[s]?/gi,"").trim();
+    if (t==="½"||t==="1/2") return 0.5;
+    if (t==="¼"||t==="1/4") return 0.25;
+    if (t==="¾"||t==="3/4") return 0.75;
+    const fr = t.match(/^(\d+)\s*\/\s*(\d+)$/);
+    if (fr) return parseInt(fr[1])/parseInt(fr[2]);
+    const n = parseFloat(t); return isNaN(n)?0:n;
+  };
+
+  const fmtMark = (v) => {
+    if (v===0.5) return "½";
+    if (v===0.25) return "¼";
+    if (v===0.75) return "¾";
+    return Number.isInteger(v)?String(v):v.toFixed(2).replace(/\.?0+$/,"");
+  };
+
+  // Compute max marks for a station
+  const stationMax = (s) => {
+    if (s.totalMarksNum) return s.totalMarksNum;
+    return (s.activities||[]).reduce((sum,a)=>{
+      const sub=(a.subItems||[]).reduce((ss,si)=>ss+(parseMark(si.mark)||0),0);
+      return sum+(parseMark(a.mark)||0)+sub;
+    },0);
+  };
+
+  // Compute earned marks for a station given current ticked state
+  const stationEarned = (s, si) => {
+    return (s.activities||[]).reduce((sum,a,ai)=>{
+      const key=`${si}-${ai}`;
+      if (!ticked[key]) return sum;
+      const aVal = parseMark(a.mark)||0;
+      const subVal = (a.subItems||[]).reduce((ss,sub)=>ss+(parseMark(sub.mark)||0),0);
+      return sum + aVal + subVal;
+    },0);
+  };
 
   const toggle = (si, ai) => {
-    const key = `${si}-${ai}`;
-    const u = {...ticked, [key]: !ticked[key]};
+    const key=`${si}-${ai}`;
+    const u={...ticked,[key]:!ticked[key]};
     setTicked(u); saveMyData("skills-done","nv-skills-done",u);
   };
+
+  const resetStation = (si) => {
+    const u={...ticked};
+    const s=skillsDb[si];
+    (s.activities||[]).forEach((_,ai)=>{ delete u[`${si}-${ai}`]; });
+    setTicked(u); saveMyData("skills-done","nv-skills-done",u);
+  };
+
   const toggleSection = (si) => setExpanded(e=>({...e,[si]:!e[si]}));
 
   const filteredSkills = osceSearch.trim()
-    ? skillsDb.filter(s => (s.heading||s.name||"").toLowerCase().includes(osceSearch.trim().toLowerCase()) ||
+    ? skillsDb.filter(s=>(s.heading||s.name||"").toLowerCase().includes(osceSearch.trim().toLowerCase())||
         (s.activities||[]).some(a=>(a.text||a||"").toLowerCase().includes(osceSearch.trim().toLowerCase())))
     : skillsDb;
 
-  const totalActivities = skillsDb.reduce((s,sk) => s + ((sk.activities&&sk.activities.length) ? sk.activities.length : (sk.name?1:0)), 0);
+  const totalActivities = skillsDb.reduce((s,sk)=>s+((sk.activities&&sk.activities.length)?sk.activities.length:(sk.name?1:0)),0);
   const tickedCount = Object.values(ticked).filter(Boolean).length;
+  const overallMax = skillsDb.reduce((s,sk,si)=>s+stationMax(sk),0);
+  const overallEarned = skillsDb.reduce((s,sk,si)=>s+stationEarned(sk,skillsDb.indexOf(sk)),0);
 
+  // ── Single-station detail view ────────────────────────────────────
+  if (selStation !== null) {
+    const s = skillsDb[selStation];
+    if (!s) { setSelStation(null); return null; }
+    const acts = s.activities&&s.activities.length ? s.activities : [];
+    const max = stationMax(s);
+    const earned = stationEarned(s, selStation);
+    const pct = max>0 ? Math.round((earned/max)*100) : 0;
+    const allDone = acts.length>0 && acts.every((_,ai)=>ticked[`${selStation}-${ai}`]);
+    const qs = s.questionStation||[];
+
+    return (
+      <div>
+        {/* Header */}
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16,flexWrap:"wrap"}}>
+          <button className="btn btn-sm" onClick={()=>setSelStation(null)}>← Back</button>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:800,fontSize:15,color:"var(--accent)",lineHeight:1.3}}>
+              🩺 {s.heading||s.name}
+            </div>
+            <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>
+              OSCE Clinical Checklist · {acts.length} activities
+            </div>
+          </div>
+        </div>
+
+        {/* Score card */}
+        <div className="card" style={{marginBottom:16,padding:"14px 18px",background:"linear-gradient(135deg,var(--accent)12,var(--bg4))"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+            <div>
+              <div style={{fontWeight:800,fontSize:13,color:"var(--accent)"}}>Your Score</div>
+              <div style={{fontSize:11,color:"var(--text3)"}}>Tick each step to record marks</div>
+            </div>
+            <div style={{textAlign:"right"}}>
+              <div style={{fontWeight:900,fontSize:28,color:pct>=70?"var(--success)":pct>=50?"var(--warn)":"var(--accent)",lineHeight:1}}>
+                {fmtMark(earned)}<span style={{fontSize:14,fontWeight:600,color:"var(--text3)"}}>/{fmtMark(max)}</span>
+              </div>
+              <div style={{fontSize:12,color:pct>=70?"var(--success)":pct>=50?"var(--warn)":"var(--danger)",fontWeight:700,marginTop:2}}>
+                {max>0?`${pct}%`:""}
+              </div>
+            </div>
+          </div>
+          <div className="progress-wrap" style={{height:8}}>
+            <div className="progress-fill" style={{width:`${max>0?pct:0}%`,
+              background:pct>=70?"linear-gradient(90deg,var(--success),#4ade80)":pct>=50?"linear-gradient(90deg,var(--warn),#fb923c)":"linear-gradient(90deg,var(--accent),var(--accent2))",
+              transition:"width .3s ease"}} />
+          </div>
+          {max>0&&<div style={{fontSize:10,color:"var(--text3)",marginTop:5}}>
+            {pct>=70?"✅ Pass":"❌ Below pass mark"} · Pass mark typically 60–70%
+          </div>}
+          {allDone&&<div style={{marginTop:8,fontSize:12,fontWeight:700,color:"var(--success)"}}>🎉 All steps completed!</div>}
+          <button className="btn btn-sm" style={{marginTop:10,fontSize:11}} onClick={()=>resetStation(selStation)}>🔄 Reset Ticks</button>
+        </div>
+
+        {/* Instructions */}
+        {(s.instructions||[]).length>0&&(
+          <div style={{marginBottom:14,background:"rgba(62,142,149,.06)",borderRadius:10,padding:"10px 14px",border:"1px solid rgba(62,142,149,.2)"}}>
+            <div style={{fontWeight:800,fontSize:11,color:"var(--accent)",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>📋 Instruction to Candidate</div>
+            {(s.instructions||[]).map((ins,ii)=>(
+              <div key={ii} style={{display:"flex",gap:8,alignItems:"flex-start",fontSize:13,marginBottom:4}}>
+                <span style={{color:"var(--accent)",flexShrink:0,marginTop:1}}>➤</span>
+                <span style={{color:"var(--text2)",lineHeight:1.5}}>{ins}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Activities with ticking */}
+        {acts.length>0&&(
+          <div style={{marginBottom:14}}>
+            <div style={{fontWeight:800,fontSize:11,color:"var(--text3)",marginBottom:8,textTransform:"uppercase",letterSpacing:1}}>
+              📝 Activities &amp; Marks
+            </div>
+            {acts.map((act,ai)=>{
+              const key=`${selStation}-${ai}`;
+              const done=!!ticked[key];
+              const aVal=parseMark(act.mark);
+              return (
+                <div key={ai}>
+                  <div onClick={()=>toggle(selStation,ai)}
+                    style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 12px",borderRadius:10,cursor:"pointer",
+                      background:done?"rgba(62,142,149,.1)":"var(--bg4)",marginBottom:4,transition:"all .2s",
+                      border:`2px solid ${done?"var(--accent)":"var(--border)"}`,boxShadow:done?"0 1px 6px rgba(62,142,149,.15)":"none"}}>
+                    {/* Checkbox */}
+                    <div style={{width:24,height:24,borderRadius:7,border:`2px solid ${done?"var(--accent)":"var(--border2)"}`,
+                      background:done?"var(--accent)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",
+                      flexShrink:0,transition:"all .2s",marginTop:1}}>
+                      {done&&<span style={{color:"white",fontSize:13,fontWeight:900}}>✓</span>}
+                    </div>
+                    {/* Text */}
+                    <div style={{flex:1}}>
+                      <span style={{fontSize:13,fontWeight:done?700:500,color:done?"var(--text)":"var(--text2)",lineHeight:1.6}}>
+                        <span style={{color:"var(--accent)",fontWeight:800}}>{act.num}.</span> {act.text}
+                      </span>
+                    </div>
+                    {/* Mark badge */}
+                    {act.mark&&(
+                      <div style={{flexShrink:0,textAlign:"center",minWidth:44}}>
+                        <div style={{fontSize:13,fontWeight:800,color:done?"var(--accent)":"var(--text3)",
+                          background:done?"rgba(62,142,149,.15)":"var(--bg4)",borderRadius:6,padding:"2px 8px",
+                          border:`1px solid ${done?"rgba(62,142,149,.3)":"var(--border)"}`,transition:"all .2s"}}>
+                          {done?"✓ ":""}{act.mark}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  {/* Sub-items */}
+                  {(act.subItems||[]).map((sub,sbi)=>(
+                    <div key={sbi} style={{paddingLeft:36,marginBottom:3}}>
+                      <div style={{display:"flex",alignItems:"flex-start",gap:8,padding:"6px 10px",borderRadius:7,
+                        background:"var(--bg4)",fontSize:12,color:"var(--text2)",lineHeight:1.5,
+                        border:`1px solid ${done?"rgba(62,142,149,.2)":"var(--border)"}`}}>
+                        <span style={{color:"var(--accent)",fontWeight:700,flexShrink:0}}>{sub.letter}.</span>
+                        <span style={{flex:1}}>{sub.text}</span>
+                        {sub.mark&&<span style={{flexShrink:0,fontSize:11,color:"var(--accent)",fontWeight:700,background:"rgba(62,142,149,.1)",borderRadius:4,padding:"1px 6px"}}>({sub.mark})</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Total marks */}
+        {s.totalMarks&&(
+          <div style={{marginBottom:14,padding:"10px 14px",background:"var(--bg4)",borderRadius:10,fontSize:13,fontWeight:700,
+            color:"var(--text2)",borderLeft:"3px solid var(--accent)"}}>
+            📊 {s.totalMarks}
+          </div>
+        )}
+
+        {/* Question Station */}
+        {qs.length>0&&(
+          <div style={{marginTop:6}}>
+            <div style={{fontWeight:800,fontSize:11,color:"var(--text3)",marginBottom:10,textTransform:"uppercase",letterSpacing:1,
+              paddingTop:10,borderTop:"1px dashed var(--border)"}}>❓ Question Station</div>
+            {qs.map((q,qi)=>{
+              const qKey=`${selStation}-q${qi}`;
+              const revealed=!!revealedQS[qKey];
+              const userAns=mcqAnswers[qKey];
+              if (q.type==="mcq") {
+                return (
+                  <div key={qi} style={{marginBottom:12,background:"var(--bg4)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--border)"}}>
+                    <div style={{fontWeight:700,fontSize:13,marginBottom:8,lineHeight:1.5}}>
+                      <span style={{color:"var(--accent)",fontWeight:800,marginRight:4}}>{q.qNum||qi+1}.</span>{q.q}
+                    </div>
+                    <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                      {(q.options||[]).map((opt,oi)=>{
+                        const isSelected=userAns===opt.letter;
+                        const isCorrect=revealed&&q.ans===opt.letter;
+                        const isWrong=revealed&&isSelected&&q.ans!==opt.letter;
+                        return (
+                          <div key={oi} onClick={()=>!revealed&&setMcqAnswers(a=>({...a,[qKey]:opt.letter}))}
+                            style={{display:"flex",gap:8,alignItems:"center",padding:"7px 10px",borderRadius:7,
+                              cursor:revealed?"default":"pointer",transition:"all .15s",
+                              background:isCorrect?"rgba(34,197,94,.12)":isWrong?"rgba(239,68,68,.08)":isSelected?"rgba(62,142,149,.1)":"transparent",
+                              border:`1px solid ${isCorrect?"var(--success)":isWrong?"var(--danger)":isSelected?"var(--accent)":"var(--border)"}`}}>
+                            <div style={{width:20,height:20,borderRadius:"50%",flexShrink:0,display:"flex",alignItems:"center",
+                              justifyContent:"center",fontSize:11,fontWeight:800,
+                              background:isCorrect?"var(--success)":isWrong?"var(--danger)":isSelected?"var(--accent)":"var(--bg4)",
+                              color:isCorrect||isWrong||isSelected?"white":"var(--text3)"}}>
+                              {opt.letter}
+                            </div>
+                            <span style={{fontSize:13,color:isCorrect?"var(--success)":isWrong?"var(--danger)":"var(--text2)",fontWeight:isCorrect?700:400}}>{opt.text}</span>
+                            {isCorrect&&<span style={{marginLeft:"auto",fontSize:11,color:"var(--success)",fontWeight:800}}>✓ Correct</span>}
+                            {isWrong&&<span style={{marginLeft:"auto",fontSize:11,color:"var(--danger)",fontWeight:800}}>✗</span>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div style={{marginTop:8,display:"flex",gap:8}}>
+                      {!revealed&&userAns&&(
+                        <button className="btn btn-sm btn-accent" style={{fontSize:11,padding:"4px 10px"}}
+                          onClick={()=>setRevealedQS(r=>({...r,[qKey]:true}))}>Check Answer</button>
+                      )}
+                      {revealed&&<span style={{fontSize:11,color:"var(--success)",fontWeight:700}}>✅ Answer revealed</span>}
+                    </div>
+                  </div>
+                );
+              } else {
+                return (
+                  <div key={qi} style={{marginBottom:10,background:"var(--bg4)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--border)"}}>
+                    <div style={{fontWeight:700,fontSize:13,marginBottom:6,lineHeight:1.6,color:"var(--text)"}}>{q.q}</div>
+                    {q.ans&&(
+                      <div>
+                        {!revealed&&<button className="btn btn-sm" style={{fontSize:11,padding:"3px 10px"}} onClick={()=>setRevealedQS(r=>({...r,[qKey]:true}))}>Show Answer</button>}
+                        {revealed&&<div style={{fontSize:12,fontWeight:700,color:"var(--success)",marginTop:4}}>✓ {q.ans}</div>}
+                      </div>
+                    )}
+                  </div>
+                );
+              }
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ── Station list view ─────────────────────────────────────────────
   return (
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,flexWrap:"wrap",gap:8}}>
@@ -10864,8 +11085,9 @@ function SkillsView() {
           <button className="btn btn-sm" onClick={()=>{setExpandAll(false);setExpanded(skillsDb.reduce((o,_,i)=>({...o,[i]:true}),{}));}}>Collapse All</button>
         </div>
       </div>
-      <div className="sec-sub">Track clinical competencies for RN OSCE</div>
-      {/* Search bar */}
+      <div className="sec-sub">Track clinical competencies for RN OSCE · Tap a station to practise and score yourself</div>
+
+      {/* Search */}
       <div style={{display:"flex",gap:8,marginBottom:14,marginTop:8}}>
         <div style={{position:"relative",flex:1}}>
           <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",fontSize:15,color:"var(--text3)",pointerEvents:"none"}}>🔍</span>
@@ -10875,14 +11097,17 @@ function SkillsView() {
       </div>
       {osceSearch&&<div style={{fontSize:11,color:"var(--text3)",marginBottom:10}}>{filteredSkills.length} result{filteredSkills.length!==1?"s":""} for "{osceSearch}"</div>}
 
-      {/* Progress */}
+      {/* Overall progress */}
       <div className="card" style={{marginBottom:16}}>
-        <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
-          <span style={{fontSize:12,color:"var(--text3)",fontWeight:700}}>Progress</span>
-          <span style={{fontSize:12,color:"var(--accent)",fontWeight:800}}>{tickedCount}/{totalActivities}</span>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:8,flexWrap:"wrap",gap:6}}>
+          <span style={{fontSize:12,color:"var(--text3)",fontWeight:700}}>Overall Progress</span>
+          <div style={{display:"flex",gap:16}}>
+            <span style={{fontSize:12,fontWeight:800,color:"var(--accent)"}}>{tickedCount}/{totalActivities} steps</span>
+            {overallMax>0&&<span style={{fontSize:12,fontWeight:800,color:"var(--success)"}}>{overallEarned.toFixed(1)}/{overallMax.toFixed(1)} marks</span>}
+          </div>
         </div>
         <div className="progress-wrap"><div className="progress-fill" style={{width:`${totalActivities>0?(tickedCount/totalActivities)*100:0}%`,background:"linear-gradient(90deg,var(--accent),var(--accent2))"}} /></div>
-        <div style={{fontSize:10,color:"var(--text3)",marginTop:5}}>Tick each activity as you practise</div>
+        <div style={{fontSize:10,color:"var(--text3)",marginTop:5}}>Tap any station to open its interactive checklist</div>
       </div>
 
       {skillsDb.length===0&&(
@@ -10896,182 +11121,47 @@ function SkillsView() {
         </div>
       )}
 
+      {/* Station cards */}
       {filteredSkills.map((s,si)=>{
         const realIdx = skillsDb.indexOf(s);
-        const acts = s.activities && s.activities.length ? s.activities : [];
-        const legacyName = !acts.length ? s.name : null;
+        const acts = s.activities&&s.activities.length ? s.activities : [];
         const isCollapsed = expandAll ? (expanded[realIdx]===true) : (expanded[realIdx]!==true);
-        const totalHere = acts.length || (legacyName ? 1 : 0);
-        const tickedHere = acts.length
-          ? acts.filter((_,ai)=>ticked[`${realIdx}-${ai}`]).length
-          : (ticked[`${realIdx}-0`] ? 1 : 0);
-        const qs = s.questionStation || [];
+        const max = stationMax(s);
+        const earned = stationEarned(s, realIdx);
+        const tickedHere = acts.filter((_,ai)=>ticked[`${realIdx}-${ai}`]).length;
+        const pct = max>0 ? Math.round((earned/max)*100) : 0;
+        const qs = s.questionStation||[];
 
         return (
-          <div key={s.id} className="card" style={{marginBottom:16,borderLeft:"4px solid var(--accent)"}}>
-            {/* Station heading */}
-            <div style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",padding:"2px 0"}}
-              onClick={()=>toggleSection(realIdx)}>
-              <div style={{width:36,height:36,borderRadius:9,background:"rgba(62,142,149,.12)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>🩺</div>
-              <div style={{flex:1}}>
+          <div key={s.id} className="card" style={{marginBottom:12,borderLeft:"4px solid var(--accent)",cursor:"pointer"}}
+            onClick={()=>setSelStation(realIdx)}>
+            <div style={{display:"flex",alignItems:"center",gap:10,padding:"2px 0"}}>
+              <div style={{width:38,height:38,borderRadius:9,background:"rgba(62,142,149,.12)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>🩺</div>
+              <div style={{flex:1,minWidth:0}}>
                 <div style={{fontWeight:800,fontSize:14,color:"var(--accent)",lineHeight:1.3}}>
-                  {acts.length>0 ? "PROCEDURE STATION: " : ""}{s.heading||s.name}
+                  {s.heading||s.name}
                 </div>
                 <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>
-                  {tickedHere}/{totalHere} activities checked
-                  {qs.length>0?` · ${qs.length} question station item${qs.length!==1?"s":""}` : ""}
+                  {tickedHere}/{acts.length} activities
+                  {max>0&&<span style={{marginLeft:8,color:pct>=70?"var(--success)":pct>=50?"var(--warn)":"var(--text3)",fontWeight:700}}>
+                    · {fmtMark(earned)}/{fmtMark(max)} marks ({pct}%)
+                  </span>}
+                  {qs.length>0&&<span style={{marginLeft:8}}>· {qs.length} Q</span>}
                 </div>
+                {/* Mini progress bar */}
+                {acts.length>0&&(
+                  <div style={{marginTop:5,height:4,background:"var(--bg4)",borderRadius:4,overflow:"hidden"}}>
+                    <div style={{height:"100%",borderRadius:4,transition:"width .3s",
+                      width:`${(tickedHere/acts.length)*100}%`,
+                      background:pct>=70?"var(--success)":pct>=50?"var(--warn)":"var(--accent)"}} />
+                  </div>
+                )}
               </div>
-              <div style={{display:"flex",alignItems:"center",gap:8}}>
-                {tickedHere===totalHere&&totalHere>0&&<span style={{fontSize:11,fontWeight:700,color:"var(--success)"}}>✅ Done</span>}
-                <span style={{fontSize:13,color:"var(--text3)",transition:"transform .2s",display:"inline-block",transform:isCollapsed?"rotate(-90deg)":"rotate(0deg)"}}>▾</span>
+              <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+                {tickedHere===acts.length&&acts.length>0&&<span style={{fontSize:11,fontWeight:700,color:"var(--success)"}}>✅</span>}
+                <span style={{fontSize:18,color:"var(--text3)"}}>›</span>
               </div>
             </div>
-
-            {!isCollapsed&&(
-              <div style={{marginTop:14,borderTop:"1px solid var(--border)",paddingTop:14}}>
-
-                {/* Instructions */}
-                {(s.instructions||[]).length>0&&(
-                  <div style={{marginBottom:14,background:"rgba(62,142,149,.06)",borderRadius:10,padding:"10px 14px",border:"1px solid rgba(62,142,149,.2)"}}>
-                    <div style={{fontWeight:800,fontSize:11,color:"var(--accent)",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>📋 Instruction to Candidate</div>
-                    {(s.instructions||[]).map((ins,ii)=>(
-                      <div key={ii} style={{display:"flex",gap:8,alignItems:"flex-start",fontSize:13,marginBottom:4}}>
-                        <span style={{color:"var(--accent)",flexShrink:0,marginTop:1}}>➤</span>
-                        <span style={{color:"var(--text2)",lineHeight:1.5}}>{ins}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* Activities */}
-                {acts.length>0&&(
-                  <div style={{marginBottom:14}}>
-                    <div style={{fontWeight:800,fontSize:11,color:"var(--text3)",marginBottom:8,textTransform:"uppercase",letterSpacing:1}}>📝 Activities</div>
-                    {acts.map((act,ai)=>{
-                      const key=`${realIdx}-${ai}`;
-                      const done=!!ticked[key];
-                      return (
-                        <div key={ai}>
-                          <div onClick={()=>toggle(realIdx,ai)}
-                            style={{display:"flex",alignItems:"flex-start",gap:10,padding:"8px 10px",borderRadius:8,cursor:"pointer",
-                              background:done?"rgba(62,142,149,.08)":"transparent",marginBottom:2,transition:"background .15s",
-                              border:`1px solid ${done?"rgba(62,142,149,.3)":"transparent"}`}}>
-                            <div style={{width:22,height:22,borderRadius:6,border:`2px solid ${done?"var(--accent)":"var(--border2)"}`,
-                              background:done?"var(--accent)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",
-                              flexShrink:0,transition:"all .2s",marginTop:1}}>
-                              {done&&<span style={{color:"white",fontSize:11,fontWeight:800}}>✓</span>}
-                            </div>
-                            <div style={{flex:1}}>
-                              <span style={{fontSize:13,fontWeight:done?700:500,color:done?"var(--text)":"var(--text2)",lineHeight:1.5}}>
-                                <span style={{color:"var(--accent)",fontWeight:800}}>{act.num}.</span> {act.text}
-                              </span>
-                              {act.mark&&<span style={{marginLeft:6,fontSize:11,background:"rgba(62,142,149,.12)",color:"var(--accent)",borderRadius:4,padding:"1px 6px",fontWeight:700}}>({act.mark})</span>}
-                            </div>
-                          </div>
-                          {(act.subItems||[]).map((sub,sbi)=>(
-                            <div key={sbi} style={{paddingLeft:32,marginBottom:2}}>
-                              <div style={{display:"flex",alignItems:"flex-start",gap:8,padding:"5px 8px",borderRadius:6,
-                                background:"var(--bg4)",fontSize:12,color:"var(--text2)",lineHeight:1.5}}>
-                                <span style={{color:"var(--accent)",fontWeight:700,flexShrink:0}}>{sub.letter}.</span>
-                                <span>{sub.text}</span>
-                                {sub.mark&&<span style={{marginLeft:4,fontSize:10,color:"var(--accent)",fontWeight:700}}>({sub.mark})</span>}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {/* Legacy simple name */}
-                {legacyName&&acts.length===0&&(
-                  <div onClick={()=>toggle(realIdx,0)}
-                    style={{display:"flex",alignItems:"center",gap:10,padding:"9px 10px",borderRadius:8,cursor:"pointer",
-                      background:ticked[`${realIdx}-0`]?"rgba(62,142,149,.08)":"transparent",marginBottom:2,
-                      border:`1px solid ${ticked[`${realIdx}-0`]?"rgba(62,142,149,.3)":"transparent"}`}}>
-                    <div style={{width:22,height:22,borderRadius:6,border:`2px solid ${ticked[`${realIdx}-0`]?"var(--accent)":"var(--border2)"}`,
-                      background:ticked[`${realIdx}-0`]?"var(--accent)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",
-                      flexShrink:0,transition:"all .2s"}}>
-                      {ticked[`${realIdx}-0`]&&<span style={{color:"white",fontSize:11,fontWeight:800}}>✓</span>}
-                    </div>
-                    <div style={{fontSize:14,fontWeight:ticked[`${realIdx}-0`]?700:500,color:"var(--text2)"}}>{legacyName}</div>
-                  </div>
-                )}
-
-                {/* Total Marks */}
-                {s.totalMarks&&(
-                  <div style={{marginBottom:14,padding:"8px 12px",background:"var(--bg4)",borderRadius:8,fontSize:12,fontWeight:700,color:"var(--text2)",borderLeft:"3px solid var(--accent)"}}>
-                    📊 {s.totalMarks}
-                  </div>
-                )}
-
-                {/* Question Station */}
-                {qs.length>0&&(
-                  <div style={{marginTop:6}}>
-                    <div style={{fontWeight:800,fontSize:11,color:"var(--text3)",marginBottom:10,textTransform:"uppercase",letterSpacing:1,paddingTop:10,borderTop:"1px dashed var(--border)"}}>
-                      ❓ Question Station
-                    </div>
-                    {qs.map((q,qi)=>{
-                      const qKey=`${realIdx}-q${qi}`;
-                      const revealed=!!revealedQS[qKey];
-                      const userAns=mcqAnswers[qKey];
-                      if (q.type==="mcq") {
-                        return (
-                          <div key={qi} style={{marginBottom:12,background:"var(--bg4)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--border)"}}>
-                            <div style={{fontWeight:700,fontSize:13,marginBottom:8,lineHeight:1.5}}>
-                              <span style={{color:"var(--accent)",fontWeight:800,marginRight:4}}>{q.qNum||qi+1}.</span>{q.q}
-                            </div>
-                            <div style={{display:"flex",flexDirection:"column",gap:6}}>
-                              {(q.options||[]).map((opt,oi)=>{
-                                const isSelected=userAns===opt.letter;
-                                const isCorrect=revealed&&q.ans===opt.letter;
-                                const isWrong=revealed&&isSelected&&q.ans!==opt.letter;
-                                return (
-                                  <div key={oi} onClick={()=>!revealed&&setMcqAnswers(a=>({...a,[qKey]:opt.letter}))}
-                                    style={{display:"flex",gap:8,alignItems:"center",padding:"7px 10px",borderRadius:7,cursor:revealed?"default":"pointer",transition:"all .15s",
-                                      background:isCorrect?"rgba(34,197,94,.12)":isWrong?"rgba(239,68,68,.08)":isSelected?"rgba(62,142,149,.1)":"transparent",
-                                      border:`1px solid ${isCorrect?"var(--success)":isWrong?"var(--danger)":isSelected?"var(--accent)":"var(--border)"}`}}>
-                                    <div style={{width:20,height:20,borderRadius:"50%",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800,
-                                      background:isCorrect?"var(--success)":isWrong?"var(--danger)":isSelected?"var(--accent)":"var(--bg4)",
-                                      color:isCorrect||isWrong||isSelected?"white":"var(--text3)",border:`1px solid ${isCorrect?"var(--success)":isWrong?"var(--danger)":isSelected?"var(--accent)":"var(--border)"}`}}>
-                                      {opt.letter}
-                                    </div>
-                                    <span style={{fontSize:13,color:isCorrect?"var(--success)":isWrong?"var(--danger)":"var(--text2)",fontWeight:isCorrect?700:400}}>{opt.text}</span>
-                                    {isCorrect&&<span style={{marginLeft:"auto",fontSize:11,color:"var(--success)",fontWeight:800}}>✓ Correct</span>}
-                                    {isWrong&&<span style={{marginLeft:"auto",fontSize:11,color:"var(--danger)",fontWeight:800}}>✗</span>}
-                                  </div>
-                                );
-                              })}
-                            </div>
-                            <div style={{marginTop:8,display:"flex",gap:8}}>
-                              {!revealed&&userAns&&(
-                                <button className="btn btn-sm btn-accent" style={{fontSize:11,padding:"4px 10px"}}
-                                  onClick={()=>setRevealedQS(r=>({...r,[qKey]:true}))}>Check Answer</button>
-                              )}
-                              {revealed&&<span style={{fontSize:11,color:"var(--success)",fontWeight:700}}>✅ Answer revealed</span>}
-                            </div>
-                          </div>
-                        );
-                      } else {
-                        return (
-                          <div key={qi} style={{marginBottom:10,background:"var(--bg4)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--border)"}}>
-                            <div style={{fontWeight:700,fontSize:13,marginBottom:6,lineHeight:1.6,color:"var(--text)"}}>{q.q}</div>
-                            {q.ans&&(
-                              <div>
-                                {!revealed&&<button className="btn btn-sm" style={{fontSize:11,padding:"3px 10px"}} onClick={()=>setRevealedQS(r=>({...r,[qKey]:true}))}>Show Answer</button>}
-                                {revealed&&<div style={{fontSize:12,fontWeight:700,color:"var(--success)",marginTop:4}}>✓ {q.ans}</div>}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      }
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
           </div>
         );
       })}
