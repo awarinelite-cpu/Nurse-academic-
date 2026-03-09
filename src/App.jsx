@@ -13679,7 +13679,7 @@ function CbtExamManager({ toast, currentUser }) {
                             />
                             <div style={{position:"absolute",bottom:2,left:2,right:2,fontSize:9,
                               background:"rgba(0,0,0,.65)",color:"white",borderRadius:3,padding:"1px 3px",textAlign:"center"}}>
-                              {v.type==="tab_switch"?"Tab":v.type==="fullscreen_exit"?"FS exit":"Flag"} {new Date(v.ts).toLocaleTimeString()}
+                              {v.type==="tab_switch"?"Tab":v.type==="page_leave"?"Left":v.type==="fullscreen_exit"?"FS exit":"Flag"} {new Date(v.ts).toLocaleTimeString()}
                             </div>
                           </div>
                         ))}
@@ -13690,8 +13690,9 @@ function CbtExamManager({ toast, currentUser }) {
                     <div style={{maxHeight:110,overflowY:"auto"}}>
                       {vList.map((v,i)=>(
                         <div key={i} style={{fontSize:11,color:"var(--text3)",padding:"2px 0",display:"flex",gap:8,alignItems:"center"}}>
-                          <span style={{color:v.type==="auto_submitted"||v.type==="duplicate_device"?"var(--danger)":v.type==="tab_switch"?"var(--warn)":v.type==="screenshot_attempt"?"var(--purple)":"var(--accent)",fontWeight:700}}>
-                            {v.type==="tab_switch"?"🔄 Tab switch":v.type==="fullscreen_exit"?"🖥️ Fullscreen exit":v.type==="auto_submitted"?"⚡ Auto-submitted":v.type==="duplicate_device"?"🔒 Duplicate device":v.type==="screenshot_attempt"?"📷 Screenshot attempt":"⚠️ "+v.type}
+                          <span style={{color:v.type==="auto_submitted"||v.type==="duplicate_device"?"var(--danger)":v.type==="tab_switch"||v.type==="page_leave"?"var(--warn)":v.type==="screenshot_attempt"?"var(--purple)":"var(--accent)",fontWeight:700}}>
+                            {v.type==="tab_switch"?"🔄 Tab switch":v.type==="page_leave"?"🚪 Page left (auto-submitted)":v.type==="fullscreen_exit"?"🖥️ Fullscreen exit":v.type==="auto_submitted"?`⚡ Auto-submitted${v.reason?" ("+v.reason+")":""}`:v.type==="duplicate_device"?"🔒 Duplicate device":v.type==="screenshot_attempt"?"📷 Screenshot attempt":"⚠️ "+v.type}
+                            {v.penaltyApplied&&<span style={{color:"var(--warn)",marginLeft:4}}>−{v.penaltyApplied}pt</span>}
                           </span>
                           {v.hasSnapshot&&<span style={{fontSize:9,color:"var(--purple)"}}>📸</span>}
                           <span style={{marginLeft:"auto",fontFamily:"'DM Mono',monospace"}}>{new Date(v.ts).toLocaleTimeString()}</span>
@@ -13810,10 +13811,13 @@ function CbtStudentView({ toast, currentUser }) {
   const [myResult,    setMyResult]    = useState(null);
   const [loading,     setLoading]     = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [tabSwitches,  setTabSwitches]  = useState(0);
-  const [violations,   setViolations]   = useState([]);
-  const [warningMsg,   setWarningMsg]   = useState("");
-  const [showWarning,  setShowWarning]  = useState(false);
+  const [tabSwitches,      setTabSwitches]      = useState(0);
+  const [violations,       setViolations]       = useState([]);
+  const [warningMsg,       setWarningMsg]       = useState("");
+  const [showWarning,      setShowWarning]      = useState(false);
+  const [penaltyDeductions,setPenaltyDeductions]= useState(0); // 0.5 per non-tab violation
+  const [examSubmitted,    setExamSubmitted]    = useState(false); // prevent double-submit
+  const [rulesAccepted,    setRulesAccepted]    = useState(false); // rules checkbox on preflight
   // Webcam
   const [camStream,    setCamStream]    = useState(null);
   const [camAllowed,   setCamAllowed]   = useState(null); // null=unknown, true, false
@@ -13977,18 +13981,30 @@ function CbtStudentView({ toast, currentUser }) {
     };
   }, [mode]);
 
-  // ── Tab/window visibility detection ──
+  // ── Tab/window visibility & page-leave detection ──
+  // ANY departure from the exam page triggers immediate auto-submit
   useEffect(() => {
     if (mode!=="taking") return;
     const onVis = () => { if (document.hidden) logViolation("tab_switch"); };
     document.addEventListener("visibilitychange", onVis);
     const onBlur = () => logViolation("tab_switch");
     window.addEventListener("blur", onBlur);
+    const onPageHide = () => logViolation("page_leave");
+    window.addEventListener("pagehide", onPageHide);
+    const onBeforeUnload = (e) => {
+      // Attempt to log & block navigation
+      logViolation("page_leave");
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
     return () => {
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("blur", onBlur);
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("beforeunload", onBeforeUnload);
     };
-  }, [mode, tabSwitches, activeExam]);
+  }, [mode, violations, penaltyDeductions, activeExam]);
 
   // ── Right-click & keyboard shortcut block during exam ──
   useEffect(() => {
@@ -14014,30 +14030,38 @@ function CbtStudentView({ toast, currentUser }) {
     const updatedLocal = [...violations, v];
     setViolations(updatedLocal);
 
-    if (type==="tab_switch") {
-      setTabSwitches(prev => {
-        const newCount = prev + 1;
-        const limit = activeExam.tabSwitchLimit ?? 3;
-        if (limit > 0 && newCount >= limit) {
-          showWarn(`🚨 You switched tabs ${newCount} time${newCount>1?"s":""}. Your exam is being auto-submitted.`);
-          setTimeout(() => doSubmit("auto_tab"), 2500);
-        } else {
-          showWarn(`⚠️ Tab switch detected (${newCount}${limit>0?`/${limit}`:""})! Return immediately or your exam may be auto-submitted.`);
-        }
-        return newCount;
-      });
-    } else if (type==="fullscreen_exit") {
-      if (activeExam.fullscreenRequired) {
-        showWarn("⚠️ You left fullscreen mode! This has been flagged. Return to fullscreen to continue.");
-      }
-    }
+    if (type==="tab_switch" || type==="page_leave") {
+      // IMMEDIATE auto-submit — any page leave/tab switch = exam over
+      const msg = type==="page_leave"
+        ? "🚨 You left the exam page. Your exam has been automatically submitted and CANNOT be continued."
+        : "🚨 Tab/window switch detected. Your exam has been automatically submitted and CANNOT be continued.";
+      showWarn(msg);
+      try {
+        const all = await cbtViolationsGet();
+        await cbtViolationsSave([...all, v]);
+      } catch(e){}
+      setTimeout(() => doSubmit(type==="page_leave"?"page_leave":"auto_tab", updatedLocal, penaltyDeductions), 1200);
 
-    // Save to Firestore (violations list kept in memory includes full snapshots; Firestore strips them to metadata)
-    try {
-      const all = await cbtViolationsGet();
-      const updated = [...all, v];
-      await cbtViolationsSave(updated);
-    } catch(e) {}
+    } else {
+      // Other violations: deduct 0.5 mark each time
+      const newPenalties = penaltyDeductions + 0.5;
+      setPenaltyDeductions(newPenalties);
+
+      if (type==="fullscreen_exit") {
+        if (activeExam.fullscreenRequired) {
+          showWarn(`⚠️ You exited fullscreen! −0.5 mark deducted (Total deductions: −${newPenalties}). Return to fullscreen immediately.`);
+        }
+      } else if (type==="screenshot_attempt") {
+        showWarn(`🚫 Screenshot attempt detected! −0.5 mark deducted (Total deductions: −${newPenalties}).`);
+      } else {
+        showWarn(`⚠️ Violation recorded: ${type}. −0.5 mark deducted (Total deductions: −${newPenalties}).`);
+      }
+
+      try {
+        const all = await cbtViolationsGet();
+        await cbtViolationsSave([...all, { ...v, penaltyApplied: 0.5, totalPenalties: newPenalties }]);
+      } catch(e){}
+    }
   };
 
   const showWarn = (msg) => {
@@ -14077,6 +14101,9 @@ function CbtStudentView({ toast, currentUser }) {
     setTabSwitches(0);
     setViolations([]);
     setDeviceBlocked(false);
+    setPenaltyDeductions(0);
+    setExamSubmitted(false);
+    setRulesAccepted(false);
 
     // 2. If webcam required, go to cam setup screen first
     if (exam.webcamSnapshots) {
@@ -14092,29 +14119,39 @@ function CbtStudentView({ toast, currentUser }) {
   };
 
   // ── Submit exam ──
-  const doSubmit = async (reason="manual") => {
+  const doSubmit = async (reason="manual", currentViolations, currentPenalties) => {
     const exam = activeExam;
     if (!exam) return;
-    // Calculate score using original question/option indices
-    const score = shuffledQs.reduce((s, sqObj, i) => {
-      const chosen = answers[i]; // index into displayOptions
+    if (examSubmitted) return; // guard against double-submit
+    setExamSubmitted(true);
+    // Use passed-in values or fall back to state (closures can be stale)
+    const vList     = currentViolations  !== undefined ? currentViolations  : violations;
+    const penalties = currentPenalties   !== undefined ? currentPenalties   : penaltyDeductions;
+    // Calculate raw score using original question/option indices
+    const rawScore = shuffledQs.reduce((s, sqObj, i) => {
+      const chosen = answers[i];
       if (chosen === null || chosen === undefined) return s;
       const chosenOrigOpt = sqObj.displayOptions[chosen]?.origOptIdx;
       return s + (chosenOrigOpt === sqObj.origAns ? 1 : 0);
     }, 0);
     const total = shuffledQs.length;
-    const pct   = Math.round((score/total)*100);
+    // Apply penalty: 0.5 per non-tab-switch violation, floored at 0
+    const penalised = Math.max(0, rawScore - penalties);
+    const score     = Math.round(penalised * 10) / 10; // keep 1 decimal
+    const pct       = Math.round((score/total)*100);
     const result = {
-      examId:exam.id, examTitle:exam.title, student:currentUser, score, total,
+      examId:exam.id, examTitle:exam.title, student:currentUser,
+      score, rawScore, penaltyDeductions:penalties, total,
       percent:pct, submittedAt:Date.now(), reason,
-      violations: violations.length,
+      violations: vList.length,
+      autoSubmittedOnLeave: reason==="page_leave",
     };
     const updated = [...results.filter(r=>!(r.examId===exam.id&&r.student===currentUser)), result];
     setResults(updated);
     await cbtResultsSave(updated);
-    if (reason==="auto_tab") {
+    if (["auto_tab","page_leave"].includes(reason)) {
       const all = await cbtViolationsGet();
-      await cbtViolationsSave([...all, {examId:exam.id,student:currentUser,type:"auto_submitted",ts:Date.now()}]);
+      await cbtViolationsSave([...all, {examId:exam.id,student:currentUser,type:"auto_submitted",reason,ts:Date.now()}]);
     }
     if (document.fullscreenElement) exitFullscreen();
     setMyResult(result);
@@ -14195,64 +14232,113 @@ function CbtStudentView({ toast, currentUser }) {
     </div>
   );
 
-  if (mode==="preflight"&&activeExam) return (
-    <div style={{maxWidth:580,margin:"0 auto"}}>
-      <div className="card" style={{borderTop:"4px solid var(--accent)",padding:"28px 24px"}}>
-        <div style={{textAlign:"center",marginBottom:20}}>
-          <div style={{fontSize:48,marginBottom:8}}>📋</div>
-          <div style={{fontWeight:800,fontSize:20,marginBottom:4}}>{activeExam.title}</div>
-          <div style={{fontSize:13,color:"var(--text3)"}}>{activeExam.subject}</div>
-        </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:20}}>
-          {[
-            {icon:"❓",label:"Questions",val:activeExam.questions.length},
-            {icon:"⏱",label:"Duration",val:`${activeExam.duration} minutes`},
-            {icon:"🔀",label:"Question Order",val:activeExam.shuffleQuestions?"Shuffled":"Fixed"},
-            {icon:"🎲",label:"Option Order",val:activeExam.shuffleOptions?"Shuffled":"Fixed"},
-          ].map((s,i)=>(
-            <div key={i} style={{padding:"10px 12px",borderRadius:9,background:"var(--bg4)",border:"1px solid var(--border)",textAlign:"center"}}>
-              <div style={{fontSize:20,marginBottom:3}}>{s.icon}</div>
-              <div style={{fontWeight:800,fontSize:15,color:"var(--accent)"}}>{s.val}</div>
-              <div style={{fontSize:11,color:"var(--text3)"}}>{s.label}</div>
-            </div>
-          ))}
-        </div>
-        <div style={{background:"rgba(239,68,68,.05)",border:"1px solid rgba(239,68,68,.2)",borderRadius:10,padding:"14px 16px",marginBottom:20}}>
-          <div style={{fontWeight:800,fontSize:13,color:"var(--danger)",marginBottom:10}}>🛡️ Exam Rules — Read Carefully</div>
-          <div style={{display:"flex",flexDirection:"column",gap:7}}>
+  if (mode==="preflight"&&activeExam) {
+    const rules = [
+      { icon:"🚪", title:"No Page-Leaving (CRITICAL)", desc:"Leaving, minimising, or switching away from this exam page will IMMEDIATELY auto-submit your exam. You will NOT be allowed to continue unless your lecturer permits a retake.", critical:true },
+      { icon:"🔄", title:"No Tab or Window Switching (CRITICAL)", desc:"Switching to another tab or window — even briefly — will IMMEDIATELY auto-submit your exam with no warning.", critical:true },
+      { icon:"🖥️", title:"Fullscreen is Mandatory", desc:"The exam runs in fullscreen. Exiting fullscreen is a violation and will deduct 0.5 mark from your score each time.", critical:false },
+      { icon:"📸", title:"No Screenshots or Screen Recording", desc:"Any screenshot attempt is automatically detected and logged. Each attempt deducts 0.5 mark from your score.", critical:false },
+      { icon:"🚫", title:"No Talking or Communication", desc:"You must not speak to, signal, or communicate with any other student during the exam. This is an honour-bound rule and any reported breach will be treated as malpractice.", critical:false },
+      { icon:"📵", title:"No External Assistance", desc:"You must not consult textbooks, notes, phones, or any other materials during the exam. All resources must be closed before you start.", critical:false },
+      { icon:"💻", title:"One Device Only", desc:"This exam may only be taken on the device you are starting it on now. Attempting to open it on another device will block your access.", critical:false },
+      { icon:"🖱️", title:"Right-click & Shortcuts Disabled", desc:"Context menus (right-click), Ctrl+C, Ctrl+V, Ctrl+U, F12, and other shortcuts are disabled for the duration of the exam.", critical:false },
+      { icon:"⏱️", title:"Timer Cannot Be Paused", desc:"The countdown timer runs continuously. When it reaches zero, your exam is automatically submitted regardless of how many questions you have answered.", critical:false },
+      { icon:"1️⃣", title:"One Attempt Only", desc:"You have exactly one attempt. Once submitted — for any reason — you cannot retake the exam unless your lecturer explicitly resets your attempt.", critical:false },
+      { icon:"⚠️", title:"0.5 Mark Deduction Per Violation", desc:"Every violation of any rule above (except page-leave/tab-switch which cause immediate auto-submission) will result in 0.5 mark being deducted from your final score. Violations accumulate.", critical:false },
+      { icon:"👁️", title:"All Activity Is Monitored & Recorded", desc:"All violations are recorded in real time with timestamps and reported directly to your lecturer. Webcam snapshots may be taken at the moment violations are detected.", critical:false },
+    ];
+    return (
+      <div style={{maxWidth:640,margin:"0 auto"}}>
+        <div className="card" style={{borderTop:"4px solid var(--danger)",padding:"24px 22px"}}>
+
+          {/* Header */}
+          <div style={{textAlign:"center",marginBottom:20}}>
+            <div style={{fontSize:44,marginBottom:6}}>🛡️</div>
+            <div style={{fontWeight:900,fontSize:20,marginBottom:2,color:"var(--danger)"}}>EXAM ANTI-MALPRACTICE RULES</div>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:2}}>{activeExam.title}</div>
+            <div style={{fontSize:12,color:"var(--text3)"}}>{activeExam.subject}</div>
+          </div>
+
+          {/* Stats strip */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:18}}>
             {[
-              activeExam.fullscreenRequired && "🖥️ Exam will run in fullscreen. Exiting fullscreen will be flagged.",
-              activeExam.tabSwitchLimit>0
-                ? `🔄 You may NOT switch tabs or windows. After ${activeExam.tabSwitchLimit} switch${activeExam.tabSwitchLimit===1?"":"es"} your exam will be auto-submitted.`
-                : "🔄 Tab switches will be logged and reported to your lecturer.",
-              activeExam.webcamSnapshots && "📸 Your webcam will silently take a photo each time a violation is detected.",
-              activeExam.deviceLock && "🔒 Only one device is allowed. Opening this exam on another device will be flagged.",
-              "🚫 Right-clicking and keyboard shortcuts (Ctrl+C, F12, etc.) are disabled.",
-              "⏱ The timer cannot be paused. When it reaches zero, your exam auto-submits.",
-              "📵 One attempt only. You cannot retake unless your lecturer resets you.",
-              "🔀 Questions and options may appear in a different order to your classmates.",
-            ].filter(Boolean).map((rule,i)=>(
-              <div key={i} style={{display:"flex",gap:8,alignItems:"flex-start",fontSize:12,color:"var(--text2)"}}>
-                <span style={{flexShrink:0}}>{rule.slice(0,2)}</span>
-                <span>{rule.slice(2)}</span>
+              {icon:"❓",label:"Questions",val:activeExam.questions.length},
+              {icon:"⏱️",label:"Duration",val:`${activeExam.duration} min`},
+              {icon:"🎯",label:"Attempts",val:"1 only"},
+            ].map((s,i)=>(
+              <div key={i} style={{padding:"8px 6px",borderRadius:8,background:"var(--bg4)",border:"1px solid var(--border)",textAlign:"center"}}>
+                <div style={{fontSize:18,marginBottom:2}}>{s.icon}</div>
+                <div style={{fontWeight:800,fontSize:13,color:"var(--accent)"}}>{s.val}</div>
+                <div style={{fontSize:10,color:"var(--text3)"}}>{s.label}</div>
               </div>
             ))}
           </div>
-        </div>
-        <div style={{background:"rgba(239,68,68,.07)",border:"1px solid rgba(239,68,68,.25)",borderRadius:9,padding:"10px 14px",marginBottom:14,fontSize:12,color:"var(--danger)",fontWeight:700,textAlign:"center"}}>
-          All anti-malpractice measures are mandatory and cannot be bypassed. Violations are recorded and reported to your lecturer in real time.
-        </div>
-        <div style={{fontSize:12,color:"var(--text3)",textAlign:"center",marginBottom:16}}>
-          By clicking Start, you confirm you have read and understood the exam rules.
-        </div>
-        <div style={{display:"flex",gap:10}}>
-          <button className="btn btn-success" style={{flex:1,fontWeight:800,fontSize:15}} onClick={beginAfterPreflight}>
-            {activeExam.fullscreenRequired?"🖥️ Enter Fullscreen & Start":"▶ Start Exam Now"}
-          </button>
+
+          {/* Critical warning box */}
+          <div style={{background:"rgba(239,68,68,.1)",border:"2px solid var(--danger)",borderRadius:10,padding:"12px 14px",marginBottom:16}}>
+            <div style={{fontWeight:900,fontSize:12,color:"var(--danger)",marginBottom:8,letterSpacing:.5}}>⚡ CRITICAL — READ BEFORE YOU START</div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {rules.filter(r=>r.critical).map((r,i)=>(
+                <div key={i} style={{display:"flex",gap:8,alignItems:"flex-start"}}>
+                  <span style={{fontSize:16,flexShrink:0}}>{r.icon}</span>
+                  <div>
+                    <div style={{fontWeight:800,fontSize:12,color:"var(--danger)"}}>{r.title}</div>
+                    <div style={{fontSize:11,color:"var(--text2)",lineHeight:1.5}}>{r.desc}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* All rules list */}
+          <div style={{background:"var(--bg4)",border:"1px solid var(--border)",borderRadius:10,padding:"14px",marginBottom:16}}>
+            <div style={{fontWeight:800,fontSize:12,color:"var(--text2)",marginBottom:10,letterSpacing:.4}}>📋 ALL EXAM RULES</div>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              {rules.filter(r=>!r.critical).map((r,i)=>(
+                <div key={i} style={{display:"flex",gap:8,alignItems:"flex-start"}}>
+                  <span style={{fontSize:15,flexShrink:0}}>{r.icon}</span>
+                  <div>
+                    <div style={{fontWeight:700,fontSize:12,color:"var(--text)"}}>{r.title}</div>
+                    <div style={{fontSize:11,color:"var(--text3)",lineHeight:1.5}}>{r.desc}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Penalty summary */}
+          <div style={{background:"rgba(251,146,60,.07)",border:"1px solid rgba(251,146,60,.35)",borderRadius:9,padding:"10px 14px",marginBottom:16,fontSize:11,lineHeight:1.6,color:"var(--text2)"}}>
+            <span style={{fontWeight:900,color:"var(--warn)"}}>⚠️ PENALTY SUMMARY: </span>
+            Leaving/switching tabs → <strong style={{color:"var(--danger)"}}>IMMEDIATE AUTO-SUBMISSION, exam cannot be continued.</strong>{" "}
+            All other rule violations → <strong style={{color:"var(--warn)"}}>−0.5 mark deducted per occurrence</strong> from your final score.
+            Violations are recorded in real time and reported to your lecturer.
+          </div>
+
+          {/* Mandatory agreement checkbox */}
+          <div style={{background:"var(--bg4)",border:`2px solid ${rulesAccepted?"var(--success)":"var(--border)"}`,borderRadius:10,padding:"12px 14px",marginBottom:18,cursor:"pointer",transition:"all .2s"}}
+            onClick={()=>setRulesAccepted(v=>!v)}>
+            <div style={{display:"flex",gap:10,alignItems:"center"}}>
+              <div style={{width:22,height:22,borderRadius:6,border:`2px solid ${rulesAccepted?"var(--success)":"var(--text3)"}`,background:rulesAccepted?"var(--success)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all .2s"}}>
+                {rulesAccepted&&<span style={{color:"white",fontSize:14,fontWeight:900}}>✓</span>}
+              </div>
+              <div style={{fontSize:12,fontWeight:700,color:rulesAccepted?"var(--success)":"var(--text2)",lineHeight:1.5}}>
+                I have read and understood all the anti-malpractice rules above. I agree to abide by them and accept that any violation will be recorded and may affect my score or result in auto-submission.
+              </div>
+            </div>
+          </div>
+
+          <div style={{display:"flex",gap:10}}>
+            <button className="btn btn-sm" style={{flexShrink:0}} onClick={()=>{setMode("list");setActiveExam(null);if(camStream)camStream.getTracks().forEach(t=>t.stop());}}>← Cancel</button>
+            <button className="btn btn-success" style={{flex:1,fontWeight:900,fontSize:15,opacity:rulesAccepted?1:.45,cursor:rulesAccepted?"pointer":"not-allowed"}}
+              disabled={!rulesAccepted}
+              onClick={()=>{if(rulesAccepted)beginAfterPreflight();}}>
+              {activeExam.fullscreenRequired?"🖥️ Accept Rules & Enter Fullscreen":"▶ Accept Rules & Start Exam"}
+            </button>
+          </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  }
 
   // ── TAKING MODE ──────────────────────────────────────────────────────
   if (mode==="taking"&&activeExam&&shuffledQs.length>0) {
@@ -14304,6 +14390,7 @@ function CbtStudentView({ toast, currentUser }) {
             <div style={{display:"flex",gap:10,fontSize:11,color:"var(--text3)",marginTop:2}}>
               <span>{answeredCnt}/{shuffledQs.length} answered</span>
               {tabSwitches>0&&<span style={{color:"var(--danger)",fontWeight:700}}>🚨 {tabSwitches} flag{tabSwitches>1?"s":""}</span>}
+              {penaltyDeductions>0&&<span style={{color:"var(--warn)",fontWeight:700}}>⚠️ −{penaltyDeductions} pts penalty</span>}
             </div>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:10}}>
@@ -14370,23 +14457,42 @@ function CbtStudentView({ toast, currentUser }) {
     const showResults = activeExam?.showResultsImmediately !== false;
     const grade  = myResult.percent>=70?"A":myResult.percent>=60?"B":myResult.percent>=50?"C":myResult.percent>=40?"D":"F";
     const gColor = myResult.percent>=70?"var(--success)":myResult.percent>=50?"var(--warn)":"var(--danger)";
+    const isPageLeave = myResult.reason==="page_leave";
+    const isAutoTab   = myResult.reason==="auto_tab";
+    const isAuto      = isPageLeave||isAutoTab;
     return (
       <div style={{maxWidth:640,margin:"0 auto"}}>
-        <div className="card" style={{textAlign:"center",padding:"32px 20px",marginBottom:16,borderTop:`4px solid ${showResults?gColor:"var(--accent)"}`}}>
+        <div className="card" style={{textAlign:"center",padding:"32px 20px",marginBottom:16,borderTop:`4px solid ${isAuto?"var(--danger)":showResults?gColor:"var(--accent)"}`}}>
           <div style={{fontSize:60,marginBottom:8}}>
-            {myResult.reason==="auto_tab"?"🚨":showResults?(myResult.percent>=70?"🎉":myResult.percent>=50?"👍":"😔"):"✅"}
+            {isAuto?"🚨":showResults?(myResult.percent>=70?"🎉":myResult.percent>=50?"👍":"😔"):"✅"}
           </div>
           <div style={{fontWeight:800,fontSize:22,marginBottom:4}}>
-            {myResult.reason==="auto_tab"?"Exam Auto-Submitted":"Exam Submitted!"}
+            {isAuto?"Exam Auto-Submitted":"Exam Submitted!"}
           </div>
-          {myResult.reason==="auto_tab"&&<div style={{fontSize:12,color:"var(--danger)",marginBottom:8,fontWeight:700}}>Your exam was auto-submitted due to repeated tab switching.</div>}
+          {isPageLeave&&(
+            <div style={{fontSize:13,color:"var(--danger)",marginBottom:10,fontWeight:700,background:"rgba(239,68,68,.08)",border:"1px solid rgba(239,68,68,.25)",borderRadius:8,padding:"10px 14px"}}>
+              ⚠️ Your exam was automatically submitted because you left or minimised the exam page.<br/>
+              <span style={{fontSize:11,fontWeight:400,color:"var(--text3)"}}>You cannot continue this exam. Contact your lecturer if you believe this was an error.</span>
+            </div>
+          )}
+          {isAutoTab&&!isPageLeave&&(
+            <div style={{fontSize:12,color:"var(--danger)",marginBottom:8,fontWeight:700}}>Your exam was auto-submitted because you switched tabs or windows.</div>
+          )}
           <div style={{fontSize:13,color:"var(--text3)",marginBottom:20}}>{activeExam?.title}</div>
           {showResults ? (
-            <div style={{display:"flex",justifyContent:"center",gap:28,flexWrap:"wrap"}}>
-              <div><div style={{fontSize:42,fontWeight:800,color:"var(--accent)"}}>{myResult.score}/{myResult.total}</div><div style={{fontSize:12,color:"var(--text3)"}}>Score</div></div>
-              <div><div style={{fontSize:42,fontWeight:800,color:gColor}}>{myResult.percent}%</div><div style={{fontSize:12,color:"var(--text3)"}}>Percentage</div></div>
-              <div><div style={{fontSize:42,fontWeight:800,color:gColor}}>{grade}</div><div style={{fontSize:12,color:"var(--text3)"}}>Grade</div></div>
-            </div>
+            <>
+              <div style={{display:"flex",justifyContent:"center",gap:28,flexWrap:"wrap",marginBottom:myResult.penaltyDeductions>0?12:0}}>
+                <div><div style={{fontSize:42,fontWeight:800,color:"var(--accent)"}}>{myResult.score}/{myResult.total}</div><div style={{fontSize:12,color:"var(--text3)"}}>Final Score</div></div>
+                <div><div style={{fontSize:42,fontWeight:800,color:gColor}}>{myResult.percent}%</div><div style={{fontSize:12,color:"var(--text3)"}}>Percentage</div></div>
+                <div><div style={{fontSize:42,fontWeight:800,color:gColor}}>{grade}</div><div style={{fontSize:12,color:"var(--text3)"}}>Grade</div></div>
+              </div>
+              {myResult.penaltyDeductions>0&&(
+                <div style={{marginTop:8,padding:"8px 14px",background:"rgba(251,146,60,.08)",border:"1px solid rgba(251,146,60,.3)",borderRadius:8,fontSize:12}}>
+                  <span style={{color:"var(--warn)",fontWeight:800}}>⚠️ Penalty applied: </span>
+                  <span style={{color:"var(--text2)"}}>Raw score {myResult.rawScore}/{myResult.total} − {myResult.penaltyDeductions} (violations) = <strong>{myResult.score}</strong></span>
+                </div>
+              )}
+            </>
           ) : (
             <div style={{padding:"16px 20px",background:"var(--bg4)",borderRadius:10,border:"1px solid var(--border)"}}>
               <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Your response has been recorded.</div>
@@ -14576,10 +14682,21 @@ function CbtStudentView({ toast, currentUser }) {
                   return (
                     <tr key={i}>
                       <td style={{fontWeight:600}}>{r.examTitle}</td>
-                      <td style={{color:"var(--accent)",fontWeight:700}}>{r.score}/{r.total}</td>
+                      <td style={{color:"var(--accent)",fontWeight:700}}>
+                        {r.score}/{r.total}
+                        {r.penaltyDeductions>0&&<span style={{fontSize:10,color:"var(--warn)",marginLeft:4}}>−{r.penaltyDeductions}</span>}
+                      </td>
                       <td style={{color:gColor,fontWeight:700}}>{r.percent}%</td>
                       <td><span style={{fontWeight:800,color:gColor}}>{grade}</span></td>
-                      <td>{r.violations>0?<span style={{color:"var(--danger)",fontWeight:700}}>🚨 {r.violations}</span>:<span style={{color:"var(--success)"}}>✅ 0</span>}</td>
+                      <td>
+                        {r.autoSubmittedOnLeave
+                          ? <span style={{color:"var(--danger)",fontWeight:700}}>🚪 Left page</span>
+                          : r.reason==="auto_tab"
+                            ? <span style={{color:"var(--danger)",fontWeight:700}}>🔄 Tab switch</span>
+                            : r.violations>0
+                              ? <span style={{color:"var(--warn)",fontWeight:700}}>⚠️ {r.violations}</span>
+                              : <span style={{color:"var(--success)"}}>✅ 0</span>}
+                      </td>
                       <td style={{fontSize:11,color:"var(--text3)"}}>{r.submittedAt?new Date(r.submittedAt).toLocaleDateString():"-"}</td>
                     </tr>
                   );
