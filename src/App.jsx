@@ -5547,32 +5547,35 @@ function MCQExamView({ toast, currentUser, banks, onBack, backLabel }) {
 // ─── Essay Exam View ───────────────────────────────────────────────────
 function EssayExamView({ toast, currentUser, essayBanks }) {
   const attKey = `nv-essay-att-${currentUser}`;
-  const [sel, setSel] = useState(null);
-  const [active, setActive] = useState(false);
-  const [answers, setAnswers] = useState({});
-  const [done, setDone] = useState(false);
-  const [grading, setGrading] = useState(false);
-  const [feedback, setFeedback] = useState(null);
-  const [savedAnswers, setSavedAnswers] = useState({});
-  const [openQ, setOpenQ] = useState(null); // index of currently open question
+  const [sel, setSel] = React.useState(null);
+  const [answers, setAnswers] = React.useState({});
+  const [openQ, setOpenQ] = React.useState(null);
+  const [done, setDone] = React.useState(false);
+  const [grading, setGrading] = React.useState(false);
+  const [feedback, setFeedback] = React.useState(null);
+  const [savedAnswers, setSavedAnswers] = React.useState({});
 
   const startExam = (bank) => {
     const att = ls(attKey, {});
     if (att[String(bank.id)]) { toast("You have already used your 1 attempt for this essay.", "error"); return; }
-    setSel(bank); setAnswers({}); setOpenQ(null); setActive(true); setDone(false); setFeedback(null);
+    setSel(bank); setAnswers({}); setOpenQ(null); setDone(false); setFeedback(null);
   };
 
   const submitEssay = async () => {
-    const missing = sel.questions.filter((_,i) => !(answers[i]||"").trim()).length;
-    if (missing > 0 && !window.confirm(`${missing} question(s) have no answer. Submit anyway?`)) return;
+    const missing = (sel.questions||[]).filter((_,i) => !(answers[i]||"").trim()).length;
+    if (missing > 0 && !window.confirm(`${missing} question(s) unanswered. Submit anyway?`)) return;
     if (!window.confirm("Submit essay? You only have 1 attempt — this cannot be undone.")) return;
 
     const snap = {...answers};
     setSavedAnswers(snap);
-    setActive(false); setDone(true); setGrading(true);
+    setDone(true); setGrading(true);
 
-    const totalMarks = sel.questions.reduce((s,q)=>s+(+q.marks||10),0);
-    const qaText = sel.questions.map((q,i)=>["Q"+(i+1)+" ["+(q.marks||10)+" marks]: "+q.q, "Key points: "+(q.modelAnswer||"Use professional nursing knowledge"), "Student answer: "+(snap[i]||"(no answer)").trim()].join("\n")).join("\n\n");
+    const totalMarks = (sel.questions||[]).reduce((s,q)=>s+(+q.marks||10),0);
+    const qaText = (sel.questions||[]).map((q,i)=>[
+      "Q"+(i+1)+" ["+(q.marks||10)+" marks]: "+q.q,
+      "Key points: "+(q.modelAnswer||"Use professional nursing knowledge"),
+      "Student answer: "+(snap[i]||"(no answer)").trim()
+    ].join("\n")).join("\n\n");
     const submissionBase = { date:new Date().toLocaleDateString(), subject:sel.subject, answers:snap, questions:sel.questions, totalMarks };
 
     try {
@@ -5580,50 +5583,29 @@ function EssayExamView({ toast, currentUser, essayBanks }) {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({
           model:"claude-sonnet-4-20250514", max_tokens:2000,
-          messages:[{ role:"user", content:`You are a professional nursing lecturer marking essay exam answers. Be fair, thorough and constructive.
-
-Exam: ${sel.subject}
-Total Marks: ${totalMarks}
-
-${qaText}
-
-Return ONLY valid JSON with no markdown or backticks:
-{"overallScore":number,"totalMarks":${totalMarks},"overallPct":number,"grade":"A/B/C/D/F","overallComment":"2-3 sentence summary of performance","questions":[{"marksAwarded":number,"maxMarks":number,"strengths":"specific strengths","weaknesses":"specific gaps","feedback":"actionable feedback"}]}`
-        }]
+          messages:[{ role:"user", content:`You are a professional nursing lecturer marking essay exam answers. Be fair, thorough and constructive.\n\nExam: ${sel.subject}\nTotal Marks: ${totalMarks}\n\n${qaText}\n\nReturn ONLY valid JSON with no markdown or backticks:\n{"overallScore":number,"totalMarks":${totalMarks},"overallPct":number,"grade":"A/B/C/D/F","overallComment":"2-3 sentence summary","questions":[{"marksAwarded":number,"maxMarks":number,"strengths":"...","weaknesses":"...","feedback":"..."}]}` }]
         })
       });
       const data = await res.json();
       const raw = (data.content?.[0]?.text||"").replace(/```json|```/g,"").trim();
       const parsed = JSON.parse(raw);
-
       const attData = { date:new Date().toLocaleDateString(), score:parsed.overallScore, total:totalMarks, pct:parsed.overallPct, grade:parsed.grade, answers:snap, feedback:parsed, gradedByAI:true };
-      const att = ls(attKey, {});
-      att[String(sel.id)] = attData;
+      const att = ls(attKey, {}); att[String(sel.id)] = attData;
       saveMyData("essay-att",attKey,att);
-
-      // Save to backend for lecturer visibility
       saveEssaySubmissionToBackend(currentUser, sel.id, { ...submissionBase, feedback:parsed, gradedByAI:true, grade:parsed.grade, pct:parsed.overallPct });
-
-      const results = ls("nv-results",[]);
-      saveMyData("results","nv-results",[...results,{id:Date.now(),subject:sel.subject,type:"Essay (AI)",score:parsed.overallScore,total:totalMarks,pct:parsed.overallPct,date:new Date().toLocaleDateString()}]);
-
+      const results = ls("nv-results",[]); saveMyData("results","nv-results",[...results,{id:Date.now(),subject:sel.subject,type:"Essay (AI)",score:parsed.overallScore,total:totalMarks,pct:parsed.overallPct,date:new Date().toLocaleDateString()}]);
       setFeedback(parsed);
     } catch(e) {
-      // AI unavailable — save submission for MANUAL LECTURER GRADING
       const attData = { date:new Date().toLocaleDateString(), score:null, total:totalMarks, pct:null, grade:null, answers:snap, feedback:null, pendingManualGrade:true };
-      const att = ls(attKey, {});
-      att[String(sel.id)] = attData;
+      const att = ls(attKey, {}); att[String(sel.id)] = attData;
       saveMyData("essay-att",attKey,att);
-
-      // Save to backend so lecturer can see and grade manually
       saveEssaySubmissionToBackend(currentUser, sel.id, { ...submissionBase, pendingManualGrade:true });
-
-      toast("AI unavailable. Your essay has been saved for manual grading by your lecturer.", "warn");
+      toast("AI unavailable. Essay saved for manual grading.", "warn");
     }
     setGrading(false);
   };
 
-  // Results screen
+  // ── Results screen ──
   if (done && sel) {
     const gradeColors = {A:"var(--success)",B:"var(--accent2)",C:"var(--warn)",D:"var(--danger)",F:"var(--danger)"};
     const gc = gradeColors[feedback?.grade]||"var(--text3)";
@@ -5631,45 +5613,34 @@ Return ONLY valid JSON with no markdown or backticks:
       <div style={{maxWidth:680,margin:"0 auto"}}>
         <div style={{textAlign:"center",padding:"24px 0 20px"}}>
           {grading ? (
-            <>
-              <div style={{fontSize:52,marginBottom:12,animation:"spin 2s linear infinite",display:"inline-block"}}>🤖</div>
-              <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20,marginBottom:8}}>Claude AI is grading your essay…</div>
-              <div style={{fontSize:12,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>Analysing your answers — please do not close this page</div>
-            </>
+            <><div style={{fontSize:52,marginBottom:12,animation:"spin 2s linear infinite",display:"inline-block"}}>🤖</div>
+            <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20,marginBottom:8}}>Claude AI is grading your essay…</div>
+            <div style={{fontSize:12,color:"var(--text3)",fontFamily:"'DM Mono',monospace"}}>Please do not close this page</div></>
           ) : feedback ? (
-            <>
-              <div style={{fontSize:52,marginBottom:10}}>{feedback.overallPct>=70?"🎉":feedback.overallPct>=50?"👍":"📚"}</div>
-              <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20,marginBottom:8}}>Grading Complete</div>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:16,marginBottom:10}}>
-                <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:48,lineHeight:1,color:feedback.overallPct>=70?"var(--success)":feedback.overallPct>=50?"var(--warn)":"var(--danger)"}}>{feedback.overallPct}%</div>
-                <div style={{width:54,height:54,borderRadius:12,background:`${gc}22`,border:`2px solid ${gc}`,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:28,color:gc}}>{feedback.grade}</div>
-              </div>
-              <div style={{fontSize:13,color:"var(--text2)",maxWidth:480,margin:"0 auto",lineHeight:1.6}}>{feedback.overallComment}</div>
-            </>
+            <><div style={{fontSize:52,marginBottom:10}}>{feedback.overallPct>=70?"🎉":feedback.overallPct>=50?"👍":"📚"}</div>
+            <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20,marginBottom:8}}>Grading Complete</div>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:16,marginBottom:10}}>
+              <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:48,lineHeight:1,color:feedback.overallPct>=70?"var(--success)":feedback.overallPct>=50?"var(--warn)":"var(--danger)"}}>{feedback.overallPct}%</div>
+              <div style={{width:54,height:54,borderRadius:12,background:`${gc}22`,border:`2px solid ${gc}`,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:28,color:gc}}>{feedback.grade}</div>
+            </div>
+            <div style={{fontSize:13,color:"var(--text2)",maxWidth:480,margin:"0 auto",lineHeight:1.6}}>{feedback.overallComment}</div></>
           ) : (
-            <>
-              <div style={{fontSize:52,marginBottom:10}}>📝</div>
-              <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20}}>Essay Submitted for Manual Grading</div>
-              <div style={{fontSize:13,color:"var(--text3)",marginTop:8,maxWidth:440,margin:"8px auto 0",lineHeight:1.6}}>
-                AI grading was unavailable. Your answers have been saved to the backend and sent to your lecturer for manual marking. Check back later for your result.
-              </div>
-              <div style={{marginTop:16,background:"rgba(251,146,60,.08)",border:"1px solid rgba(251,146,60,.25)",borderRadius:12,padding:"12px 18px",fontSize:12,color:"var(--warn)",display:"inline-block"}}>
-                ⏳ Awaiting lecturer feedback
-              </div>
-            </>
+            <><div style={{fontSize:52,marginBottom:10}}>📝</div>
+            <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20}}>Submitted for Manual Grading</div>
+            <div style={{fontSize:13,color:"var(--text3)",marginTop:8,maxWidth:440,margin:"8px auto 0",lineHeight:1.6}}>Your answers have been sent to your lecturer. Check back later for your result.</div>
+            <div style={{marginTop:16,background:"rgba(251,146,60,.08)",border:"1px solid rgba(251,146,60,.25)",borderRadius:12,padding:"12px 18px",fontSize:12,color:"var(--warn)",display:"inline-block"}}>⏳ Awaiting lecturer feedback</div></>
           )}
         </div>
-
         {!grading && feedback?.questions && (
           <div style={{marginTop:20}}>
-            {sel.questions.map((q,i)=>{
+            {(sel.questions||[]).map((q,i)=>{
               const qf=feedback.questions[i]||{};
               const qpct=qf.maxMarks>0?Math.round((qf.marksAwarded/qf.maxMarks)*100):0;
               return (
                 <div key={i} className="card" style={{marginBottom:14,borderLeft:`3px solid ${qpct>=70?"var(--success)":qpct>=50?"var(--warn)":"var(--danger)"}`}}>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
                     <div style={{fontWeight:700,fontSize:14,flex:1,marginRight:12}}>Q{i+1}. {q.q}</div>
-                    <span style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16,color:qpct>=70?"var(--success)":qpct>=50?"var(--warn)":"var(--danger)",flexShrink:0}}>{qf.marksAwarded||0}/{qf.maxMarks||q.marks||10}</span>
+                    <span style={{fontWeight:800,fontSize:16,color:qpct>=70?"var(--success)":qpct>=50?"var(--warn)":"var(--danger)",flexShrink:0}}>{qf.marksAwarded||0}/{qf.maxMarks||q.marks||10}</span>
                   </div>
                   <div style={{fontSize:13,color:"var(--text3)",fontStyle:"italic",borderLeft:"2px solid var(--border2)",paddingLeft:10,marginBottom:10,lineHeight:1.6}}>{savedAnswers[i]||"(no answer)"}</div>
                   {qf.strengths&&<div style={{fontSize:12,marginBottom:4}}><b style={{color:"var(--success)"}}>✓ Strengths: </b>{qf.strengths}</div>}
@@ -5680,108 +5651,69 @@ Return ONLY valid JSON with no markdown or backticks:
             })}
           </div>
         )}
-
-        {!grading && <div style={{textAlign:"center",marginTop:16}}><button className="btn" onClick={()=>{setSel(null);setDone(false);setFeedback(null);}}>← Back</button></div>}
+        <button className="btn" style={{marginTop:12}} onClick={()=>{setSel(null);setDone(false);setFeedback(null);}}>← Back to Essay Exams</button>
       </div>
     );
   }
 
-  // ── Active essay screen — click a question to open its textarea ──
-  if (active && sel) {
-    const answeredCount = sel.questions.filter((_,i)=>(answers[i]||"").trim().length>0).length;
+  // ── Active exam — simple always-visible textareas ──
+  if (sel) {
+    const answeredCount = (sel.questions||[]).filter((_,i)=>(answers[i]||"").trim().length>0).length;
     return (
       <div style={{maxWidth:720,margin:"0 auto",paddingBottom:40}}>
-
-        {/* Header */}
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:10}}>
           <div>
             <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:18}}>{sel.subject}</div>
-            <div style={{fontSize:12,color:"var(--text3)",marginTop:2,fontFamily:"'DM Mono',monospace"}}>
-              {sel.questions.length} question{sel.questions.length!==1?"s":""} · {sel.questions.reduce((s,q)=>s+(+q.marks||10),0)} total marks · {answeredCount}/{sel.questions.length} answered
-            </div>
+            <div style={{fontSize:12,color:"var(--text3)",marginTop:2}}>{(sel.questions||[]).length} questions · {(sel.questions||[]).reduce((s,q)=>s+(+q.marks||10),0)} total marks · {answeredCount}/{(sel.questions||[]).length} answered</div>
           </div>
           <div style={{display:"flex",gap:8}}>
-            <button className="btn" onClick={()=>{if(window.confirm("Exit? Your answers will be lost."))setActive(false);}}>Exit</button>
+            <button className="btn" onClick={()=>{if(window.confirm("Exit? Answers will be lost."))setSel(null);}}>Exit</button>
             <button className="btn btn-accent" style={{fontWeight:800}} onClick={submitEssay}>Submit Essay ✓</button>
           </div>
         </div>
-
-        {/* Progress bar */}
-        <div style={{height:6,borderRadius:3,background:"var(--bg4)",marginBottom:18,overflow:"hidden"}}>
-          <div style={{height:"100%",borderRadius:3,background:"var(--success)",width:`${(answeredCount/Math.max(sel.questions.length,1))*100}%`,transition:"width .4s"}} />
+        <div style={{height:6,borderRadius:3,background:"var(--bg4)",marginBottom:24,overflow:"hidden"}}>
+          <div style={{height:"100%",borderRadius:3,background:"var(--success)",width:`${(answeredCount/Math.max((sel.questions||[]).length,1))*100}%`,transition:"width .4s"}} />
         </div>
-
-        <div style={{fontSize:11,color:"var(--text3)",marginBottom:16,fontFamily:"'DM Mono',monospace"}}>
-          💡 Click a question to open it and type or paste your answer
-        </div>
-
-        {/* Questions list — each expands on click */}
-        {sel.questions.map((q,i)=>{
+        {(sel.questions||[]).map((q,i)=>{
           const val = answers[i]||"";
           const answered = val.trim().length > 0;
           const wc = val.trim().split(/\s+/).filter(Boolean).length;
-          const isOpen = openQ === i;
           return (
-            <div key={i} style={{marginBottom:12,borderRadius:14,overflow:"hidden",border:`1.5px solid ${isOpen?"var(--accent)":answered?"var(--success)":"var(--border)"}`,transition:"border-color .2s"}}>
-
-              {/* Question header — click to toggle open/close */}
-              <div
-                onClick={()=>setOpenQ(isOpen ? null : i)}
-                style={{padding:"16px 18px",background:isOpen?"rgba(0,119,182,.05)":"var(--card)",cursor:"pointer",display:"flex",alignItems:"flex-start",gap:12,userSelect:"none"}}
-              >
-                {/* Badge */}
-                <div style={{minWidth:32,height:32,borderRadius:9,background:answered?"var(--success)":isOpen?"var(--accent)":"var(--bg4)",border:`1.5px solid ${answered?"var(--success)":isOpen?"var(--accent)":"var(--border2)"}`,color:answered||isOpen?"white":"var(--text3)",fontWeight:800,fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all .2s"}}>
-                  {answered ? "✓" : `Q${i+1}`}
+            <div key={i} className="card" style={{marginBottom:16,borderLeft:`3px solid ${answered?"var(--success)":"var(--border)"}`}}>
+              <div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:12}}>
+                <div style={{minWidth:32,height:32,borderRadius:8,background:answered?"var(--success)":"var(--accent)",color:"white",fontWeight:800,fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                  {answered?"✓":`Q${i+1}`}
                 </div>
-
-                {/* Question text + meta */}
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{fontWeight:700,fontSize:14,lineHeight:1.6,color:"var(--text)",marginBottom:4}}>{q.q}</div>
-                  <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
-                    <span style={{fontSize:10,fontWeight:700,color:"var(--accent)",background:"rgba(0,119,182,.1)",padding:"2px 8px",borderRadius:10,border:"1px solid rgba(0,119,182,.2)"}}>{q.marks||10} marks</span>
-                    {q.wordGuide&&<span style={{fontSize:10,color:"var(--text3)",background:"var(--bg4)",padding:"2px 8px",borderRadius:10,border:"1px solid var(--border)"}}>~{q.wordGuide} words</span>}
-                    {answered&&<span style={{fontSize:10,color:"var(--success)",fontWeight:700}}>✅ {wc} word{wc!==1?"s":""}</span>}
-                    {!answered&&isOpen&&<span style={{fontSize:10,color:"var(--text3)"}}>⬜ Not answered yet</span>}
+                <div style={{flex:1}}>
+                  <div style={{fontWeight:700,fontSize:14,lineHeight:1.6,color:"var(--text)",marginBottom:6}}>{q.q}</div>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                    <span style={{fontSize:11,fontWeight:700,color:"var(--accent)",background:"rgba(0,119,182,.1)",padding:"2px 8px",borderRadius:8}}>{q.marks||10} marks</span>
+                    {q.wordGuide&&<span style={{fontSize:11,color:"var(--text3)",background:"var(--bg4)",padding:"2px 8px",borderRadius:8}}>~{q.wordGuide} words</span>}
                   </div>
                 </div>
-
-                {/* Chevron */}
-                <div style={{fontSize:18,color:"var(--text3)",flexShrink:0,transform:isOpen?"rotate(180deg)":"rotate(0deg)",transition:"transform .25s"}}>⌄</div>
               </div>
-
-              {/* Textarea — only shown when open */}
-              {isOpen && (
-                <div onClick={e=>e.stopPropagation()} style={{padding:"0 18px 18px",background:"var(--bg4)",borderTop:"1px solid var(--border)"}}>
-                  <textarea
-                    rows={8}
-                    style={{width:"100%",resize:"vertical",padding:"14px",fontSize:14,lineHeight:1.75,borderRadius:10,border:`1.5px solid ${answered?"var(--success)":"var(--border2)"}`,background:"var(--bg)",color:"var(--text)",outline:"none",fontFamily:"inherit",boxSizing:"border-box",marginTop:14,display:"block"}}
-                    placeholder={`Write or paste your answer here (aim for ${q.wordGuide||"100–200"} words)…`}
-                    value={val}
-                    onChange={e=>{const v=e.target.value; setAnswers(a=>({...a,[i]:v}));}}
-                  />
-                  <div style={{display:"flex",justifyContent:"space-between",fontSize:11,marginTop:6,fontFamily:"'DM Mono',monospace",color:answered?"var(--success)":"var(--text3)"}}>
-                    <span>{answered?"✓ ":""}{wc} word{wc!==1?"s":""}</span>
-                    {i < sel.questions.length-1
-                      ? <button className="btn btn-sm btn-success" onClick={e=>{e.stopPropagation();setOpenQ(i+1);}}>Next Question →</button>
-                      : <span style={{color:"var(--accent)",fontWeight:700}}>Last question</span>
-                    }
-                  </div>
-                </div>
-              )}
+              <textarea
+                rows={6}
+                style={{width:"100%",resize:"vertical",padding:"12px 14px",fontSize:14,lineHeight:1.7,borderRadius:10,border:`1.5px solid ${answered?"var(--success)":"var(--border2)"}`,background:"var(--bg)",color:"var(--text)",fontFamily:"inherit",boxSizing:"border-box",display:"block"}}
+                placeholder={`Write or paste your answer here…`}
+                value={val}
+                onChange={e=>{ const v = e.target.value; setAnswers(prev=>({...prev,[i]:v})); }}
+              />
+              <div style={{fontSize:11,color:answered?"var(--success)":"var(--text3)",marginTop:6,textAlign:"right",fontFamily:"'DM Mono',monospace"}}>
+                {answered?`✓ ${wc} word${wc!==1?"s":""}  ✅ Answered`:"⬜ Not answered"}
+              </div>
             </div>
           );
         })}
-
-        {/* Submit footer */}
-        <div style={{display:"flex",gap:10,justifyContent:"flex-end",marginTop:16}}>
-          <button className="btn" onClick={()=>{if(window.confirm("Exit? Your answers will be lost."))setActive(false);}}>Exit</button>
-          <button className="btn btn-accent" style={{fontWeight:800,fontSize:15,padding:"10px 28px"}} onClick={submitEssay}>Submit Essay ✓</button>
+        <div style={{display:"flex",gap:10,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn" onClick={()=>{if(window.confirm("Exit? Answers will be lost."))setSel(null);}}>Exit</button>
+          <button className="btn btn-accent" style={{fontWeight:800,fontSize:15}} onClick={submitEssay}>Submit Essay ✓</button>
         </div>
       </div>
     );
   }
 
-  // Essay bank list
+  // ── Essay bank list ──
   return (
     <div>
       {essayBanks.length===0 ? (
@@ -5810,7 +5742,6 @@ Return ONLY valid JSON with no markdown or backticks:
                       <div style={{marginBottom:6}}>
                         <div style={{fontSize:14,fontWeight:700,marginBottom:2}}>Grade: <span style={{color:"var(--accent)"}}>{att.manualGrade.grade}</span> · {att.manualGrade.pct}%</div>
                         {att.manualGrade.overallComment && <div style={{fontSize:12,color:"var(--text2)"}}>{att.manualGrade.overallComment}</div>}
-                        <div style={{fontSize:10,color:"var(--text3)",fontFamily:"'DM Mono',monospace",marginTop:4}}>✏️ Manually graded on {att.gradedDate}</div>
                       </div>
                     )}
                     {att.grade && !att.manualGrade && <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Grade: <span style={{color:"var(--accent)"}}>{att.grade}</span> · {att.pct}%</div>}
@@ -5827,7 +5758,6 @@ Return ONLY valid JSON with no markdown or backticks:
     </div>
   );
 }
-
 
 // ══════════════════════════════════════════════════════════════════
 // ── STUDENT ID CARD GENERATOR ────────────────────────────────────
