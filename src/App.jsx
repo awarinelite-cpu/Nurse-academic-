@@ -12374,64 +12374,96 @@ const parseCbtQuestions = (qText, ansText = "") => {
   const ansLines = ansText.trim().split("\n").map(l => l.trim()).filter(Boolean);
   const normalized = qText.trim().split("\n").map(l => l.trimEnd()).join("\n");
 
-  // Strategy 1: split on blank lines
-  let rawBlocks = normalized.split(/\n[ \t]*\n+/).map(b => b.trim()).filter(Boolean);
+  // Letter/roman → 0-3 index
+  const LTR = {A:0,B:1,C:2,D:3,a:0,b:1,c:2,d:3,"1":0,"2":1,"3":2,"4":3,i:0,ii:1,iii:2,iv:3,I:0,II:1,III:2,IV:3};
+  const mapLetter = (s) => { const k=s.trim(); return LTR[k]??LTR[k.toLowerCase()]??LTR[k.toUpperCase()]??0; };
 
-  // Strategy 2: no blank lines — split on question-number patterns
-  if (rawBlocks.length <= 1) {
-    const qStartRe = /(?:^|\n)((?:Q(?:uestion)?\s*\.?\d*\s*[:.\-)]?\s*|\d+\s*[.):]\s*).{5,})/gi;
-    const matches = [...normalized.matchAll(qStartRe)];
-    if (matches.length > 1) {
-      const positions = matches.map(m => m.index + (m[0].startsWith("\n") ? 1 : 0));
-      rawBlocks = positions.map((pos, i) => {
-        const end = positions[i + 1] ?? normalized.length;
-        return normalized.slice(pos, end).trim();
+  // Option line: single A-D / 1-4 / roman numeral + separator  
+  const OPT_RE = /^[\(\[]?\s*([A-Da-d]|[1-4]|i{1,3}v?)\s*[\)\]:.\)\-]\s*(.+)$/;
+  // Answer declaration line
+  const ANS_RE = /^(?:ANS(?:WER)?|Ans(?:wer)?|Answer)\s*[-:.\)\s]\s*([A-Da-d1-4]|i{1,3}v?)\b/i;
+  // Strip leading question number / Q: prefix
+  const QSTRIP = /^(?:Q(?:uestion)?\s*\.?\s*\d*\s*[-:.)]?\s*|\d+\s*[.):\-]\s*)/i;
+
+  const isOpt = (line) => {
+    const m = line.match(OPT_RE);
+    if (!m) return false;
+    // single digit 1-4 with long text (5+ words or ends ?) = question, not option
+    if (/^[1-4]$/.test(m[1])) {
+      const t = m[2].trim();
+      if (t.split(/\s+/).length >= 5 || t.endsWith("?")) return false;
+    }
+    return true;
+  };
+  const isAns = (line) => ANS_RE.test(line);
+
+  // Expand compact single-line "Question A)opt B)opt C)opt D)opt" into separate lines
+  const expandIfCompact = (line) => {
+    const count = (line.match(/\b[A-Da-d]\s*[\):]\s*\S/g)||[]).length;
+    if (count >= 3 && !isOpt(line) && !isAns(line)) {
+      const parts = line.split(/\s+(?=[A-Da-d]\s*[\):.][^\s])/);
+      if (parts.length >= 3) return parts;
+    }
+    return [line];
+  };
+
+  // Pre-process: expand any compact lines
+  const preLines = normalized.split("\n").flatMap(l => expandIfCompact(l.trimEnd()));
+  const preText  = preLines.join("\n");
+
+  // ── Split into per-question blocks ────────────────────────────────────────
+  let rawBlocks;
+
+  // Strategy 1: blank-line separated (most common)
+  const blankSplit = preText.split(/\n[ \t]*\n+/).map(b=>b.trim()).filter(Boolean);
+  if (blankSplit.length > 1) {
+    rawBlocks = blankSplit;
+  } else {
+    // Strategy 2: find lines that begin a new question
+    const lines = preText.split("\n");
+    const qStarts = [];
+    for (let i=0; i<lines.length; i++) {
+      const l = lines[i].trim();
+      if (!l) continue;
+      const isNumQ     = /^\d+\s*[.):\-]\s*.+/.test(l) && !isOpt(l) && !isAns(l);
+      const isQPfx     = /^Q(?:uestion)?\s*\.?\s*\d*\s*[-:.)]?\s*.+/i.test(l) && !isOpt(l) && !isAns(l);
+      const prevL      = lines[i-1]?.trim()||"";
+      const afterOptAns = (i===0 || isOpt(prevL) || isAns(prevL)) && !isOpt(l) && !isAns(l);
+      if (isNumQ || isQPfx || afterOptAns) qStarts.push(i);
+    }
+    if (qStarts.length > 1) {
+      rawBlocks = qStarts.map((start,i) => {
+        const end = qStarts[i+1]??lines.length;
+        return lines.slice(start,end).join("\n").trim();
       }).filter(Boolean);
+    } else {
+      rawBlocks = [preText];
     }
   }
 
-  // Strategy 3: fallback — whole text is one question
-  if (rawBlocks.length === 0) rawBlocks = [normalized];
-
-  const OPTION_RE  = /^[\(\[]?\s*([AaBbCcDd]|[1-4])\s*[\)\]:.\-]\s*(.+)$/;
-  const ANS_RE     = /^(?:ANS(?:WER)?|Ans(?:wer)?)\s*[:.\-)]?\s*:?\s*([A-Da-d1-4])\b/i;
-  const QNUM_STRIP = /^(?:Q(?:uestion)?\s*\.?\d*\s*[:.\-)]?\s*|\d+\s*[.):] ?)/i;
-
-  const items = rawBlocks.map((block, idx) => {
-    const lines = block.split("\n").map(l => l.trim()).filter(Boolean);
-    let q = "", options = ["", "", "", ""], ans = 0, foundAns = false;
-
+  // ── Parse one block ───────────────────────────────────────────────────────
+  const parseBlock = (block) => {
+    const lines = block.split("\n").map(l=>l.trim()).filter(Boolean);
+    let q="", options=["","","",""], ans=0, foundAns=false;
     for (const line of lines) {
-      const ansMatch = line.match(ANS_RE);
-      if (ansMatch) {
-        const a = ansMatch[1].toUpperCase();
-        const mapped = { A:0, B:1, C:2, D:3, "1":0, "2":1, "3":2, "4":3 }[a];
-        if (mapped !== undefined) { ans = mapped; foundAns = true; }
+      const am = line.match(ANS_RE);
+      if (am) { ans=mapLetter(am[1]); foundAns=true; continue; }
+      if (isOpt(line)) {
+        const m=line.match(OPT_RE); if(!m) continue;
+        const oi=mapLetter(m[1]); const txt=m[2].trim();
+        if (txt && oi>=0 && oi<=3) options[oi]=txt;
         continue;
       }
-      const optMatch = line.match(OPTION_RE);
-      if (optMatch) {
-        const letter = optMatch[1].toUpperCase();
-        const text   = optMatch[2].trim();
-        const oi = { A:0, B:1, C:2, D:3, "1":0, "2":1, "3":2, "4":3 }[letter];
-        if (oi !== undefined && text) { options[oi] = text; continue; }
-      }
-      if (!q) {
-        const stripped = line.replace(QNUM_STRIP, "").trim();
-        if (stripped && !line.match(OPTION_RE)) { q = stripped; }
-      }
+      if (!q) q=line.replace(QSTRIP,"").trim();
     }
+    return {q:q.trim(), options, ans, _hasAns:foundAns};
+  };
 
-    if (ansLines[idx]) {
-      const a = ansLines[idx][0]?.toUpperCase();
-      const mapped = { A:0, B:1, C:2, D:3, "1":0, "2":1, "3":2, "4":3 }[a];
-      if (mapped !== undefined) { ans = mapped; foundAns = true; }
-    }
-
-    return { q: q.trim(), options, ans, _hasAns: foundAns || !!ansLines[idx] };
-  }).filter(item => item.q && item.options.some(o => o));
-
-  return items;
+  return rawBlocks.map((block,idx) => {
+    const item = parseBlock(block);
+    if (ansLines[idx]) { item.ans=mapLetter(ansLines[idx][0]); item._hasAns=true; }
+    return item;
+  }).filter(item => item.q && item.options.some(o=>o));
 };
 
 // ── Lecturer: CBT Exam Manager ───────────────────────────────────────
