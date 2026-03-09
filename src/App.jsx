@@ -2892,18 +2892,42 @@ function AdminSkills({ toast }) {
         if (!st.totalMarksNum)
           st.totalMarksNum = st.activities.reduce((s,a)=>s+(a.markVal||0)+(a.subItems||[]).reduce((ss,si)=>ss+(si.markVal||0),0),0);
       });
-      const allActivities = subTopics.flatMap(st=>st.activities);
       if (!heading) heading = lines.find(l=>l.trim()) || "OSCE Station";
+
+      // ── EXPAND: each subTopic becomes its own top-level procedure station ──
+      // If there are multiple named subTopics, promote each to its own station.
+      // The parent heading/instructions are shared; questionStation goes to the last.
+      const namedSubTopics = subTopics.filter(st => st.title && st.title.trim());
+      if (namedSubTopics.length > 1) {
+        // Multiple named sub-topics → each becomes its own station
+        return namedSubTopics.map((st, idx) => {
+          const stHeading = st.title.trim();
+          const stActivities = st.activities || [];
+          // Attach question station only to the last sub-topic
+          const stQS = idx === namedSubTopics.length - 1 ? questionStation : [];
+          return {
+            heading: stHeading,
+            instructions: instructions, // share parent instructions
+            subTopics: [{ ...st, title: "" }], // single subTopic with no title (flatten)
+            activities: stActivities,
+            questionStation: stQS,
+            totalMarks: st.totalMarks || "",
+            _parentHeading: heading.trim()
+          };
+        });
+      }
+
+      // Single subTopic or no named subTopics → keep as-is (original behaviour)
+      const allActivities = subTopics.flatMap(st=>st.activities);
       return {
         heading:heading.trim(), instructions, subTopics, activities:allActivities,
         questionStation, totalMarks:subTopics.map(s=>s.totalMarks).filter(Boolean).join(" | ")
       };
-    }).filter(i => i.heading);
+    }).flat().filter(i => i && i.heading);
 
     setParsedOsce(items);
     const qsCount  = items.filter(i=>i.isQuestionStation).length;
     const procCount = items.filter(i=>!i.isQuestionStation).length;
-    const subCount  = items.reduce((s,i)=>s+(i.subTopics||[]).length,0);
     if (!items.length) toast("No stations parsed — check format","error");
     else toast(`✅ ${procCount} procedure station${procCount!==1?"s":""}, ${qsCount} question station${qsCount!==1?"s":""} parsed!`,"success");
   };
@@ -2993,11 +3017,14 @@ function AdminSkills({ toast }) {
             </div>
             {parsedOsce.map((c,i)=>(
               <div key={i} style={{padding:"10px 14px",borderTop:"1px solid var(--border)"}}>
-                <div style={{fontWeight:800,fontSize:13,color:"var(--accent)",marginBottom:3}}>🩺 {c.heading}</div>
+                <div style={{fontWeight:800,fontSize:13,color:"var(--accent)",marginBottom:3}}>
+                  {c.isQuestionStation?"❓":"🩺"} {c.heading}
+                </div>
+                {c._parentHeading&&<div style={{fontSize:10,color:"var(--text3)",marginBottom:2}}>Under: {c._parentHeading}</div>}
                 <div style={{fontSize:11,color:"var(--text3)"}}>
                   {c.isQuestionStation
-                    ? <span style={{color:"var(--accent)",fontWeight:700}}>❓ Question Station · {c.questionStation.length} question{c.questionStation.length!==1?"s":""}</span>
-                    : <>{c.instructions.length} instruction{c.instructions.length!==1?"s":""} · {(c.subTopics||[]).length} sub-topic{(c.subTopics||[]).length!==1?"s":""} · {c.activities.length} activities · {c.questionStation.length} Q-station items{c.totalMarks?` · ${c.totalMarks}`:""}</>
+                    ? <span style={{color:"var(--accent)",fontWeight:700}}>Question Station · {c.questionStation.length} question{c.questionStation.length!==1?"s":""}</span>
+                    : <>{c.instructions.length} instruction{c.instructions.length!==1?"s":""} · {c.activities.length} activit{c.activities.length!==1?"ies":"y"}{c.questionStation.length>0?` · ${c.questionStation.length} Q`:""}{c.totalMarks?` · ${c.totalMarks}`:""}</>
                   }
                 </div>
               </div>
