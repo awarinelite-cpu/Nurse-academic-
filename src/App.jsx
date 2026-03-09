@@ -1235,6 +1235,7 @@ const initData = () => {
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap');
 *{margin:0;padding:0;box-sizing:border-box;}
+html,body{overscroll-behavior-y:contain;}
 
 /* ── LIGHT MODE (default: sky-blue/white) ── */
 :root{
@@ -18357,7 +18358,7 @@ self.addEventListener('notificationclick', e => {
     });
   }, []);
 
-  const [page, setPage] = useState("auth");
+  const [page, setPage] = useState(() => ls("nv-session-page", "auth"));
   const [siteMode, setSiteMode] = useState(() => ls("nv-site-mode","school")); // "school" | "nursing"
   const switchToNursing = () => { setSiteMode("nursing"); lsSet("nv-site-mode","nursing"); };
   const switchToSchool  = () => { setSiteMode("school");  lsSet("nv-site-mode","school"); };
@@ -18367,10 +18368,11 @@ self.addEventListener('notificationclick', e => {
   const [regUser, setRegUser] = useState(""); const [regPw, setRegPw] = useState(""); const [regClass, setRegClass] = useState(""); const [regName, setRegName] = useState(""); const [regMatric, setRegMatric] = useState(""); const [regStudentType, setRegStudentType] = useState("class"); // "class" | "phn"
   const [activeNav, setActiveNav] = useState("dashboard"); const [activeTool, setActiveTool] = useState(null);
   const [themeMode, setThemeMode] = useState("light"); const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [toasts, setToasts] = useState([]); const [currentUser, setCurrentUser] = useState(""); const [isAdmin, setIsAdmin] = useState(false);
+  const [toasts, setToasts] = useState([]); const [currentUser, setCurrentUser] = useState(() => ls("nv-session-user", "")); const [isAdmin, setIsAdmin] = useState(() => ls("nv-session-admin", false));
   const [selectedClass, setSelectedClass] = useState(null);
   const [navHistory, setNavHistory] = useState([]);
-  const [isLecturer, setIsLecturer] = useState(false);
+  const [isLecturer, setIsLecturer] = useState(() => ls("nv-session-lecturer", false));
+  React.useEffect(() => { const u = ls("nv-session-user",""); if (u) setCurrentUserRef(u); }, []);
   const [openGroup, setOpenGroup] = useState(null);
   const [unreadNotifs, setUnreadNotifs] = useState(()=>{
     const notifs = ls("nv-notifications", []);
@@ -18726,6 +18728,7 @@ self.addEventListener('notificationclick', e => {
       setCurrentUserRef(username); setCurrentUser(username);
       setIsAdmin(localUser.role === "admin"); setIsLecturer(localUser.role === "lecturer");
       setPage("app");
+      lsSet("nv-session-user",username); lsSet("nv-session-page","app"); lsSet("nv-session-admin",localUser.role==="admin"); lsSet("nv-session-lecturer",localUser.role==="lecturer");
       toast(`Welcome back! 👋`, "success");
       // Auto-mark admin/lecturer as research club member in localStorage for badge display
       if (localUser.role === "admin" || localUser.role === "lecturer") {
@@ -18756,6 +18759,7 @@ self.addEventListener('notificationclick', e => {
       setCurrentUserRef(username); setCurrentUser(username);
       setIsAdmin(remoteUser.role === "admin"); setIsLecturer(remoteUser.role === "lecturer");
       setPage("app");
+      lsSet("nv-session-user",username); lsSet("nv-session-page","app"); lsSet("nv-session-admin",remoteUser.role==="admin"); lsSet("nv-session-lecturer",remoteUser.role==="lecturer");
       toast(`Welcome back! 👋`, "success");
       if (remoteUser.role === "admin" || remoteUser.role === "lecturer") {
         try { localStorage.setItem("rc-member-"+username.replace(/[^a-z0-9]/gi,"_"), "1"); } catch{}
@@ -18788,6 +18792,7 @@ self.addEventListener('notificationclick', e => {
     setCurrentUserRef(regUser); setCurrentUser(regUser);
     setIsAdmin(false); setIsLecturer(false);
     setPage("app");
+    lsSet("nv-session-user",regUser); lsSet("nv-session-page","app"); lsSet("nv-session-admin",false); lsSet("nv-session-lecturer",false);
     toast(`Welcome, ${regName.trim().split(" ")[0]}! 🎉`, "success");
     saveCredential(regUser, regPw);
     setTimeout(() => setShowPinSetup(true), 1500);
@@ -19074,7 +19079,7 @@ self.addEventListener('notificationclick', e => {
         runSync={runSync}
         syncing={syncing}
         syncError={syncError}
-        onSignOut={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);}}
+        onSignOut={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);lsSet("nv-session-user","");lsSet("nv-session-page","auth");lsSet("nv-session-admin",false);lsSet("nv-session-lecturer",false);}}
       />
     );
   }
@@ -19176,7 +19181,7 @@ self.addEventListener('notificationclick', e => {
             <div className="nav-item" style={{color:"#7bc950",background:"rgba(90,158,53,.15)",borderRadius:9,marginBottom:4}} onClick={switchToNursing}>
               <span className="nav-icon">🏛️</span>NC Exam Centre
             </div>
-            <div className="nav-item" style={{color:"var(--danger)",marginBottom:12}} onClick={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);setNavHistory([]);}}>
+            <div className="nav-item" style={{color:"var(--danger)",marginBottom:12}} onClick={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);setNavHistory([]);lsSet("nv-session-user","");lsSet("nv-session-page","auth");lsSet("nv-session-admin",false);lsSet("nv-session-lecturer",false);}}>
               <span className="nav-icon">🚪</span>Sign Out
             </div>
 
