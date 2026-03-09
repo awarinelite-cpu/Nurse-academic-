@@ -5554,11 +5554,12 @@ function EssayExamView({ toast, currentUser, essayBanks }) {
   const [grading, setGrading] = useState(false);
   const [feedback, setFeedback] = useState(null);
   const [savedAnswers, setSavedAnswers] = useState({});
+  const [openQ, setOpenQ] = useState(null); // index of currently open question
 
   const startExam = (bank) => {
     const att = ls(attKey, {});
     if (att[String(bank.id)]) { toast("You have already used your 1 attempt for this essay.", "error"); return; }
-    setSel(bank); setAnswers({}); setActive(true); setDone(false); setFeedback(null);
+    setSel(bank); setAnswers({}); setOpenQ(null); setActive(true); setDone(false); setFeedback(null);
   };
 
   const submitEssay = async () => {
@@ -5685,127 +5686,99 @@ Return ONLY valid JSON with no markdown or backticks:
     );
   }
 
-  // Active essay screen
+  // ── Active essay screen — click a question to open its textarea ──
   if (active && sel) {
-    const totalWords = Object.values(answers).reduce((s,v)=>s+((v||"").trim().split(/\s+/).filter(Boolean).length),0);
     const answeredCount = sel.questions.filter((_,i)=>(answers[i]||"").trim().length>0).length;
     return (
-      <div style={{maxWidth:960,margin:"0 auto"}}>
-        {/* Header bar */}
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:14,flexWrap:"wrap"}}>
+      <div style={{maxWidth:720,margin:"0 auto",paddingBottom:40}}>
+
+        {/* Header */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:10}}>
           <div>
-            <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16}}>{sel.subject}</div>
-            <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>
-              {sel.questions.length} questions · {answeredCount}/{sel.questions.length} answered · {totalWords} words total
+            <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:18}}>{sel.subject}</div>
+            <div style={{fontSize:12,color:"var(--text3)",marginTop:2,fontFamily:"'DM Mono',monospace"}}>
+              {sel.questions.length} question{sel.questions.length!==1?"s":""} · {sel.questions.reduce((s,q)=>s+(+q.marks||10),0)} total marks · {answeredCount}/{sel.questions.length} answered
             </div>
           </div>
-          <div style={{display:"flex",gap:8,alignItems:"center"}}>
-            {/* Progress dots */}
-            <div style={{display:"flex",gap:4}}>
-              {sel.questions.map((_,i)=>(
-                <div key={i} style={{width:10,height:10,borderRadius:"50%",
-                  background:(answers[i]||"").trim()?"var(--success)":"var(--border2)",
-                  border:"1px solid var(--border)",transition:"background .2s"}}
-                  title={`Q${i+1}: ${(answers[i]||"").trim()?"answered":"unanswered"}`} />
-              ))}
-            </div>
+          <div style={{display:"flex",gap:8}}>
             <button className="btn" onClick={()=>{if(window.confirm("Exit? Your answers will be lost."))setActive(false);}}>Exit</button>
-            <button className="btn btn-accent" onClick={submitEssay}>🤖 Submit for AI Grading</button>
+            <button className="btn btn-accent" style={{fontWeight:800}} onClick={submitEssay}>Submit Essay ✓</button>
           </div>
         </div>
 
-        <div style={{background:"rgba(167,139,250,.07)",border:"1px solid rgba(167,139,250,.2)",borderRadius:10,padding:"10px 14px",marginBottom:18,fontSize:12,color:"var(--purple)"}}>
-          🤖 Your answers will be graded by Claude AI. Write clearly and in full sentences. You have <b>1 attempt only</b>.
+        {/* Progress bar */}
+        <div style={{height:6,borderRadius:3,background:"var(--bg4)",marginBottom:18,overflow:"hidden"}}>
+          <div style={{height:"100%",borderRadius:3,background:"var(--success)",width:`${(answeredCount/Math.max(sel.questions.length,1))*100}%`,transition:"width .4s"}} />
         </div>
 
-        {/* Two-column layout: question | answer */}
-        <div style={{display:"grid",gridTemplateColumns:"1fr 2px 1fr",gap:0,border:"1px solid var(--border)",borderRadius:14,overflow:"hidden",marginBottom:24}}>
+        <div style={{fontSize:11,color:"var(--text3)",marginBottom:16,fontFamily:"'DM Mono',monospace"}}>
+          💡 Click a question to open it and type or paste your answer
+        </div>
 
-          {/* Column headers */}
-          <div style={{background:"var(--bg4)",padding:"10px 18px",fontWeight:800,fontSize:13,color:"var(--accent)",borderBottom:"1px solid var(--border)"}}>
-            📋 Questions
-          </div>
-          <div style={{background:"var(--border)",borderBottom:"1px solid var(--border)"}} />
-          <div style={{background:"var(--bg4)",padding:"10px 18px",fontWeight:800,fontSize:13,color:"var(--success)",borderBottom:"1px solid var(--border)"}}>
-            ✍️ Your Answers
-          </div>
+        {/* Questions list — each expands on click */}
+        {sel.questions.map((q,i)=>{
+          const val = answers[i]||"";
+          const answered = val.trim().length > 0;
+          const wc = val.trim().split(/\s+/).filter(Boolean).length;
+          const isOpen = openQ === i;
+          return (
+            <div key={i} style={{marginBottom:12,borderRadius:14,overflow:"hidden",border:`1.5px solid ${isOpen?"var(--accent)":answered?"var(--success)":"var(--border)"}`,transition:"border-color .2s"}}>
 
-          {/* Q&A rows */}
-          {sel.questions.map((q,i)=>{
-            const wordCount = ((answers[i]||"").trim().split(/\s+/).filter(Boolean)).length;
-            const hasAnswer = (answers[i]||"").trim().length > 0;
-            const isLast = i === sel.questions.length-1;
-            return (
-              <>
-                {/* Question cell */}
-                <div key={`q${i}`} style={{
-                  padding:"18px 18px",
-                  borderBottom: isLast?"none":"1px solid var(--border)",
-                  background: i%2===0?"var(--card)":"var(--bg4)",
-                  display:"flex",flexDirection:"column",gap:8
-                }}>
-                  <div style={{display:"flex",alignItems:"flex-start",gap:8}}>
-                    <span style={{
-                      minWidth:26,height:26,borderRadius:7,background:"var(--accent)",
-                      color:"white",fontWeight:800,fontSize:11,display:"flex",
-                      alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:1
-                    }}>Q{i+1}</span>
-                    <div style={{fontWeight:600,fontSize:13,lineHeight:1.6,color:"var(--text)"}}>{q.q}</div>
-                  </div>
-                  <div style={{display:"flex",gap:8,flexWrap:"wrap",marginLeft:34}}>
-                    <span style={{fontSize:10,fontWeight:700,color:"var(--accent)",background:"rgba(0,119,182,.1)",
-                      padding:"2px 8px",borderRadius:10,border:"1px solid rgba(0,119,182,.2)"}}>
-                      {q.marks||10} marks
-                    </span>
-                    {q.wordGuide&&<span style={{fontSize:10,color:"var(--text3)",background:"var(--bg4)",
-                      padding:"2px 8px",borderRadius:10,border:"1px solid var(--border)"}}>
-                      ~{q.wordGuide} words
-                    </span>}
+              {/* Question header — click to toggle open/close */}
+              <div
+                onClick={()=>setOpenQ(isOpen ? null : i)}
+                style={{padding:"16px 18px",background:isOpen?"rgba(0,119,182,.05)":"var(--card)",cursor:"pointer",display:"flex",alignItems:"flex-start",gap:12,userSelect:"none"}}
+              >
+                {/* Badge */}
+                <div style={{minWidth:32,height:32,borderRadius:9,background:answered?"var(--success)":isOpen?"var(--accent)":"var(--bg4)",border:`1.5px solid ${answered?"var(--success)":isOpen?"var(--accent)":"var(--border2)"}`,color:answered||isOpen?"white":"var(--text3)",fontWeight:800,fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all .2s"}}>
+                  {answered ? "✓" : `Q${i+1}`}
+                </div>
+
+                {/* Question text + meta */}
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:700,fontSize:14,lineHeight:1.6,color:"var(--text)",marginBottom:4}}>{q.q}</div>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                    <span style={{fontSize:10,fontWeight:700,color:"var(--accent)",background:"rgba(0,119,182,.1)",padding:"2px 8px",borderRadius:10,border:"1px solid rgba(0,119,182,.2)"}}>{q.marks||10} marks</span>
+                    {q.wordGuide&&<span style={{fontSize:10,color:"var(--text3)",background:"var(--bg4)",padding:"2px 8px",borderRadius:10,border:"1px solid var(--border)"}}>~{q.wordGuide} words</span>}
+                    {answered&&<span style={{fontSize:10,color:"var(--success)",fontWeight:700}}>✅ {wc} word{wc!==1?"s":""}</span>}
+                    {!answered&&isOpen&&<span style={{fontSize:10,color:"var(--text3)"}}>⬜ Not answered yet</span>}
                   </div>
                 </div>
 
-                {/* Divider */}
-                <div key={`d${i}`} style={{background:"var(--border)",borderBottom:isLast?"none":"1px solid var(--border)"}} />
+                {/* Chevron */}
+                <div style={{fontSize:18,color:"var(--text3)",flexShrink:0,transform:isOpen?"rotate(180deg)":"rotate(0deg)",transition:"transform .25s"}}>⌄</div>
+              </div>
 
-                {/* Answer cell */}
-                <div key={`a${i}`} style={{
-                  padding:"14px 16px",
-                  borderBottom: isLast?"none":"1px solid var(--border)",
-                  background: i%2===0?"var(--card)":"var(--bg4)",
-                  display:"flex",flexDirection:"column",gap:6
-                }}>
+              {/* Textarea — only shown when open */}
+              {isOpen && (
+                <div style={{padding:"0 18px 18px",background:"var(--bg4)",borderTop:"1px solid var(--border)"}}>
                   <textarea
-                    rows={5}
-                    style={{
-                      width:"100%",resize:"vertical",padding:"10px 12px",fontSize:13,lineHeight:1.6,
-                      borderRadius:9,border:`1.5px solid ${hasAnswer?"var(--success)":"var(--border2)"}`,
-                      background:"var(--bg)",color:"var(--text)",outline:"none",
-                      fontFamily:"inherit",transition:"border-color .2s",boxSizing:"border-box",
-                      marginBottom:0
-                    }}
-                    placeholder={`Write your answer here (aim for ${q.wordGuide||"100–200"} words)…`}
-                    value={answers[i]||""}
+                    autoFocus
+                    rows={8}
+                    style={{width:"100%",resize:"vertical",padding:"14px",fontSize:14,lineHeight:1.75,borderRadius:10,border:`1.5px solid ${answered?"var(--success)":"var(--border2)"}`,background:"var(--bg)",color:"var(--text)",outline:"none",fontFamily:"inherit",boxSizing:"border-box",marginTop:14,display:"block"}}
+                    placeholder={`Write or paste your answer here (aim for ${q.wordGuide||"100–200"} words)…`}
+                    value={val}
                     onChange={e=>setAnswers(a=>({...a,[i]:e.target.value}))}
-                    onFocus={e=>e.target.style.borderColor="var(--accent)"}
-                    onBlur={e=>e.target.style.borderColor=hasAnswer?"var(--success)":"var(--border2)"}
+                    onFocus={ev=>ev.target.style.borderColor="var(--accent)"}
+                    onBlur={ev=>ev.target.style.borderColor=answered?"var(--success)":"var(--border2)"}
                   />
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                    <span style={{fontSize:10,fontFamily:"'DM Mono',monospace",
-                      color:hasAnswer?"var(--success)":"var(--text3)"}}>
-                      {hasAnswer?"✓ ":""}{wordCount} word{wordCount!==1?"s":""}
-                    </span>
-                    {hasAnswer&&<span style={{fontSize:10,color:"var(--success)"}}>✅ Answered</span>}
-                    {!hasAnswer&&<span style={{fontSize:10,color:"var(--text3)"}}>⬜ Not answered</span>}
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:11,marginTop:6,fontFamily:"'DM Mono',monospace",color:answered?"var(--success)":"var(--text3)"}}>
+                    <span>{answered?"✓ ":""}{wc} word{wc!==1?"s":""}</span>
+                    {i < sel.questions.length-1
+                      ? <button className="btn btn-sm btn-success" onClick={()=>setOpenQ(i+1)}>Next Question →</button>
+                      : <span style={{color:"var(--accent)",fontWeight:700}}>Last question</span>
+                    }
                   </div>
                 </div>
-              </>
-            );
-          })}
-        </div>
+              )}
+            </div>
+          );
+        })}
 
-        <div style={{display:"flex",gap:10,justifyContent:"flex-end",paddingBottom:24}}>
+        {/* Submit footer */}
+        <div style={{display:"flex",gap:10,justifyContent:"flex-end",marginTop:16}}>
           <button className="btn" onClick={()=>{if(window.confirm("Exit? Your answers will be lost."))setActive(false);}}>Exit</button>
-          <button className="btn btn-accent" style={{fontWeight:800}} onClick={submitEssay}>🤖 Submit for AI Grading</button>
+          <button className="btn btn-accent" style={{fontWeight:800,fontSize:15,padding:"10px 28px"}} onClick={submitEssay}>Submit Essay ✓</button>
         </div>
       </div>
     );
