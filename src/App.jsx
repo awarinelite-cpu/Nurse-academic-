@@ -3468,30 +3468,22 @@ function AdminEssayExams({ toast }) {
                   Subject: <b style={{color:"var(--accent)"}}>{gradingStudent.subject}</b> · Submitted {gradingStudent.date}
                 </div>
                 {(gradingStudent.questions || []).map((q, i) => (
-                  <div key={i} className="card" style={{marginBottom:14,borderLeft:"3px solid var(--purple)"}}>
-                    {/* Question */}
-                    <div style={{fontWeight:700,fontSize:14,marginBottom:8,color:"var(--text)"}}>{i+1}. {q.q} <span style={{color:"var(--accent)",fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:400}}>[max {q.marks||10} marks]</span></div>
-                    {/* Student answer */}
-                    <div style={{background:"var(--bg4)",borderRadius:9,padding:"10px 14px",fontSize:13,color:"var(--text2)",lineHeight:1.6,marginBottom:12,fontStyle:"italic",borderLeft:"2px solid var(--border2)",whiteSpace:"pre-wrap",wordBreak:"break-word"}}>
-                      {(gradingStudent.answers || {})[i] || "(no answer provided)"}
+                  <div key={i} className="card" style={{marginBottom:14}}>
+                    <div style={{fontWeight:700,fontSize:14,marginBottom:6}}>Q{i+1}. {q.q} <span style={{color:"var(--accent)",fontFamily:"'DM Mono',monospace",fontSize:11}}>[{q.marks||10} marks]</span></div>
+                    <div style={{background:"var(--bg4)",borderRadius:9,padding:"10px 14px",fontSize:13,color:"var(--text2)",lineHeight:1.6,marginBottom:10,fontStyle:"italic",borderLeft:"2px solid var(--border2)"}}>
+                      {(gradingStudent.answers || {})[i] || "(no answer)"}
                     </div>
-                    {/* Score dropdown + feedback */}
-                    <div style={{display:"flex",gap:12,flexWrap:"wrap",alignItems:"flex-start"}}>
-                      <div style={{minWidth:160}}>
-                        <label className="lbl" style={{marginBottom:4}}>Score (0–{q.marks||10})</label>
-                        <select
-                          style={{width:"100%",padding:"8px 10px",borderRadius:8,border:"1.5px solid var(--border2)",background:"var(--bg)",color:"var(--text)",fontSize:14,fontWeight:700,fontFamily:"'DM Mono',monospace",cursor:"pointer"}}
-                          value={gradeForm[i]?.marksAwarded??0}
-                          onChange={e=>setGradeForm(f=>({...f,[i]:{...f[i],marksAwarded:+e.target.value}}))}
-                        >
-                          {Array.from({length:(q.marks||10)+1},(_,v)=>v).map(v=>(
-                            <option key={v} value={v}>{v}/{q.marks||10} {v===0?"(No marks)":v===(q.marks||10)?"(Full marks)":""}</option>
-                          ))}
-                        </select>
+                    <div className="form-row">
+                      <div>
+                        <label className="lbl">Marks Awarded (max {q.marks||10})</label>
+                        <input className="inp" type="number" min="0" max={q.marks||10}
+                          value={gradeForm[i]?.marksAwarded||0}
+                          onChange={e=>setGradeForm(f=>({...f,[i]:{...f[i],marksAwarded:Math.min(+e.target.value,q.marks||10)}}))}
+                        />
                       </div>
-                      <div style={{flex:1,minWidth:200}}>
-                        <label className="lbl" style={{marginBottom:4}}>Feedback for student (optional)</label>
-                        <input className="inp" placeholder="Brief feedback on this answer…"
+                      <div>
+                        <label className="lbl">Feedback</label>
+                        <input className="inp" placeholder="Brief feedback for this answer..."
                           value={gradeForm[i]?.feedback||""}
                           onChange={e=>setGradeForm(f=>({...f,[i]:{...f[i],feedback:e.target.value}}))}
                         />
@@ -5557,44 +5549,20 @@ function EssayExamView({ toast, currentUser, essayBanks }) {
   const attKey = `nv-essay-att-${currentUser}`;
   const [sel, setSel] = useState(null);
   const [active, setActive] = useState(false);
-  const [answers, setAnswers] = useState({});   // key: "qIdx" or "qIdx_subIdx"
+  const [answers, setAnswers] = useState({});
   const [done, setDone] = useState(false);
   const [grading, setGrading] = useState(false);
   const [feedback, setFeedback] = useState(null);
   const [savedAnswers, setSavedAnswers] = useState({});
-  const [expandedQs, setExpandedQs] = useState({}); // which questions are open
-
-  // Detect sub-questions like "(a)", "a)", "a." embedded in question text
-  const parseSubQuestions = (qText) => {
-    const explicit = (qText||"").match(/(?:^|\n)\s*\(?([a-zA-Z])\)?[.)]\s*(.+)/g);
-    if (explicit && explicit.length >= 2) {
-      return explicit.map(part => {
-        const m = part.trim().match(/^\(?([a-zA-Z])\)?[.)]\s*(.+)/s);
-        return m ? { label: m[1].toLowerCase(), text: m[2].trim() } : { label: "", text: part.trim() };
-      });
-    }
-    return [{ label: "", text: qText }];
-  };
-
-  // All answer keys for a bank (handles sub-questions)
-  const buildAnswerKeys = (bank) => {
-    const keys = [];
-    (bank.questions||[]).forEach((q,qi) => {
-      const subs = parseSubQuestions(q.q);
-      subs.length > 1 ? subs.forEach((_,si) => keys.push(`${qi}_${si}`)) : keys.push(`${qi}`);
-    });
-    return keys;
-  };
 
   const startExam = (bank) => {
     const att = ls(attKey, {});
     if (att[String(bank.id)]) { toast("You have already used your 1 attempt for this essay.", "error"); return; }
-    setSel(bank); setAnswers({}); setExpandedQs({}); setActive(true); setDone(false); setFeedback(null);
+    setSel(bank); setAnswers({}); setActive(true); setDone(false); setFeedback(null);
   };
 
   const submitEssay = async () => {
-    const allKeys = buildAnswerKeys(sel);
-    const missing = allKeys.filter(k => !(answers[k]||"").trim()).length;
+    const missing = sel.questions.filter((_,i) => !(answers[i]||"").trim()).length;
     if (missing > 0 && !window.confirm(`${missing} question(s) have no answer. Submit anyway?`)) return;
     if (!window.confirm("Submit essay? You only have 1 attempt — this cannot be undone.")) return;
 
@@ -5603,14 +5571,7 @@ function EssayExamView({ toast, currentUser, essayBanks }) {
     setActive(false); setDone(true); setGrading(true);
 
     const totalMarks = sel.questions.reduce((s,q)=>s+(+q.marks||10),0);
-    const qaText = sel.questions.map((q,i)=>{
-      const subs = parseSubQuestions(q.q);
-      if (subs.length > 1) {
-        const subText = subs.map((s,si)=>`  ${s.label||si+1}. ${s.text}\n     Answer: ${(snap[`${i}_${si}`]||"(no answer)").trim()}`).join("\n");
-        return `Q${i+1} [${q.marks||10} marks]:\n${subText}`;
-      }
-      return `Q${i+1} [${q.marks||10} marks]: ${q.q}\nKey points: ${q.modelAnswer||"Use professional nursing knowledge"}\nStudent answer: ${(snap[`${i}`]||"(no answer)").trim()}`;
-    }).join("\n\n");
+    const qaText = sel.questions.map((q,i)=>["Q"+(i+1)+" ["+(q.marks||10)+" marks]: "+q.q, "Key points: "+(q.modelAnswer||"Use professional nursing knowledge"), "Student answer: "+(snap[i]||"(no answer)").trim()].join("\n")).join("\n\n");
     const submissionBase = { date:new Date().toLocaleDateString(), subject:sel.subject, answers:snap, questions:sel.questions, totalMarks };
 
     try {
@@ -5661,12 +5622,10 @@ Return ONLY valid JSON with no markdown or backticks:
     setGrading(false);
   };
 
-  // ── Results screen ──
+  // Results screen
   if (done && sel) {
     const gradeColors = {A:"var(--success)",B:"var(--accent2)",C:"var(--warn)",D:"var(--danger)",F:"var(--danger)"};
     const gc = gradeColors[feedback?.grade]||"var(--text3)";
-    const attNow = ls(attKey,{})[String(sel.id)];
-    const manualGrade = attNow?.manualGrade;
     return (
       <div style={{maxWidth:680,margin:"0 auto"}}>
         <div style={{textAlign:"center",padding:"24px 0 20px"}}>
@@ -5686,22 +5645,12 @@ Return ONLY valid JSON with no markdown or backticks:
               </div>
               <div style={{fontSize:13,color:"var(--text2)",maxWidth:480,margin:"0 auto",lineHeight:1.6}}>{feedback.overallComment}</div>
             </>
-          ) : manualGrade ? (
-            <>
-              <div style={{fontSize:52,marginBottom:10}}>✏️</div>
-              <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20,marginBottom:8}}>Manually Graded by Lecturer</div>
-              <div style={{display:"flex",justifyContent:"center",gap:20,marginBottom:10}}>
-                <div style={{textAlign:"center"}}><div style={{fontSize:42,fontWeight:800,color:"var(--accent)"}}>{manualGrade.score}/{manualGrade.total}</div><div style={{fontSize:12,color:"var(--text3)"}}>Score</div></div>
-                <div style={{textAlign:"center"}}><div style={{fontSize:42,fontWeight:800,color:"var(--accent)"}}>{manualGrade.pct}%</div><div style={{fontSize:12,color:"var(--text3)"}}>Percentage</div></div>
-              </div>
-              {manualGrade.overallComment&&<div style={{fontSize:13,color:"var(--text2)",maxWidth:480,margin:"0 auto",lineHeight:1.6}}>{manualGrade.overallComment}</div>}
-            </>
           ) : (
             <>
               <div style={{fontSize:52,marginBottom:10}}>📝</div>
               <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:20}}>Essay Submitted for Manual Grading</div>
               <div style={{fontSize:13,color:"var(--text3)",marginTop:8,maxWidth:440,margin:"8px auto 0",lineHeight:1.6}}>
-                Your answers have been saved and sent to your lecturer for marking. Check back later for your result.
+                AI grading was unavailable. Your answers have been saved to the backend and sent to your lecturer for manual marking. Check back later for your result.
               </div>
               <div style={{marginTop:16,background:"rgba(251,146,60,.08)",border:"1px solid rgba(251,146,60,.25)",borderRadius:12,padding:"12px 18px",fontSize:12,color:"var(--warn)",display:"inline-block"}}>
                 ⏳ Awaiting lecturer feedback
@@ -5710,44 +5659,18 @@ Return ONLY valid JSON with no markdown or backticks:
           )}
         </div>
 
-        {/* Manual grade per-question breakdown */}
-        {!grading && manualGrade?.questions && (
-          <div style={{marginTop:20}}>
-            {sel.questions.map((q,i)=>{
-              const qg = manualGrade.questions[i]||{};
-              return (
-                <div key={i} className="card" style={{marginBottom:12,borderLeft:"3px solid var(--accent)"}}>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
-                    <div style={{fontWeight:700,fontSize:14,flex:1,marginRight:12}}>Q{i+1}. {q.q}</div>
-                    <span style={{fontFamily:"'DM Mono',monospace",fontWeight:800,fontSize:16,color:"var(--accent)",flexShrink:0}}>{qg.score??qg.marksAwarded??0}/{q.marks||10}</span>
-                  </div>
-                  {qg.feedback&&<div style={{fontSize:12,color:"var(--text2)",marginTop:4}}><b>📝 Feedback: </b>{qg.feedback}</div>}
-                </div>
-              );
-            })}
-          </div>
-        )}
-
         {!grading && feedback?.questions && (
           <div style={{marginTop:20}}>
             {sel.questions.map((q,i)=>{
               const qf=feedback.questions[i]||{};
               const qpct=qf.maxMarks>0?Math.round((qf.marksAwarded/qf.maxMarks)*100):0;
-              const subs = parseSubQuestions(q.q);
               return (
                 <div key={i} className="card" style={{marginBottom:14,borderLeft:`3px solid ${qpct>=70?"var(--success)":qpct>=50?"var(--warn)":"var(--danger)"}`}}>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
                     <div style={{fontWeight:700,fontSize:14,flex:1,marginRight:12}}>Q{i+1}. {q.q}</div>
                     <span style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16,color:qpct>=70?"var(--success)":qpct>=50?"var(--warn)":"var(--danger)",flexShrink:0}}>{qf.marksAwarded||0}/{qf.maxMarks||q.marks||10}</span>
                   </div>
-                  {subs.length>1 ? subs.map((s,si)=>(
-                    <div key={si} style={{marginBottom:8,paddingLeft:12,borderLeft:"2px solid var(--border)"}}>
-                      <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",marginBottom:4}}>{i+1}{s.label}. {s.text}</div>
-                      <div style={{fontSize:13,color:"var(--text3)",fontStyle:"italic",lineHeight:1.6}}>{savedAnswers[`${i}_${si}`]||"(no answer)"}</div>
-                    </div>
-                  )) : (
-                    <div style={{fontSize:13,color:"var(--text3)",fontStyle:"italic",borderLeft:"2px solid var(--border2)",paddingLeft:10,marginBottom:10,lineHeight:1.6}}>{savedAnswers[`${i}`]||"(no answer)"}</div>
-                  )}
+                  <div style={{fontSize:13,color:"var(--text3)",fontStyle:"italic",borderLeft:"2px solid var(--border2)",paddingLeft:10,marginBottom:10,lineHeight:1.6}}>{savedAnswers[i]||"(no answer)"}</div>
                   {qf.strengths&&<div style={{fontSize:12,marginBottom:4}}><b style={{color:"var(--success)"}}>✓ Strengths: </b>{qf.strengths}</div>}
                   {qf.weaknesses&&<div style={{fontSize:12,marginBottom:4}}><b style={{color:"var(--warn)"}}>↗ Areas to improve: </b>{qf.weaknesses}</div>}
                   {qf.feedback&&<div style={{fontSize:12,color:"var(--text2)"}}><b>📝 Feedback: </b>{qf.feedback}</div>}
@@ -5762,127 +5685,127 @@ Return ONLY valid JSON with no markdown or backticks:
     );
   }
 
-  // ── Active exam screen — click-to-expand per question ──
+  // Active essay screen
   if (active && sel) {
-    const allKeys = buildAnswerKeys(sel);
-    const answeredCount = allKeys.filter(k=>(answers[k]||"").trim().length>0).length;
+    const totalWords = Object.values(answers).reduce((s,v)=>s+((v||"").trim().split(/\s+/).filter(Boolean).length),0);
+    const answeredCount = sel.questions.filter((_,i)=>(answers[i]||"").trim().length>0).length;
     return (
-      <div style={{maxWidth:720,margin:"0 auto",paddingBottom:32}}>
-        {/* Header */}
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:10}}>
+      <div style={{maxWidth:960,margin:"0 auto"}}>
+        {/* Header bar */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:14,flexWrap:"wrap"}}>
           <div>
-            <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:18}}>{sel.subject}</div>
-            <div style={{fontSize:12,color:"var(--text3)",marginTop:2}}>{sel.questions.length} questions · {sel.questions.reduce((s,q)=>s+(+q.marks||10),0)} total marks · {answeredCount}/{allKeys.length} answered</div>
+            <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16}}>{sel.subject}</div>
+            <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"var(--text3)"}}>
+              {sel.questions.length} questions · {answeredCount}/{sel.questions.length} answered · {totalWords} words total
+            </div>
           </div>
-          <div style={{display:"flex",gap:8}}>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            {/* Progress dots */}
+            <div style={{display:"flex",gap:4}}>
+              {sel.questions.map((_,i)=>(
+                <div key={i} style={{width:10,height:10,borderRadius:"50%",
+                  background:(answers[i]||"").trim()?"var(--success)":"var(--border2)",
+                  border:"1px solid var(--border)",transition:"background .2s"}}
+                  title={`Q${i+1}: ${(answers[i]||"").trim()?"answered":"unanswered"}`} />
+              ))}
+            </div>
             <button className="btn" onClick={()=>{if(window.confirm("Exit? Your answers will be lost."))setActive(false);}}>Exit</button>
-            <button className="btn btn-accent" style={{fontWeight:800}} onClick={submitEssay}>Submit Essay ✓</button>
+            <button className="btn btn-accent" onClick={submitEssay}>🤖 Submit for AI Grading</button>
           </div>
         </div>
 
-        {/* Progress bar */}
-        <div style={{height:6,borderRadius:3,background:"var(--bg4)",marginBottom:20,overflow:"hidden"}}>
-          <div style={{height:"100%",borderRadius:3,background:"var(--accent)",width:`${(answeredCount/Math.max(allKeys.length,1))*100}%`,transition:"width .3s"}} />
+        <div style={{background:"rgba(167,139,250,.07)",border:"1px solid rgba(167,139,250,.2)",borderRadius:10,padding:"10px 14px",marginBottom:18,fontSize:12,color:"var(--purple)"}}>
+          🤖 Your answers will be graded by Claude AI. Write clearly and in full sentences. You have <b>1 attempt only</b>.
         </div>
 
-        <div style={{fontSize:11,color:"var(--text3)",marginBottom:16,fontFamily:"'DM Mono',monospace"}}>
-          💡 Click any question below to expand it and type or paste your answer.
-        </div>
+        {/* Two-column layout: question | answer */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 2px 1fr",gap:0,border:"1px solid var(--border)",borderRadius:14,overflow:"hidden",marginBottom:24}}>
 
-        {sel.questions.map((q,qi)=>{
-          const subs = parseSubQuestions(q.q);
-          const hasMultipleSubs = subs.length > 1;
-          const isOpen = !!expandedQs[`q${qi}`];
-          // Answered indicator
-          const qAnswered = hasMultipleSubs
-            ? subs.some((_,si)=>(answers[`${qi}_${si}`]||"").trim())
-            : (answers[`${qi}`]||"").trim().length>0;
+          {/* Column headers */}
+          <div style={{background:"var(--bg4)",padding:"10px 18px",fontWeight:800,fontSize:13,color:"var(--accent)",borderBottom:"1px solid var(--border)"}}>
+            📋 Questions
+          </div>
+          <div style={{background:"var(--border)",borderBottom:"1px solid var(--border)"}} />
+          <div style={{background:"var(--bg4)",padding:"10px 18px",fontWeight:800,fontSize:13,color:"var(--success)",borderBottom:"1px solid var(--border)"}}>
+            ✍️ Your Answers
+          </div>
 
-          return (
-            <div key={qi} className="card" style={{marginBottom:12,border:`1px solid ${isOpen?"var(--accent)":"var(--border)"}`,borderRadius:14,overflow:"hidden",padding:0,transition:"border-color .2s"}}>
-              {/* Question header — click to toggle */}
-              <div
-                style={{padding:"16px 18px",background:isOpen?"rgba(0,119,182,.04)":"var(--card)",cursor:"pointer",display:"flex",alignItems:"flex-start",gap:12,borderBottom:isOpen?"1px solid var(--border)":"none"}}
-                onClick={()=>setExpandedQs(prev=>({...prev,[`q${qi}`]:!prev[`q${qi}`]}))}
-              >
-                <div style={{minWidth:30,height:30,borderRadius:8,background:qAnswered?"var(--success)":"var(--accent)",color:"white",fontWeight:800,fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:1}}>
-                  {qAnswered?"✓":`Q${qi+1}`}
-                </div>
-                <div style={{flex:1}}>
-                  <div style={{fontWeight:700,fontSize:14,lineHeight:1.6,color:"var(--text)",marginBottom:4}}>{q.q}</div>
-                  <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
-                    <span style={{fontSize:10,fontWeight:700,color:"var(--accent)",background:"rgba(0,119,182,.1)",padding:"2px 8px",borderRadius:10,border:"1px solid rgba(0,119,182,.2)"}}>{q.marks||10} marks</span>
-                    {q.wordGuide&&<span style={{fontSize:10,color:"var(--text3)",background:"var(--bg4)",padding:"2px 8px",borderRadius:10,border:"1px solid var(--border)"}}>~{q.wordGuide} words</span>}
-                    {hasMultipleSubs&&<span style={{fontSize:10,color:"var(--purple)",background:"rgba(124,58,237,.08)",padding:"2px 8px",borderRadius:10,border:"1px solid rgba(124,58,237,.2)"}}>Sub-questions: {subs.length}</span>}
-                    {qAnswered&&<span style={{fontSize:10,color:"var(--success)",fontWeight:700}}>✅ Answered</span>}
+          {/* Q&A rows */}
+          {sel.questions.map((q,i)=>{
+            const wordCount = ((answers[i]||"").trim().split(/\s+/).filter(Boolean)).length;
+            const hasAnswer = (answers[i]||"").trim().length > 0;
+            const isLast = i === sel.questions.length-1;
+            return (
+              <>
+                {/* Question cell */}
+                <div key={`q${i}`} style={{
+                  padding:"18px 18px",
+                  borderBottom: isLast?"none":"1px solid var(--border)",
+                  background: i%2===0?"var(--card)":"var(--bg4)",
+                  display:"flex",flexDirection:"column",gap:8
+                }}>
+                  <div style={{display:"flex",alignItems:"flex-start",gap:8}}>
+                    <span style={{
+                      minWidth:26,height:26,borderRadius:7,background:"var(--accent)",
+                      color:"white",fontWeight:800,fontSize:11,display:"flex",
+                      alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:1
+                    }}>Q{i+1}</span>
+                    <div style={{fontWeight:600,fontSize:13,lineHeight:1.6,color:"var(--text)"}}>{q.q}</div>
+                  </div>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap",marginLeft:34}}>
+                    <span style={{fontSize:10,fontWeight:700,color:"var(--accent)",background:"rgba(0,119,182,.1)",
+                      padding:"2px 8px",borderRadius:10,border:"1px solid rgba(0,119,182,.2)"}}>
+                      {q.marks||10} marks
+                    </span>
+                    {q.wordGuide&&<span style={{fontSize:10,color:"var(--text3)",background:"var(--bg4)",
+                      padding:"2px 8px",borderRadius:10,border:"1px solid var(--border)"}}>
+                      ~{q.wordGuide} words
+                    </span>}
                   </div>
                 </div>
-                <div style={{fontSize:20,color:"var(--text3)",flexShrink:0,transition:"transform .2s",transform:isOpen?"rotate(180deg)":"rotate(0deg)"}}>⌄</div>
-              </div>
 
-              {/* Expandable answer area */}
-              {isOpen && (
-                <div style={{padding:"16px 18px",background:"var(--bg4)"}}>
-                  {hasMultipleSubs ? (
-                    <div style={{display:"flex",flexDirection:"column",gap:16}}>
-                      {subs.map((sub,si)=>{
-                        const key=`${qi}_${si}`;
-                        const val=answers[key]||"";
-                        const wc=val.trim().split(/\s+/).filter(Boolean).length;
-                        const answered=val.trim().length>0;
-                        return (
-                          <div key={si}>
-                            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
-                              <div style={{minWidth:28,height:28,borderRadius:7,background:"rgba(124,58,237,.15)",color:"var(--purple)",fontWeight:800,fontSize:11,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,border:"1px solid rgba(124,58,237,.25)"}}>
-                                {qi+1}{sub.label||String.fromCharCode(97+si)}
-                              </div>
-                              <div style={{fontWeight:600,fontSize:13,color:"var(--text)",lineHeight:1.5}}>{sub.text}</div>
-                            </div>
-                            <textarea rows={5} style={{width:"100%",resize:"vertical",padding:"10px 12px",fontSize:13,lineHeight:1.6,borderRadius:9,border:`1.5px solid ${answered?"var(--success)":"var(--border2)"}`,background:"var(--bg)",color:"var(--text)",outline:"none",fontFamily:"inherit",transition:"border-color .2s",boxSizing:"border-box"}}
-                              placeholder={`Answer for ${qi+1}${sub.label||String.fromCharCode(97+si)} — type or paste your answer here…`}
-                              value={val}
-                              onChange={e=>setAnswers(a=>({...a,[key]:e.target.value}))}
-                              onFocus={ev=>ev.target.style.borderColor="var(--accent)"}
-                              onBlur={ev=>ev.target.style.borderColor=answered?"var(--success)":"var(--border2)"}
-                            />
-                            <div style={{display:"flex",justifyContent:"space-between",fontSize:10,marginTop:3,fontFamily:"'DM Mono',monospace",color:answered?"var(--success)":"var(--text3)"}}>
-                              <span>{answered?"✓ ":""}{wc} word{wc!==1?"s":""}</span>
-                              <span>{answered?"✅ Answered":"⬜ Not answered"}</span>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : (()=>{
-                    const key=`${qi}`;
-                    const val=answers[key]||"";
-                    const wc=val.trim().split(/\s+/).filter(Boolean).length;
-                    const answered=val.trim().length>0;
-                    return (
-                      <div>
-                        <textarea rows={7} style={{width:"100%",resize:"vertical",padding:"12px 14px",fontSize:13,lineHeight:1.7,borderRadius:10,border:`1.5px solid ${answered?"var(--success)":"var(--border2)"}`,background:"var(--bg)",color:"var(--text)",outline:"none",fontFamily:"inherit",transition:"border-color .2s",boxSizing:"border-box"}}
-                          placeholder={`Write or paste your answer here (aim for ${q.wordGuide||"100–200"} words)…`}
-                          value={val}
-                          onChange={e=>setAnswers(a=>({...a,[key]:e.target.value}))}
-                          onFocus={ev=>ev.target.style.borderColor="var(--accent)"}
-                          onBlur={ev=>ev.target.style.borderColor=answered?"var(--success)":"var(--border2)"}
-                        />
-                        <div style={{display:"flex",justifyContent:"space-between",fontSize:10,marginTop:4,fontFamily:"'DM Mono',monospace",color:answered?"var(--success)":"var(--text3)"}}>
-                          <span>{answered?"✓ ":""}{wc} word{wc!==1?"s":""}</span>
-                          <span>{answered?"✅ Answered":"⬜ Not answered"}</span>
-                        </div>
-                      </div>
-                    );
-                  })()}
+                {/* Divider */}
+                <div key={`d${i}`} style={{background:"var(--border)",borderBottom:isLast?"none":"1px solid var(--border)"}} />
+
+                {/* Answer cell */}
+                <div key={`a${i}`} style={{
+                  padding:"14px 16px",
+                  borderBottom: isLast?"none":"1px solid var(--border)",
+                  background: i%2===0?"var(--card)":"var(--bg4)",
+                  display:"flex",flexDirection:"column",gap:6
+                }}>
+                  <textarea
+                    rows={5}
+                    style={{
+                      width:"100%",resize:"vertical",padding:"10px 12px",fontSize:13,lineHeight:1.6,
+                      borderRadius:9,border:`1.5px solid ${hasAnswer?"var(--success)":"var(--border2)"}`,
+                      background:"var(--bg)",color:"var(--text)",outline:"none",
+                      fontFamily:"inherit",transition:"border-color .2s",boxSizing:"border-box",
+                      marginBottom:0
+                    }}
+                    placeholder={`Write your answer here (aim for ${q.wordGuide||"100–200"} words)…`}
+                    value={answers[i]||""}
+                    onChange={e=>setAnswers(a=>({...a,[i]:e.target.value}))}
+                    onFocus={e=>e.target.style.borderColor="var(--accent)"}
+                    onBlur={e=>e.target.style.borderColor=hasAnswer?"var(--success)":"var(--border2)"}
+                  />
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:10,fontFamily:"'DM Mono',monospace",
+                      color:hasAnswer?"var(--success)":"var(--text3)"}}>
+                      {hasAnswer?"✓ ":""}{wordCount} word{wordCount!==1?"s":""}
+                    </span>
+                    {hasAnswer&&<span style={{fontSize:10,color:"var(--success)"}}>✅ Answered</span>}
+                    {!hasAnswer&&<span style={{fontSize:10,color:"var(--text3)"}}>⬜ Not answered</span>}
+                  </div>
                 </div>
-              )}
-            </div>
-          );
-        })}
+              </>
+            );
+          })}
+        </div>
 
-        <div style={{display:"flex",gap:10,justifyContent:"flex-end",marginTop:8}}>
+        <div style={{display:"flex",gap:10,justifyContent:"flex-end",paddingBottom:24}}>
           <button className="btn" onClick={()=>{if(window.confirm("Exit? Your answers will be lost."))setActive(false);}}>Exit</button>
-          <button className="btn btn-accent" style={{fontWeight:800,fontSize:15}} onClick={submitEssay}>Submit Essay ✓</button>
+          <button className="btn btn-accent" style={{fontWeight:800}} onClick={submitEssay}>🤖 Submit for AI Grading</button>
         </div>
       </div>
     );
@@ -13830,10 +13753,7 @@ function CbtExamManager({ toast, currentUser }) {
       {/* Archived exams */}
       {archivedExams.length>0&&(
         <div>
-          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
-            <div style={{fontWeight:800,fontSize:13,color:"var(--warn)"}}>🗄️ Exam Archive ({archivedExams.length})</div>
-            <span style={{fontSize:11,color:"var(--text3)",padding:"2px 8px",borderRadius:8,border:"1px solid var(--border)"}}>Read-only for students · Republish to reactivate</span>
-          </div>
+          <div style={{fontWeight:800,fontSize:13,color:"var(--warn)",marginBottom:8}}>🗄️ Archived ({archivedExams.length}) — Read-Only for students</div>
           {archivedExams.map(e=>_examCard(e))}
         </div>
       )}
@@ -13865,20 +13785,10 @@ function CbtExamManager({ toast, currentUser }) {
           <div style={{display:"flex",gap:6,flexWrap:"wrap",justifyContent:"flex-end",alignItems:"center"}}>
             <button className="btn btn-sm" onClick={()=>{setSelExam(e);setView("monitor");}}>👁 Monitor</button>
             <button className="btn btn-sm" onClick={()=>{setForm({...e});setEditQIdx(null);setSingleQ({q:"",options:["","","",""],ans:0});setView("compose");}}>✏️ Edit</button>
-            {isArchived(e) ? (
-              <button className="btn btn-sm btn-success" title="Republish this archived exam — resets the published time so students can attempt it again" onClick={()=>{
-                if(window.confirm("Republish this exam? It will go live again and students can attempt it.")) {
-                  const now = Date.now();
-                  const updated = exams.map(x=>x.id===e.id?{...x,published:true,publishedAt:now,endTime:x.endTime||""}:x);
-                  setExams(updated); saveCbt(updated);
-                  toast("✅ Exam republished!","success");
-                }
-              }}>🔄 Republish</button>
-            ) : e.published ? (
-              <button className="btn btn-sm" style={{borderColor:"var(--warn)",color:"var(--warn)"}} onClick={()=>togglePublish(e.id,false)}>📤 Unpublish</button>
-            ) : (
-              <button className="btn btn-sm btn-success" onClick={()=>togglePublish(e.id,true)}>🚀 Publish</button>
-            )}
+            {e.published
+              ? <button className="btn btn-sm" style={{borderColor:"var(--warn)",color:"var(--warn)"}} onClick={()=>togglePublish(e.id,false)}>📤 Unpublish</button>
+              : <button className="btn btn-sm btn-success" onClick={()=>togglePublish(e.id,true)}>🚀 Publish</button>
+            }
             <button className="btn btn-sm btn-danger" onClick={()=>deleteExam(e.id)}>🗑️</button>
           </div>
         </div>
@@ -14248,28 +14158,18 @@ function CbtStudentView({ toast, currentUser }) {
     setMode("done");
   };
 
-  // An exam is expired/archived if:
-  //   (a) It has an explicit endTime that has passed, OR
-  //   (b) It was published over 24h ago (no endTime set)
-  const isExpired = (exam) => {
-    if (!exam.published) return false;
-    if (exam.endTime) {
-      const end = new Date(exam.endTime).getTime();
-      if (!isNaN(end) && Date.now() > end) return true;
-    }
-    return exam.publishedAt && (Date.now() - exam.publishedAt > 24 * 60 * 60 * 1000);
-  };
+  const isArchived    = (exam) => exam.published && exam.publishedAt && (Date.now()-exam.publishedAt > 24*60*60*1000);
   const hasAttempted  = (examId) => results.some(r=>r.examId===examId&&r.student===currentUser);
   const fmtTime       = (s) => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
   const urgent        = timeLeft<=60&&timeLeft>0;
 
   const isExamOpen = (e) => {
-    if (!e.published || isExpired(e)) return false;
+    if (!e.published || isArchived(e)) return false;
     if (e.startTime) { const s = new Date(e.startTime).getTime(); if (!isNaN(s) && Date.now() < s) return false; }
     return true;
   };
   const available = exams.filter(e=>e.classId===myClass&&isExamOpen(e));
-  const archived  = exams.filter(e=>e.published&&e.classId===myClass&&isExpired(e));
+  const archived  = exams.filter(e=>e.published&&e.classId===myClass&&isArchived(e));
   const myResults = results.filter(r=>r.student===currentUser);
 
   // ── PRE-FLIGHT / INSTRUCTIONS screen ──────────────────────────────
@@ -14690,7 +14590,7 @@ function CbtStudentView({ toast, currentUser }) {
     <div>
       <div className="sec-title">📝 CBT Exams</div>
       <div style={{fontSize:12,color:"var(--text3)",marginBottom:20}}>
-        Computer-Based Tests for your class. One attempt per exam. Expired exams are available in read-only Review Mode.
+        Computer-Based Tests for your class. One attempt per exam. Archived exams are available in read-only Review Mode.
       </div>
 
       {available.length===0&&archived.length===0&&(
@@ -14707,11 +14607,6 @@ function CbtStudentView({ toast, currentUser }) {
           {available.map(e=>{
             const attempted = hasAttempted(e.id);
             const myR       = myResults.find(r=>r.examId===e.id);
-            // Show countdown if endTime is set
-            const endMs = e.endTime ? new Date(e.endTime).getTime() : null;
-            const msLeft = endMs ? Math.max(0, endMs - Date.now()) : null;
-            const hrsLeft = msLeft ? Math.floor(msLeft/3600000) : null;
-            const minsLeft = msLeft ? Math.floor((msLeft%3600000)/60000) : null;
             return (
               <div key={e.id} className="card" style={{marginBottom:10,borderLeft:`4px solid ${attempted?"var(--success)":"var(--accent)"}`}}>
                 <div style={{display:"flex",gap:10,alignItems:"flex-start",flexWrap:"wrap"}}>
@@ -14731,11 +14626,6 @@ function CbtStudentView({ toast, currentUser }) {
                       {e.fullscreenRequired&&<span style={{color:"var(--danger)"}}>🖥️ Fullscreen</span>}
                       {myR&&<span style={{color:"var(--success)",fontWeight:700}}>Score: {myR.score}/{myR.total} ({myR.percent}%)</span>}
                     </div>
-                    {msLeft!==null&&msLeft>0&&(
-                      <div style={{fontSize:10,color:"var(--warn)",fontWeight:700,marginTop:4,fontFamily:"'DM Mono',monospace"}}>
-                        ⏰ Closes in {hrsLeft>0?`${hrsLeft}h `:""}${minsLeft}min
-                      </div>
-                    )}
                   </div>
                   <div>
                     {attempted
@@ -14752,23 +14642,21 @@ function CbtStudentView({ toast, currentUser }) {
 
       {archived.length>0&&(
         <div>
-          <div style={{fontWeight:800,fontSize:13,color:"var(--warn)",marginBottom:4}}>🗄️ Expired — Review Mode Only</div>
-          <div style={{fontSize:11,color:"var(--text3)",marginBottom:10}}>These exams have ended. You can review questions and answers for study purposes only — no new attempts are allowed.</div>
+          <div style={{fontWeight:800,fontSize:13,color:"var(--warn)",marginBottom:4}}>🗄️ Archived — Review Mode Only</div>
+          <div style={{fontSize:11,color:"var(--text3)",marginBottom:10}}>Exams older than 24 hours. Questions and answers are visible for study.</div>
           {archived.map(e=>{
             const myR = myResults.find(r=>r.examId===e.id);
-            const expiredAt = e.endTime ? new Date(e.endTime).toLocaleString() : e.publishedAt ? new Date(e.publishedAt+24*60*60*1000).toLocaleString() : "";
             return (
               <div key={e.id} className="card" style={{marginBottom:10,borderLeft:"4px solid var(--warn)",opacity:.9}}>
                 <div style={{display:"flex",gap:10,alignItems:"flex-start",flexWrap:"wrap"}}>
                   <div style={{flex:1}}>
                     <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
                       <div style={{fontWeight:800,fontSize:15}}>{e.title}</div>
-                      <span style={{fontSize:10,padding:"2px 8px",borderRadius:12,background:"rgba(251,146,60,.12)",color:"var(--warn)",fontWeight:700}}>🗄️ Expired</span>
+                      <span style={{fontSize:10,padding:"2px 8px",borderRadius:12,background:"rgba(251,146,60,.12)",color:"var(--warn)",fontWeight:700}}>🗄️ Archived</span>
                     </div>
                     {e.subject&&<div style={{fontSize:12,color:"var(--text3)",marginBottom:3}}>📚 {e.subject}</div>}
                     <div style={{display:"flex",flexWrap:"wrap",gap:10,fontSize:11,color:"var(--text3)"}}>
                       <span>❓ {e.questions.length}Q</span>
-                      {expiredAt&&<span>🔒 Expired: {expiredAt}</span>}
                       {myR&&<span style={{color:"var(--success)",fontWeight:700}}>Score: {myR.score}/{myR.total} ({myR.percent}%)</span>}
                     </div>
                   </div>
@@ -19588,6 +19476,9 @@ self.addEventListener('notificationclick', e => {
         : isLecturer
           ? <CbtExamManager toast={toast} currentUser={currentUser} />
           : <CbtStudentView toast={toast} currentUser={currentUser} />;
+      case "essay": return isLecturer||isAdmin
+        ? <AdminEssayExams toast={toast} />
+        : <EssayExamView toast={toast} currentUser={currentUser} essayBanks={ls("nv-essay-banks",[])} />;
       case "questions": return <SchoolOnlyPastQuestionsView toast={toast} currentUser={currentUser} />;
       case "nursingexams": return <NursingExamsStandaloneView toast={toast} currentUser={currentUser} initialExam={selectedExamType} />;
       case "messages": return <Messages user={currentUser} toast={toast} onUnreadChange={setUnreadDM} />;
@@ -19615,6 +19506,7 @@ self.addEventListener('notificationclick', e => {
     { icon:"📄", label:"All Handouts", key:"handouts" },
     { icon:"📊", label:"Results", key:"results" },
     ...(!isAdmin ? [{ icon:"🧪", label:"CBT Exams", key:"cbt" }] : []),
+    { icon:"✍️", label:"Essay Exams", key:"essay" },
     { icon:"🏫", label:"School Past Questions", key:"questions" },
     { icon:"🔔", label:"Notifications", key:"notifications" },
     { icon:"💬", label:"Messages", key:"messages" },
