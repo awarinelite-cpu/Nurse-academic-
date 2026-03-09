@@ -11099,7 +11099,26 @@ function SkillsView() {
   };
   const revealQ = (si,qi) => setQRevealed(r=>({...r,[`${si}-${qi}`]:true}));
 
-  const toggleSection = (si) => setExpanded(e=>({...e,[si]:!e[si]}));
+  const toggleSection = (si) => setExpanded(e => {
+    const isCurrentlyOpen = expandAll ? e[si]!==true : e[si]===true;
+    if (isCurrentlyOpen) {
+      // Close the currently open one
+      const next = {...e};
+      if (expandAll) { next[si] = true; } else { delete next[si]; }
+      return next;
+    } else {
+      // Open this one, close all others
+      if (expandAll) {
+        // expandAll: open = NOT true, closed = true. Close all by setting true, then un-set si
+        const next = {...e};
+        Object.keys(next).forEach(k => { next[k] = true; });
+        delete next[si]; // si now follows expandAll default = open
+        return next;
+      } else {
+        return {[si]: true}; // only si is open
+      }
+    }
+  });
 
   const filteredSkills = osceSearch.trim()
     ? skillsDb.filter(s=>{
