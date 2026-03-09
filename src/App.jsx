@@ -5751,21 +5751,18 @@ Return ONLY valid JSON with no markdown or backticks:
 
               {/* Textarea — only shown when open */}
               {isOpen && (
-                <div style={{padding:"0 18px 18px",background:"var(--bg4)",borderTop:"1px solid var(--border)"}}>
+                <div onClick={e=>e.stopPropagation()} style={{padding:"0 18px 18px",background:"var(--bg4)",borderTop:"1px solid var(--border)"}}>
                   <textarea
-                    autoFocus
                     rows={8}
                     style={{width:"100%",resize:"vertical",padding:"14px",fontSize:14,lineHeight:1.75,borderRadius:10,border:`1.5px solid ${answered?"var(--success)":"var(--border2)"}`,background:"var(--bg)",color:"var(--text)",outline:"none",fontFamily:"inherit",boxSizing:"border-box",marginTop:14,display:"block"}}
                     placeholder={`Write or paste your answer here (aim for ${q.wordGuide||"100–200"} words)…`}
                     value={val}
-                    onChange={e=>setAnswers(a=>({...a,[i]:e.target.value}))}
-                    onFocus={ev=>ev.target.style.borderColor="var(--accent)"}
-                    onBlur={ev=>ev.target.style.borderColor=answered?"var(--success)":"var(--border2)"}
+                    onChange={e=>{const v=e.target.value; setAnswers(a=>({...a,[i]:v}));}}
                   />
                   <div style={{display:"flex",justifyContent:"space-between",fontSize:11,marginTop:6,fontFamily:"'DM Mono',monospace",color:answered?"var(--success)":"var(--text3)"}}>
                     <span>{answered?"✓ ":""}{wc} word{wc!==1?"s":""}</span>
                     {i < sel.questions.length-1
-                      ? <button className="btn btn-sm btn-success" onClick={()=>setOpenQ(i+1)}>Next Question →</button>
+                      ? <button className="btn btn-sm btn-success" onClick={e=>{e.stopPropagation();setOpenQ(i+1);}}>Next Question →</button>
                       : <span style={{color:"var(--accent)",fontWeight:700}}>Last question</span>
                     }
                   </div>
