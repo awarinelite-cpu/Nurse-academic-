@@ -17556,10 +17556,18 @@ function LecturerPanel({ currentUser, toast, onSignOut, themeMode, setThemeMode,
     setSidebarOpen(false);
     window.history.pushState({ nvApp: true }, "");
   };
+  const _exitRef = React.useRef(false);
   const goBack = () => {
-    if (!navHistory.length) return;
-    setActiveTab(navHistory[navHistory.length-1]);
-    setNavHistory(h => h.slice(0,-1));
+    if (navHistory.length > 0) {
+      setActiveTab(navHistory[navHistory.length-1]);
+      setNavHistory(h => h.slice(0,-1));
+      return;
+    }
+    // Already on home — double-press to exit
+    if (_exitRef.current) { window.history.go(-999); return; }
+    _exitRef.current = true;
+    toast("Press back again to exit", "info");
+    setTimeout(() => { _exitRef.current = false; }, 2000);
   };
   // Phone/browser back button — intercept popstate and mirror goBack
   useEffect(() => {
@@ -18818,11 +18826,19 @@ self.addEventListener('notificationclick', e => {
     setActiveTool(tool); setActiveNav(null); setSidebarOpen(false);
     window.history.pushState({ nvApp: true }, "");
   };
+  const _exitRef = React.useRef(false);
   const goBack = () => {
-    if (navHistory.length === 0) return;
-    const prev = navHistory[navHistory.length - 1];
-    setNavHistory(h => h.slice(0, -1));
-    setActiveNav(prev.nav); setActiveTool(prev.tool); if (prev.cls) setSelectedClass(prev.cls);
+    if (navHistory.length > 0) {
+      const prev = navHistory[navHistory.length - 1];
+      setNavHistory(h => h.slice(0, -1));
+      setActiveNav(prev.nav); setActiveTool(prev.tool); if (prev.cls) setSelectedClass(prev.cls);
+      return;
+    }
+    // Already on home — double-press to exit
+    if (_exitRef.current) { window.history.go(-999); return; }
+    _exitRef.current = true;
+    toast("Press back again to exit", "info");
+    setTimeout(() => { _exitRef.current = false; }, 2000);
   };
   // Phone/browser back button — intercept popstate and mirror goBack
   useEffect(() => {
