@@ -1988,6 +1988,42 @@ function AdminUsers({ toast, currentUser }) {
               <option value="sub-admin">Sub Admin</option>
               {isSuperAdmin && <option value="admin">Admin</option>}
             </select>
+            <label className="lbl">🏫 Class</label>
+            <select className="inp" value={form.class} onChange={e=>setForm({...form,class:e.target.value})}>
+              <option value="">— No class —</option>
+              {classes.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
+            </select>
+            {/* ── PHN toggle for admin ── */}
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(46,125,50,.07)",border:"1.5px solid #2e7d32",borderRadius:10,padding:"10px 14px",marginBottom:4}}>
+              <div>
+                <div style={{fontWeight:700,fontSize:13,color:"#2e7d32"}}>🌍 Public Health Nursing Student</div>
+                <div style={{fontSize:11,color:"var(--text3)"}}>Auto-assigns to PHN Forum & sets class to Public Health</div>
+              </div>
+              <button
+                type="button"
+                onClick={()=>setForm(f=>({...f,isPublicHealth:!f.isPublicHealth,class:!f.isPublicHealth?"publichealth":(f.class==="publichealth"?"":f.class)}))}
+                style={{
+                  width:44,height:24,borderRadius:12,border:"none",cursor:"pointer",transition:"all .25s",flexShrink:0,
+                  background:form.isPublicHealth?"#2e7d32":"var(--border2)",position:"relative",
+                }}>
+                <span style={{
+                  position:"absolute",top:2,left:form.isPublicHealth?22:2,width:20,height:20,
+                  borderRadius:"50%",background:"white",transition:"left .25s",boxShadow:"0 1px 4px rgba(0,0,0,.25)"
+                }}/>
+              </button>
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <button className="btn btn-purple" style={{flex:1}} onClick={save}>💾 Save</button>
+              <button className="btn" onClick={()=>setShowAdd(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Admin Classes ────────────────────────────────────────────────────
 function AdminClasses({ toast }) {
   const [classes, setClasses] = useSharedData("nv-classes", DEFAULT_CLASSES);
   const [edit, setEdit] = useState(null);
