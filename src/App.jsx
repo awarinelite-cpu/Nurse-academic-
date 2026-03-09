@@ -105,7 +105,8 @@ const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } ca
 // IMPORTANT: After testing, go to Firestore → Rules and set:
 //   allow read, write: if true;   ← keeps it open (fine for internal school use)
 
-const FIREBASE_CONFIG = {
+// ── MAIN SITE Firebase config ──────────────────────────────────────────
+const FIREBASE_CONFIG_MAIN = {
   apiKey:            "AIzaSyB_bSeHflIDhihDhDUE1p1kKZpJId0dxA8",
   authDomain:        "medicare-c6196.firebaseapp.com",
   projectId:         "medicare-c6196",
@@ -113,6 +114,21 @@ const FIREBASE_CONFIG = {
   messagingSenderId: "632103735569",
   appId:             "1:632103735569:web:458561690c6c4c6efbbcb0",
 };
+
+// ── CLONE SITE Firebase config (nurse-academic-school-b.onrender.com) ──
+const FIREBASE_CONFIG_CLONE = {
+  apiKey:            "AIzaSyDH5jtyCEDTUkhqw1gEOw8p7lxfzhUITpM",
+  authDomain:        "nurseexamprep-6956a.firebaseapp.com",
+  projectId:         "nurseexamprep-6956a",
+  storageBucket:     "nurseexamprep-6956a.firebasestorage.app",
+  messagingSenderId: "726798762408",
+  appId:             "1:726798762408:web:da9b75b3e9eded124f1d9d",
+};
+
+// ── Auto-select config based on hostname ───────────────────────────────
+const _IS_CLONE = typeof window !== "undefined" &&
+  window.location.hostname === "nurse-academic-school-b.onrender.com";
+const FIREBASE_CONFIG = _IS_CLONE ? FIREBASE_CONFIG_CLONE : FIREBASE_CONFIG_MAIN;
 
 // ── FCM VAPID key — get from Firebase Console → Project Settings → Cloud Messaging → Web Push certificates ──
 // Replace the string below with your actual VAPID key
@@ -8500,9 +8516,8 @@ const gvcLeave = async (roomId, uid) => {
 const gvcWriteOffer = async (roomId, callerUid, calleeUid, offer) => {
   // Ensure caller < callee alphabetically
   const [a, b] = callerUid < calleeUid ? [callerUid, calleeUid] : [calleeUid, callerUid];
-  // Use set with merge:false only for the structured fields; reset ICE arrays cleanly
   await _gvcSigDoc(roomId, a, b).set(
-    { from: a, to: b, offer, callerIce: [], calleeIce: [], answer: null, declined: null, updatedAt: Date.now() },
+    { from: a, to: b, offer, callerIce: [], calleeIce: [], updatedAt: Date.now() },
     { merge: false }
   );
 };
@@ -8621,17 +8636,13 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
   const connectAsCaller = useCallback(async (remoteUid) => {
     if (pcsRef.current[remoteUid]) return; // already connected
     const pc = makePc(remoteUid);
-    // ICE field is determined by alpha order: alpha-smaller writes "callerIce", alpha-larger writes "calleeIce"
-    const myIceRole = currentUser < remoteUid ? "caller" : "callee";
-    pc.onicecandidate = (ev) => { if (ev.candidate) gvcAddIce(roomId, currentUser, remoteUid, ev.candidate.toJSON(), myIceRole); };
+    pc.onicecandidate = (ev) => { if (ev.candidate) gvcAddIce(roomId, currentUser, remoteUid, ev.candidate.toJSON(), "caller"); };
 
     const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
     await pc.setLocalDescription(offer);
     await gvcWriteOffer(roomId, currentUser, remoteUid, { type: offer.type, sdp: offer.sdp });
 
-    // Watch for answer + remote ICE (remote writes the opposite ice field)
-    const remoteIceField = myIceRole === "caller" ? "calleeIce" : "callerIce";
-    const remoteIceRole  = myIceRole === "caller" ? "callee"    : "caller";
+    // Watch for answer + callee ICE
     const unsub = _gvcSigDoc(roomId, currentUser, remoteUid).onSnapshot(async snap => {
       if (!snap.exists) return;
       const d = snap.data();
@@ -8639,10 +8650,10 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(d.answer));
           await flushIce(remoteUid);
-          await applyIce(remoteUid, d[remoteIceField], remoteIceRole);
+          await applyIce(remoteUid, d.calleeIce, "callee");
         } catch(e) { console.warn("[GVC caller SRD]", e.message); }
       } else if (pc.remoteDescription) {
-        await applyIce(remoteUid, d[remoteIceField], remoteIceRole);
+        await applyIce(remoteUid, d.calleeIce, "callee");
       }
     }, () => {});
     unsubsRef.current.push(unsub);
@@ -8652,11 +8663,7 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
   const connectAsCallee = useCallback(async (remoteUid, offerData) => {
     if (pcsRef.current[remoteUid]) return;
     const pc = makePc(remoteUid);
-    // ICE field determined by alpha order
-    const myIceRole      = currentUser < remoteUid ? "caller" : "callee";
-    const remoteIceField = myIceRole === "caller"  ? "calleeIce" : "callerIce";
-    const remoteIceRole  = myIceRole === "caller"  ? "callee"    : "caller";
-    pc.onicecandidate = (ev) => { if (ev.candidate) gvcAddIce(roomId, currentUser, remoteUid, ev.candidate.toJSON(), myIceRole); };
+    pc.onicecandidate = (ev) => { if (ev.candidate) gvcAddIce(roomId, currentUser, remoteUid, ev.candidate.toJSON(), "callee"); };
 
     await pc.setRemoteDescription(new RTCSessionDescription(offerData));
     await flushIce(remoteUid);
@@ -8664,13 +8671,13 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
     await pc.setLocalDescription(answer);
     await gvcWriteAnswer(roomId, remoteUid, currentUser, { type: answer.type, sdp: answer.sdp });
 
-    // Apply any remote ICE already in Firestore + watch for more
+    // Apply any caller ICE already in Firestore + watch for more
     const snap = await _gvcSigDoc(roomId, remoteUid, currentUser).get().catch(() => null);
-    if (snap?.exists) await applyIce(remoteUid, snap.data()[remoteIceField], remoteIceRole);
+    if (snap?.exists) await applyIce(remoteUid, snap.data().callerIce, "caller");
 
     const unsub = _gvcSigDoc(roomId, remoteUid, currentUser).onSnapshot(async snap2 => {
       if (!snap2.exists) return;
-      await applyIce(remoteUid, snap2.data()[remoteIceField], remoteIceRole);
+      await applyIce(remoteUid, snap2.data().callerIce, "caller");
     }, () => {});
     unsubsRef.current.push(unsub);
   }, [roomId, currentUser, makePc, applyIce, flushIce]);
@@ -8720,23 +8727,14 @@ function GroupVideoCallModal({ roomId, label, currentUser, onClose }) {
       }, () => {});
       unsubsRef.current.push(unsub1);
 
-      // Watch signals for offers addressed to us (callee path).
-      // gvcWriteOffer always sets from=alpha-smaller, to=alpha-larger.
-      // The CALLER is whoever is alpha-smaller (they sent the offer).
-      // We are the CALLEE (should answer) if we appear in the doc but are NOT the alpha-smaller sender.
+      // Watch signals for offers addressed to us (callee path)
       const unsub2 = _gvcSigsCol(roomId).onSnapshot(snap => {
         if (!active) return;
         snap.docChanges().forEach(async change => {
           const d = change.doc.data();
-          if (!d.offer) return;
-          // doc involves us?
-          const involvedUs = d.from === currentUser || d.to === currentUser;
-          if (!involvedUs) return;
-          // we are the callee if the other side (alpha-smaller) sent the offer
-          const callerUid = d.from; // always alpha-smaller
-          if (callerUid === currentUser) return; // we are the caller, skip
-          const remoteUid = callerUid;
-          if (!remoteUid || pcsRef.current[remoteUid]) return;
+          if (!d.offer || d.to !== currentUser) return;
+          const remoteUid = d.from;
+          if (!remoteUid || remoteUid === currentUser || pcsRef.current[remoteUid]) return;
           try { await connectAsCallee(remoteUid, d.offer); }
           catch(e) { console.warn("[GVC callee err]", e.message); }
         });
@@ -8871,7 +8869,7 @@ function GroupVideoCallBtn({ roomId, label="Video Call", currentUser, style={} }
 // Firestore ICE field naming: "callerIce" belongs to whoever is alphabetically
 // smaller (gvcWriteOffer decides this). We must map our role to that correctly.
 // ════════════════════════════════════════════════════════════════════════
-function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator, roomId: roomIdProp, onClose }) {
+function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator, onClose }) {
   const videoOnly = callType === "video";
   const myUid     = fromUser;    // local user
   const remoteUid = toUser;      // remote user
@@ -8892,8 +8890,8 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
   const myName   = _myInfo.name;
   const myAvatar = _myInfo.avatar;
 
-  // Stable room id — same on both sides. If caller passed one via prop, use it.
-  const roomId = roomIdProp || ("dm__" + _gvcPairId(myUid, remoteUid));
+  // Stable room id — same on both sides
+  const roomId = "dm__" + _gvcPairId(myUid, remoteUid);
 
   // Map our explicit role to the Firestore ICE field names.
   // gvcWriteOffer always stores callerIce for the alpha-smaller uid.
@@ -8980,11 +8978,10 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
       localStreamRef.current = stream;
       stream.getVideoTracks().forEach(t => { t.enabled = videoOnly; });
 
-      // 2. Build RTCPeerConnection and add local tracks BEFORE creating offer/answer
+      // 2. Build RTCPeerConnection
       const pc = new RTCPeerConnection(GVC_ICE);
       pcRef.current = pc;
-      // ── CRITICAL: add local tracks so remote side receives audio/video ──
-      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+      // Apply low-latency encoding: low start bitrate ramps up fast,       // prioritise latency over throughput       pc.getSenders().forEach(sender => {         if (sender.track?.kind === "video") {           const params = sender.getParameters();           if (!params.encodings || params.encodings.length === 0) {             params.encodings = [{}];           }           params.encodings[0] = {             ...params.encodings[0],             maxBitrate:         2_000_000,   // 2 Mbps ceiling             maxFramerate:       30,             networkPriority:    "high",             priority:           "high",             scaleResolutionDownBy: 1.0,           };           sender.setParameters(params).catch(() => {});         }         if (sender.track?.kind === "audio") {           const params = sender.getParameters();           if (!params.encodings || params.encodings.length === 0) {             params.encodings = [{}];           }           params.encodings[0] = {             ...params.encodings[0],             maxBitrate:      128_000,   // 128 kbps for crisp audio             networkPriority: "very-high",             priority:        "very-high",           };           sender.setParameters(params).catch(() => {});         }       });
 
       // Use a ref to track live status — avoids stale closure in callbacks
       const liveRef = { current: false };
@@ -9061,7 +9058,8 @@ function DmCallModal({ callType, fromUser, toUser, toName, toAvatar, isInitiator
           if (!snap.exists || !active) return;
           const d = snap.data();
           // Callee declined — stop ringing
-          if (d.declined && !liveRef.current) {
+          // Callee declined — stop ringing
+          if (d.declined && !liveRef.current && status === "ringing") {
             setStatus("ended");
             setTimeout(() => { if (active) onClose(); }, 1500);
             return;
@@ -19769,7 +19767,7 @@ self.addEventListener('notificationclick', e => {
           onAnswer={() => {
             const c = incomingCall;
             setIncomingCall(null);
-            setActiveCall({ type: c.callType, toUser: c.fromUser, toName: c.callerName, toAvatar: c.callerAvatar, roomId: c.roomId });
+            setActiveCall({ type: c.callType, toUser: c.fromUser, toName: c.callerName, toAvatar: c.callerAvatar });
             setActiveNav("messages");
             clearCallSignal(currentUser, c.roomId);
           }}
@@ -19796,7 +19794,6 @@ self.addEventListener('notificationclick', e => {
           toUser={activeCall.toUser}
           toName={activeCall.toName}
           toAvatar={activeCall.toAvatar}
-          roomId={activeCall.roomId}
           isInitiator={false}
           onClose={() => setActiveCall(null)}
         />
