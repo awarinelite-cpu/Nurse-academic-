@@ -905,8 +905,6 @@ export function Messages({ user, toast, onUnreadChange }) {
       </div>
       )} {/* end broadcastTab === "direct" */}
     </div>
-      />
-    )}
     </Fragment>
   );
 }

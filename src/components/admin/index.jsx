@@ -3924,7 +3924,7 @@ export function AdminDailyMockManager({ toast }) {
             <div>
               <div style={{fontSize:11,fontWeight:800,color:"var(--success)",marginBottom:4}}>✅ Answer Key (optional)<br/><span style={{fontWeight:500,color:"var(--text3)"}}>One per line: A / B / C / D<br/>Only needed if answers aren't<br/>included in the questions box.</span></div>
               <textarea className="paste-box" style={{minHeight:260,resize:"vertical",borderColor:"rgba(34,197,94,.35)"}}
-                placeholder={"B\nC\nA\n..."} style={{borderColor:"rgba(34,197,94,.35)",minHeight:260,resize:"vertical"}}
+                placeholder={"B\nC\nA\n..."}
                 value={pasteAnswers} onChange={e=>{setPasteAnswers(e.target.value);setParsedQ([]);setPreviewPage(0);}} />
             </div>
           </div>
