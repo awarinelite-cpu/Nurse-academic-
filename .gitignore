@@ -3,3 +3,8 @@ build/
 .env
 .DS_Store
 dist
+
+# Firebase Admin SDK service account keys — NEVER commit these
+serviceAccountKey.json
+*-admin.json
+*firebase-adminsdk*.json
