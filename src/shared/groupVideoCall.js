@@ -1,3 +1,4 @@
+import { arrayUnion } from "firebase/firestore";
 import { _db, _loadFirebase, _safeKey } from "../services/backend";
 import { GroupVideoCallModal } from "../components/video-call";
 
@@ -77,14 +78,12 @@ export const gvcAddIce = async (roomId, uid, remoteUid, candidate, role) => {
   try {
     const field = role === "caller" ? "callerIce" : "calleeIce";
     // Prefer arrayUnion so concurrent writes don't clobber each other.
-    // Fall back to a read-modify-write if FieldValue is unavailable.
-    const FieldValue = window.firebase?.firestore?.FieldValue;
-    if (FieldValue?.arrayUnion) {
+    try {
       await _gvcSigDoc(roomId, uid, remoteUid).set(
-        { [field]: FieldValue.arrayUnion(candidate), updatedAt: Date.now() },
+        { [field]: arrayUnion(candidate), updatedAt: Date.now() },
         { merge: true }
       );
-    } else {
+    } catch {
       // Safe fallback: read current array then append
       const snap = await _gvcSigDoc(roomId, uid, remoteUid).get().catch(() => null);
       const existing = snap?.exists ? (snap.data()[field] || []) : [];
