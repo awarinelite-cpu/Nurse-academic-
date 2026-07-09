@@ -1,6 +1,8 @@
 /* @jsxRuntime classic */
 import React, { useState, useEffect, useCallback, useRef, Fragment } from "react";
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from "firebase/auth";
 
+import { auth } from "./config/firebaseClient";
 import { FCM_VAPID_KEY } from "./config/firebase";
 import { EMAILJS_PUBLIC_KEY, EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID } from "./config/keys";
 import { DEFAULT_CLASSES, initData } from "./data/defaults";
@@ -579,9 +581,44 @@ self.addEventListener('notificationclick', e => {
 
   const login = async () => {
     if (!username || !password) return toast("Fill in all fields", "error");
-    // Step 1: Check localStorage instantly (sub 100ms)
+
+    // ── Step 0: verify identity with real Firebase Auth ──────────────
+    // Replaces the old plaintext password comparison. If this account
+    // hasn't been through the migration script yet, fall back to the
+    // legacy check once, then lazily create the real Auth account
+    // using the password they just proved they know — so every
+    // subsequent login goes through the fast, secure path above.
+    try {
+      await signInWithEmailAndPassword(auth, username, password);
+    } catch (e) {
+      if (e.code === "auth/user-not-found") {
+        const localUsers = ls("nv-users", []);
+        let legacyUser = localUsers.find(u => u.username === username && u.password === password);
+        if (!legacyUser) {
+          try {
+            const fresh = await Promise.race([
+              loadShared("users", [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]),
+              new Promise((_,reject) => setTimeout(()=>reject(new Error("timeout")), 4000))
+            ]);
+            legacyUser = (fresh||[]).find(u => u.username === username && u.password === password);
+          } catch {}
+        }
+        if (!legacyUser) return toast("Invalid email or password", "error");
+        try {
+          await createUserWithEmailAndPassword(auth, username, password);
+        } catch (createErr) {
+          console.warn("[Auth] Lazy account creation failed:", createErr.message);
+        }
+      } else if (e.code === "auth/wrong-password" || e.code === "auth/invalid-credential") {
+        return toast("Invalid email or password", "error");
+      } else {
+        return toast("Login failed — check your connection and try again", "error");
+      }
+    }
+
+    // ── Step 1: check localStorage instantly for profile/role (sub 100ms) ──
     const localUsers = ls("nv-users", []);
-    const localUser = localUsers.find(u => u.username === username && u.password === password);
+    const localUser = localUsers.find(u => u.username === username);
     if (localUser) {
       // Instant login from cache
       if (loginType === "admin" && localUser.role !== "admin" && localUser.role !== "sub-admin") return toast("Not an admin account", "error");
@@ -614,7 +651,7 @@ self.addEventListener('notificationclick', e => {
         loadShared("users", [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]),
         new Promise((_,reject) => setTimeout(()=>reject(new Error("timeout")), 4000))
       ]);
-      const remoteUser = (fresh||[]).find(u => u.username === username && u.password === password);
+      const remoteUser = (fresh||[]).find(u => u.username === username);
       if (!remoteUser) return toast("Invalid email or password", "error");
       if (loginType === "admin" && remoteUser.role !== "admin" && remoteUser.role !== "sub-admin") return toast("Not an admin account", "error");
       setCurrentUserRef(username); setCurrentUser(username);
@@ -637,18 +674,26 @@ self.addEventListener('notificationclick', e => {
     }
   };
 
-  const register = () => {
+  const register = async () => {
     if (!regName.trim()) return toast("Enter your full name", "error");
     if (!regUser || !regPw) return toast("Fill in all fields", "error");
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(regUser)) return toast("Enter a valid email address", "error");
+    if (regPw.length < 6) return toast("Password must be at least 6 characters", "error");
     if (!regMatric.trim()) return toast("Enter your matric number", "error");
     if (regStudentType !== "phn" && !regClass) return toast("Please select your class", "error");
     const users = ls("nv-users", []);
     if (users.find(u => u.username === regUser)) return toast("Email already registered", "error");
     if (users.find(u => u.matricNumber && u.matricNumber.toLowerCase() === regMatric.trim().toLowerCase())) return toast("Matric number already registered", "error");
+    try {
+      await createUserWithEmailAndPassword(auth, regUser, regPw);
+    } catch (e) {
+      if (e.code === "auth/email-already-in-use") return toast("Email already registered", "error");
+      if (e.code === "auth/weak-password") return toast("Password must be at least 6 characters", "error");
+      return toast("Registration failed — check your connection and try again", "error");
+    }
     const isPHN = regStudentType === "phn";
     const assignedClass = isPHN ? "publichealth" : regClass;
-    const newUsers = [...users, { username: regUser, password: regPw, role: "student", class: assignedClass, isPublicHealth: isPHN, displayName: regName.trim(), matricNumber: regMatric.trim().toUpperCase(), joined: new Date().toLocaleDateString() }];
+    const newUsers = [...users, { username: regUser, role: "student", class: assignedClass, isPublicHealth: isPHN, displayName: regName.trim(), matricNumber: regMatric.trim().toUpperCase(), joined: new Date().toLocaleDateString() }];
     saveShared("users", newUsers);
     setCurrentUserRef(regUser); setCurrentUser(regUser);
     setIsAdmin(false); setIsLecturer(false);
@@ -947,7 +992,7 @@ self.addEventListener('notificationclick', e => {
         runSync={runSync}
         syncing={syncing}
         syncError={syncError}
-        onSignOut={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);lsSet("nv-session-user","");lsSet("nv-session-page","auth");lsSet("nv-session-admin",false);lsSet("nv-session-lecturer",false);}}
+        onSignOut={()=>{signOut(auth).catch(()=>{});setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);lsSet("nv-session-user","");lsSet("nv-session-page","auth");lsSet("nv-session-admin",false);lsSet("nv-session-lecturer",false);}}
       />
     );
   }
@@ -1048,7 +1093,7 @@ self.addEventListener('notificationclick', e => {
             <div className="nav-item" style={{color:"#7bc950",background:"rgba(90,158,53,.15)",borderRadius:9,marginBottom:4}} onClick={switchToNursing}>
               <span className="nav-icon">🏛️</span>NC Exam Centre
             </div>
-            <div className="nav-item" style={{color:"var(--danger)",marginBottom:12}} onClick={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);setNavHistory([]);lsSet("nv-session-user","");lsSet("nv-session-page","auth");lsSet("nv-session-admin",false);lsSet("nv-session-lecturer",false);}}>
+            <div className="nav-item" style={{color:"var(--danger)",marginBottom:12}} onClick={()=>{signOut(auth).catch(()=>{});setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);setNavHistory([]);lsSet("nv-session-user","");lsSet("nv-session-page","auth");lsSet("nv-session-admin",false);lsSet("nv-session-lecturer",false);}}>
               <span className="nav-icon">🚪</span>Sign Out
             </div>
 
