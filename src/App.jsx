@@ -1,6 +1,6 @@
 /* @jsxRuntime classic */
 import React, { useState, useEffect, useCallback, useRef, Fragment } from "react";
-import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from "firebase/auth";
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, sendPasswordResetEmail, signOut } from "firebase/auth";
 
 import { auth } from "./config/firebaseClient";
 import { FCM_VAPID_KEY } from "./config/firebase";
@@ -523,14 +523,36 @@ self.addEventListener('notificationclick', e => {
   // ── Forgot Password ──
   const sendResetCode = async () => {
     if (!forgotEmail.trim()) return toast("Enter your email","error");
-    const users = ls("nv-users",[]);
-    const user = users.find(u=>u.username===forgotEmail.trim());
-    if (!user) return toast("No account found with that email","error");
+    const email = forgotEmail.trim();
     setForgotLoading(true);
+
+    // ── Try real Firebase Auth reset first (works on free Spark plan —
+    // no Cloud Function needed. Firebase sends the email and hosts the
+    // reset page itself). Only accounts already migrated to real Auth
+    // will succeed here. ──
+    try {
+      await sendPasswordResetEmail(auth, email);
+      setForgotLoading(false);
+      setForgotMode("sent");
+      toast("📧 Reset link sent! Check your inbox (and spam folder).", "success");
+      return;
+    } catch (e) {
+      if (e.code !== "auth/user-not-found") {
+        setForgotLoading(false);
+        return toast("Couldn't send reset email — check your connection and try again", "error");
+      }
+      // auth/user-not-found → this account hasn't been migrated yet.
+      // Fall through to the legacy code-based flow below, which still
+      // works against the old nv-users array.
+    }
+
+    const users = ls("nv-users",[]);
+    const user = users.find(u=>u.username===email);
+    if (!user) { setForgotLoading(false); return toast("No account found with that email","error"); }
     // Generate 6-digit code and store in backend (10-min expiry)
     const code = String(Math.floor(100000+Math.random()*900000));
     _setResetCode(code);
-    await examBsSet(`reset:${forgotEmail.trim()}`, {code, expires: Date.now()+600000});
+    await examBsSet(`reset:${email}`, {code, expires: Date.now()+600000});
 
     // ── Send real email via EmailJS ──
     const emailConfigured =
@@ -540,7 +562,7 @@ self.addEventListener('notificationclick', e => {
 
     if (emailConfigured) {
       try {
-        await sendResetEmail(forgotEmail.trim(), code);
+        await sendResetEmail(email, code);
         setForgotLoading(false);
         setForgotMode("code");
         toast("📧 Reset code sent! Check your inbox (and spam folder).","success");
@@ -846,10 +868,10 @@ self.addEventListener('notificationclick', e => {
             {forgotMode ? (
               <>
                 <div style={{textAlign:"center",marginBottom:16}}>
-                  <div style={{fontSize:32,marginBottom:6}}>{forgotMode==="code"?"🔑":"📧"}</div>
-                  <div style={{fontWeight:800,fontSize:16,marginBottom:4}}>{forgotMode==="code"?"Enter Reset Code":"Reset Password"}</div>
+                  <div style={{fontSize:32,marginBottom:6}}>{forgotMode==="code"?"🔑":forgotMode==="sent"?"✅":"📧"}</div>
+                  <div style={{fontWeight:800,fontSize:16,marginBottom:4}}>{forgotMode==="code"?"Enter Reset Code":forgotMode==="sent"?"Check Your Email":"Reset Password"}</div>
                   <div style={{fontSize:12,color:"var(--text3)"}}>
-                    {forgotMode==="code"?`We sent a 6-digit code to ${forgotEmail}`:"Enter your registered email address"}
+                    {forgotMode==="code"?`We sent a 6-digit code to ${forgotEmail}`:forgotMode==="sent"?`We sent a password reset link to ${forgotEmail}. Click the link in that email to set a new password, then come back here to sign in.`:"Enter your registered email address"}
                   </div>
                 </div>
                 {forgotMode==="email"&&(
@@ -859,7 +881,7 @@ self.addEventListener('notificationclick', e => {
                       onChange={e=>setForgotEmail(e.target.value)}
                       onKeyDown={e=>e.key==="Enter"&&sendResetCode()} />
                     <button className="btn-primary" onClick={sendResetCode} disabled={forgotLoading}>
-                      {forgotLoading?"📤 Sending...":"📧 Send Reset Code"}
+                      {forgotLoading?"📤 Sending...":"📧 Send Reset Link"}
                     </button>
                   </>
                 )}
