@@ -1,0 +1,178 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ──────────────────────────────────────────────────────
+    function signedIn() {
+      return request.auth != null;
+    }
+    function myProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function myRole() {
+      return signedIn() ? myProfile().role : null;
+    }
+    function isAdmin() {
+      return signedIn() && (myRole() == 'admin' || myRole() == 'sub-admin');
+    }
+    function isLecturer() {
+      return signedIn() && myRole() == 'lecturer';
+    }
+    function isStaff() {
+      return isAdmin() || isLecturer();
+    }
+    function isEnrolledIn(courseId) {
+      return signedIn() && exists(
+        /databases/$(database)/documents/enrollments/$(request.auth.uid + '_' + courseId)
+      );
+    }
+
+    // ── users/{uid} — profile docs written by registration/migration ──
+    match /users/{userId} {
+      allow read: if signedIn(); // needed for role lookups (myProfile()) and
+                                  // for chat/directory features that look up
+                                  // other users' display names
+      allow create: if request.auth.uid == userId; // self-registration
+      allow update: if request.auth.uid == userId || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ── LEGACY COLLECTIONS ─────────────────────────────────────────────
+    // These predate real Firebase Auth and don't have per-record owner
+    // fields consistently modeled, so we can't yet do fine-grained
+    // per-user rules here without risking breaking existing features.
+    // The meaningful security win at this stage: NONE of this is
+    // readable/writable by anyone who isn't signed in anymore, closing
+    // off the app to the open internet. Tightening further is future
+    // follow-up work as each area gets its own data-model pass.
+
+    match /nv/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    match /class_chats/{classId} {
+      allow read, write: if signedIn();
+      match /msgs/{msgId} {
+        allow read, write: if signedIn();
+      }
+    }
+
+    match /dm_convs/{convId} {
+      allow read, write: if signedIn();
+      match /msgs/{msgId} {
+        allow read, write: if signedIn();
+      }
+    }
+
+    match /study_groups/{groupId} {
+      allow read, write: if signedIn();
+      match /msgs/{msgId} {
+        allow read, write: if signedIn();
+      }
+    }
+
+    match /research_club/{docId} {
+      allow read, write: if signedIn();
+      match /msgs/{msgId} {
+        allow read, write: if signedIn();
+      }
+    }
+
+    match /research_requests/{reqId} {
+      allow read, write: if signedIn();
+    }
+
+    match /call_signals/{key} {
+      allow read, write: if signedIn();
+    }
+
+    match /group_calls/{roomId} {
+      allow read, write: if signedIn();
+      match /peers/{peerId} {
+        allow read, write: if signedIn();
+      }
+      match /signals/{sigId} {
+        allow read, write: if signedIn();
+      }
+    }
+
+    // ── assignments (existing classId-based homework system) ──────────
+    // Already has real per-student submission docs, so this gets
+    // properly gated rather than just "any signed-in user":
+    match /assignments/{asgnId} {
+      allow read: if signedIn();
+      allow write: if isStaff(); // only lecturers/admin create or edit the assignment itself
+
+      match /submissions/{studentKey} {
+        allow read: if isStaff() ||
+          (signedIn() && resource.data.student == request.auth.token.email);
+        // Student can create their own submission (must match their own
+        // email in the `student` field), ungraded
+        allow create: if signedIn() &&
+          request.resource.data.student == request.auth.token.email &&
+          request.resource.data.grade == null;
+        // Student can resubmit only while ungraded and only their own doc;
+        // staff can always grade/edit
+        allow update: if isStaff() ||
+          (signedIn() && resource.data.student == request.auth.token.email &&
+           resource.data.grade == null && request.resource.data.grade == null);
+        allow delete: if isStaff();
+      }
+    }
+
+    // ── NEW: university-platform course model ──────────────────────────
+    // Not yet used by any app code — rules are ready ahead of the
+    // course/module/lesson build so there's no gap once that ships.
+
+    match /courses/{courseId} {
+      allow read: if true; // public catalog browsing before enrollment
+      allow write: if isAdmin() ||
+        (isLecturer() && resource.data.instructorId == request.auth.uid);
+      allow create: if isAdmin() || isLecturer();
+
+      match /modules/{moduleId} {
+        allow read: if isEnrolledIn(courseId) || isStaff();
+        allow write: if isAdmin() ||
+          (isLecturer() && get(/databases/$(database)/documents/courses/$(courseId)).data.instructorId == request.auth.uid);
+
+        match /lessons/{lessonId} {
+          allow read: if isEnrolledIn(courseId) || isStaff();
+          allow write: if isAdmin() ||
+            (isLecturer() && get(/databases/$(database)/documents/courses/$(courseId)).data.instructorId == request.auth.uid);
+        }
+      }
+    }
+
+    match /enrollments/{enrollId} {
+      allow read: if signedIn() &&
+        (resource.data.userId == request.auth.uid || isStaff());
+      allow create: if signedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'pending_payment';
+      // Payment verification flips status to "active" — must happen via
+      // Admin SDK (Cloud Function or trusted server), never from the client.
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /quizzes/{quizId} {
+      allow read: if isEnrolledIn(resource.data.courseId) || isStaff();
+      allow write: if isStaff();
+    }
+
+    match /quizResults/{resultId} {
+      allow read: if signedIn() &&
+        (resource.data.userId == request.auth.uid || isStaff());
+      allow create: if signedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        isEnrolledIn(request.resource.data.courseId);
+      allow update, delete: if isAdmin();
+    }
+
+    match /grades/{gradeId} {
+      allow read: if signedIn() &&
+        (resource.data.userId == request.auth.uid || isStaff());
+      allow write: if isStaff();
+    }
+  }
+}

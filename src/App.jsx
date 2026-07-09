@@ -1,8 +1,9 @@
 /* @jsxRuntime classic */
 import React, { useState, useEffect, useCallback, useRef, Fragment } from "react";
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, sendPasswordResetEmail, signOut } from "firebase/auth";
+import { doc, setDoc } from "firebase/firestore";
 
-import { auth } from "./config/firebaseClient";
+import { auth, db } from "./config/firebaseClient";
 import { FCM_VAPID_KEY } from "./config/firebase";
 import { EMAILJS_PUBLIC_KEY, EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID } from "./config/keys";
 import { DEFAULT_CLASSES, initData } from "./data/defaults";
@@ -627,7 +628,20 @@ self.addEventListener('notificationclick', e => {
         }
         if (!legacyUser) return toast("Invalid email or password", "error");
         try {
-          await createUserWithEmailAndPassword(auth, username, password);
+          const created = await createUserWithEmailAndPassword(auth, username, password);
+          // Security rules key admin/lecturer checks off users/{uid}.role —
+          // without this doc, a lazily-migrated user would pass auth but
+          // fail every role-gated rule.
+          await setDoc(doc(db, "users", created.user.uid), {
+            username: legacyUser.username,
+            displayName: legacyUser.displayName || legacyUser.username,
+            role: legacyUser.role || "student",
+            class: legacyUser.class || "",
+            isPublicHealth: !!legacyUser.isPublicHealth,
+            matricNumber: legacyUser.matricNumber || "",
+            joined: legacyUser.joined || null,
+            migratedAt: Date.now(),
+          }, { merge: true });
         } catch (createErr) {
           console.warn("[Auth] Lazy account creation failed:", createErr.message);
         }
@@ -706,8 +720,10 @@ self.addEventListener('notificationclick', e => {
     const users = ls("nv-users", []);
     if (users.find(u => u.username === regUser)) return toast("Email already registered", "error");
     if (users.find(u => u.matricNumber && u.matricNumber.toLowerCase() === regMatric.trim().toLowerCase())) return toast("Matric number already registered", "error");
+    let newUid = null;
     try {
-      await createUserWithEmailAndPassword(auth, regUser, regPw);
+      const created = await createUserWithEmailAndPassword(auth, regUser, regPw);
+      newUid = created.user.uid;
     } catch (e) {
       if (e.code === "auth/email-already-in-use") return toast("Email already registered", "error");
       if (e.code === "auth/weak-password") return toast("Password must be at least 6 characters", "error");
@@ -715,7 +731,13 @@ self.addEventListener('notificationclick', e => {
     }
     const isPHN = regStudentType === "phn";
     const assignedClass = isPHN ? "publichealth" : regClass;
-    const newUsers = [...users, { username: regUser, role: "student", class: assignedClass, isPublicHealth: isPHN, displayName: regName.trim(), matricNumber: regMatric.trim().toUpperCase(), joined: new Date().toLocaleDateString() }];
+    const profile = { username: regUser, role: "student", class: assignedClass, isPublicHealth: isPHN, displayName: regName.trim(), matricNumber: regMatric.trim().toUpperCase(), joined: new Date().toLocaleDateString() };
+    try {
+      await setDoc(doc(db, "users", newUid), profile, { merge: true });
+    } catch (e) {
+      console.warn("[Auth] users/{uid} profile write failed:", e.message);
+    }
+    const newUsers = [...users, profile];
     saveShared("users", newUsers);
     setCurrentUserRef(regUser); setCurrentUser(regUser);
     setIsAdmin(false); setIsLecturer(false);
