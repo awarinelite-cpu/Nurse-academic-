@@ -149,9 +149,21 @@ service cloud.firestore {
       allow create: if signedIn() &&
         request.resource.data.userId == request.auth.uid &&
         request.resource.data.status == 'pending_payment';
-      // Payment verification flips status to "active" — must happen via
-      // Admin SDK (Cloud Function or trusted server), never from the client.
-      allow update: if isAdmin();
+      // Ideally payment verification happens server-side (Admin SDK) and
+      // only staff/a trusted backend can flip status to "active". This app
+      // doesn't have a server-verification endpoint yet, and other payment
+      // flows in this codebase (research downloads, NC access codes) also
+      // trust the Paystack client callback directly — so, consistently,
+      // the owner may transition THEIR OWN enrollment pending_payment ->
+      // active exactly once. This does not let anyone create a free
+      // enrollment (create requires pending_payment) or touch someone
+      // else's record. Revisit if/when a server verification endpoint
+      // exists (see services/courses.js enrollment TODO).
+      allow update: if isAdmin() ||
+        (signedIn() && resource.data.userId == request.auth.uid &&
+         resource.data.status == 'pending_payment' &&
+         request.resource.data.status == 'active' &&
+         request.resource.data.userId == request.auth.uid);
       allow delete: if isAdmin();
     }
 

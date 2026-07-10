@@ -11,7 +11,45 @@ import {
 } from "firebase/firestore";
 import { db } from "../config/firebaseClient";
 
-// ── Lecturers (for instructor-assignment dropdowns) ─────────────────
+// ── Enrollments ──────────────────────────────────────────────────────
+// Doc id convention: {uid}_{courseId} — one enrollment per user per course.
+export function enrollmentId(uid, courseId) { return `${uid}_${courseId}`; }
+
+export async function createPendingEnrollment(uid, courseId) {
+  const id = enrollmentId(uid, courseId);
+  await setDoc(doc(db, "enrollments", id), {
+    userId: uid,
+    courseId,
+    status: "pending_payment",
+    enrolledAt: serverTimestamp(),
+  });
+  return id;
+}
+
+// NOTE: this flips status client-side after the Paystack popup reports
+// success — no server-side verification exists yet (see firestore.rules
+// comment on the enrollments match block for why, and what to do if you
+// add one later: research/nursing-council payment flows in this app work
+// the same way today).
+export async function activateEnrollment(uid, courseId, paymentRef) {
+  const id = enrollmentId(uid, courseId);
+  await updateDoc(doc(db, "enrollments", id), {
+    status: "active",
+    paymentRef: paymentRef || null,
+    activatedAt: serverTimestamp(),
+  });
+}
+
+export async function getEnrollment(uid, courseId) {
+  const snap = await getDoc(doc(db, "enrollments", enrollmentId(uid, courseId)));
+  return snap.exists() ? snap.data() : null;
+}
+
+export async function listMyEnrollments(uid) {
+  const q = query(collection(db, "enrollments"), where("userId", "==", uid));
+  const snap = await getDocs(q);
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
 export async function listLecturers() {
   const q = query(collection(db, "users"), where("role", "==", "lecturer"));
   const snap = await getDocs(q);

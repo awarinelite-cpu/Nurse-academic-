@@ -1,9 +1,13 @@
 import { useState, useEffect } from "react";
 import {
-  createCourse, updateCourse, deleteCourse, listCourses, listLecturers,
+  createCourse, updateCourse, deleteCourse, listCourses, listLecturers, getCourse,
   createModule, updateModule, deleteModule, subscribeModules,
   createLesson, updateLesson, deleteLesson, subscribeLessons,
+  subscribeCourses, createPendingEnrollment, activateEnrollment, getEnrollment,
 } from "../../services/courses";
+import { auth } from "../../config/firebaseClient";
+import { loadPaystack } from "../../services/paystackService";
+import { PAYSTACK_PUBLIC_KEY } from "../../config/keys";
 
 // ═══════════════════════════════════════════════════════════════════
 // CourseManager — admin/lecturer UI to create and manage courses,
@@ -276,6 +280,231 @@ function LessonManager({ courseId, moduleId, toast }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CourseCatalog — student-facing browse view. Published courses only.
+// ═══════════════════════════════════════════════════════════════════
+export function CourseCatalog({ toast }) {
+  const [courses, setCourses] = useState([]);
+  const [openCourseId, setOpenCourseId] = useState(null);
+
+  useEffect(() => {
+    const unsub = subscribeCourses(setCourses, { publishedOnly: true });
+    return unsub;
+  }, []);
+
+  if (openCourseId) {
+    return <CourseDetail courseId={openCourseId} toast={toast} onBack={() => setOpenCourseId(null)} />;
+  }
+
+  return (
+    <div>
+      <div className="sec-title" style={{ marginBottom: 16 }}>🎓 Course Catalog</div>
+      {courses.length === 0 ? (
+        <div className="card" style={{ textAlign: "center", color: "var(--text3)" }}>No courses available yet — check back soon.</div>
+      ) : (
+        <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))" }}>
+          {courses.map(c => (
+            <div key={c.id} className="card" style={{ cursor: "pointer" }} onClick={() => setOpenCourseId(c.id)}>
+              <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 4 }}>{c.title}</div>
+              <div style={{ fontSize: 12, color: "var(--text3)", marginBottom: 8 }}>{c.instructorName || "Instructor TBA"}</div>
+              {c.description && <div style={{ fontSize: 12.5, marginBottom: 10 }}>{c.description.slice(0, 100)}{c.description.length > 100 ? "…" : ""}</div>}
+              <div style={{ fontWeight: 800, color: "var(--accent)" }}>{c.price > 0 ? `₦${Number(c.price).toLocaleString()}` : "Free"}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CourseDetail — enrollment gate + module/lesson browser for one course.
+// ═══════════════════════════════════════════════════════════════════
+function CourseDetail({ courseId, toast, onBack }) {
+  const [course, setCourse] = useState(null);
+  const [modules, setModules] = useState([]);
+  const [enrollment, setEnrollment] = useState(undefined); // undefined = loading, null = not enrolled
+  const [enrolling, setEnrolling] = useState(false);
+  const [activeLesson, setActiveLesson] = useState(null);
+  const uid = auth.currentUser?.uid;
+
+  useEffect(() => {
+    getCourse(courseId).then(setCourse);
+    const unsub = subscribeModules(courseId, setModules);
+    if (uid) getEnrollment(uid, courseId).then(setEnrollment).catch(() => setEnrollment(null));
+    else setEnrollment(null);
+    return unsub;
+  }, [courseId, uid]);
+
+  const isEnrolled = enrollment?.status === "active";
+  const isPending = enrollment?.status === "pending_payment";
+
+  const enroll = async () => {
+    if (!uid) return toast("Please sign in again", "error");
+    setEnrolling(true);
+    try {
+      await createPendingEnrollment(uid, courseId);
+      await loadPaystack();
+      const handler = window.PaystackPop.setup({
+        key: PAYSTACK_PUBLIC_KEY,
+        email: auth.currentUser.email,
+        amount: Math.round((course.price || 0) * 100), // kobo
+        ref: `enroll_${courseId}_${Date.now()}`,
+        callback: (response) => {
+          activateEnrollment(uid, courseId, response.reference)
+            .then(() => { setEnrollment({ status: "active", paymentRef: response.reference }); toast("🎉 Enrolled!", "success"); })
+            .catch(e => toast("Payment succeeded but enrollment failed to activate: " + e.message, "error"));
+        },
+        onClose: () => setEnrolling(false),
+      });
+      handler.openIframe();
+    } catch (e) {
+      setEnrolling(false);
+      toast("Enrollment failed: " + e.message, "error");
+    }
+  };
+
+  const enrollFree = async () => {
+    if (!uid) return toast("Please sign in again", "error");
+    setEnrolling(true);
+    try {
+      await createPendingEnrollment(uid, courseId);
+      await activateEnrollment(uid, courseId, "free");
+      setEnrollment({ status: "active" });
+      toast("🎉 Enrolled!", "success");
+    } catch (e) {
+      toast("Enrollment failed: " + e.message, "error");
+    } finally {
+      setEnrolling(false);
+    }
+  };
+
+  if (!course) return <div className="card">Loading…</div>;
+
+  if (activeLesson) {
+    return <LessonPlayer lesson={activeLesson} onBack={() => setActiveLesson(null)} courseTitle={course.title} />;
+  }
+
+  return (
+    <div>
+      <button className="btn btn-sm" style={{ marginBottom: 12 }} onClick={onBack}>← Back to catalog</button>
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div style={{ fontWeight: 800, fontSize: 18 }}>{course.title}</div>
+        <div style={{ fontSize: 13, color: "var(--text3)", margin: "4px 0 10px" }}>{course.instructorName || "Instructor TBA"}</div>
+        {course.description && <div style={{ fontSize: 13.5, marginBottom: 12 }}>{course.description}</div>}
+
+        {enrollment === undefined ? null : isEnrolled ? (
+          <div style={{ fontWeight: 700, color: "var(--success)" }}>✅ You're enrolled</div>
+        ) : isPending ? (
+          <button className="btn btn-purple" onClick={enroll} disabled={enrolling}>
+            {enrolling ? "Processing…" : `Finish Payment — ₦${Number(course.price || 0).toLocaleString()}`}
+          </button>
+        ) : course.price > 0 ? (
+          <button className="btn btn-purple" onClick={enroll} disabled={enrolling}>
+            {enrolling ? "Processing…" : `Enroll — ₦${Number(course.price).toLocaleString()}`}
+          </button>
+        ) : (
+          <button className="btn btn-purple" onClick={enrollFree} disabled={enrolling}>
+            {enrolling ? "Enrolling…" : "Enroll — Free"}
+          </button>
+        )}
+      </div>
+
+      <div className="sec-title" style={{ fontSize: 15, marginBottom: 10 }}>Course Content</div>
+      {modules.length === 0 ? (
+        <div style={{ fontSize: 12.5, color: "var(--text3)" }}>No modules published yet.</div>
+      ) : (
+        modules.map(m => (
+          <StudentModuleRow key={m.id} courseId={courseId} module={m} isEnrolled={isEnrolled} onOpenLesson={setActiveLesson} />
+        ))
+      )}
+    </div>
+  );
+}
+
+function StudentModuleRow({ courseId, module: m, isEnrolled, onOpenLesson }) {
+  const [open, setOpen] = useState(false);
+  const [lessons, setLessons] = useState([]);
+
+  useEffect(() => {
+    if (!open) return;
+    const unsub = subscribeLessons(courseId, m.id, setLessons);
+    return unsub;
+  }, [open, courseId, m.id]);
+
+  const typeIcon = { video: "🎬", reading: "📖", live: "🔴" };
+
+  return (
+    <div className="card" style={{ marginBottom: 8, padding: 12 }}>
+      <div style={{ fontWeight: 700, fontSize: 13.5, cursor: "pointer" }} onClick={() => setOpen(o => !o)}>
+        {open ? "▼" : "▶"} {m.title}
+      </div>
+      {open && (
+        <div style={{ marginTop: 8, paddingLeft: 14, borderLeft: "2px solid var(--border,#e5e5e5)" }}>
+          {lessons.length === 0 ? (
+            <div style={{ fontSize: 12, color: "var(--text3)" }}>No lessons yet.</div>
+          ) : lessons.map(l => (
+            <div key={l.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", fontSize: 12.5 }}>
+              <span>{isEnrolled ? "" : "🔒 "}{typeIcon[l.type] || "📄"} {l.title}</span>
+              {isEnrolled ? (
+                <button className="btn btn-sm btn-purple" onClick={() => onOpenLesson(l)}>Open</button>
+              ) : (
+                <span style={{ color: "var(--text3)", fontSize: 11 }}>Enroll to unlock</span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LessonPlayer — renders one lesson: video / reading / live.
+// ═══════════════════════════════════════════════════════════════════
+function LessonPlayer({ lesson, onBack, courseTitle }) {
+  const c = lesson.content || {};
+
+  const renderVideo = (url) => {
+    if (!url) return <div style={{ color: "var(--text3)" }}>No video URL set.</div>;
+    const yt = url.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/))([\w-]{6,})/);
+    if (yt) {
+      return <iframe title={lesson.title} src={`https://www.youtube.com/embed/${yt[1]}`} style={{ width: "100%", aspectRatio: "16/9", border: "none", borderRadius: 10 }} allowFullScreen />;
+    }
+    const vm = url.match(/vimeo\.com\/(\d+)/);
+    if (vm) {
+      return <iframe title={lesson.title} src={`https://player.vimeo.com/video/${vm[1]}`} style={{ width: "100%", aspectRatio: "16/9", border: "none", borderRadius: 10 }} allowFullScreen />;
+    }
+    return <video controls style={{ width: "100%", borderRadius: 10 }} src={url} />;
+  };
+
+  return (
+    <div>
+      <button className="btn btn-sm" style={{ marginBottom: 12 }} onClick={onBack}>← Back to {courseTitle}</button>
+      <div className="card">
+        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 12 }}>{lesson.title}</div>
+
+        {lesson.type === "video" && renderVideo(c.videoUrl)}
+
+        {lesson.type === "reading" && (
+          <div style={{ fontSize: 14, lineHeight: 1.7, whiteSpace: "pre-wrap" }}>{c.textBody || "No content yet."}</div>
+        )}
+
+        {lesson.type === "live" && (
+          <div>
+            {c.scheduledAt && <div style={{ marginBottom: 10, fontSize: 13, color: "var(--text3)" }}>📅 Scheduled: {new Date(c.scheduledAt).toLocaleString()}</div>}
+            {c.liveLink ? (
+              <a href={c.liveLink} target="_blank" rel="noopener noreferrer" className="btn btn-purple" style={{ textDecoration: "none", display: "inline-block" }}>🔴 Join Live Session</a>
+            ) : (
+              <div style={{ color: "var(--text3)" }}>No session link set yet.</div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -18,6 +18,7 @@ import { PaymentHistory, PerformanceAnalytics, StudyTimer, Toasts } from "./comp
 import { CbtExamManager, CbtStudentView } from "./components/exams";
 import { LecturerPanel } from "./components/lecturer";
 import { Messages, Notifications } from "./components/messaging";
+import { CourseCatalog } from "./components/courses";
 import { NursingCouncilSite, NursingExamsStandaloneView, SchoolOnlyPastQuestionsView } from "./components/nursing-council";
 import { DrugGuideView, GPACalc, LabReferenceView, MedCalc, SkillsView } from "./components/reference";
 import { ResearchClub, ResearchRequestPage } from "./components/research";
@@ -828,6 +829,7 @@ self.addEventListener('notificationclick', e => {
       case "study-groups": return <StudyGroups currentUser={currentUser} toast={toast} />;
       case "timetable": return <Timetable currentUser={currentUser} toast={toast} isLecturer={isLecturer||isAdmin} />;
       case "assignments": return <Assignments currentUser={currentUser} toast={toast} isLecturer={isLecturer||isAdmin} />;
+      case "courses": return <CourseCatalog currentUser={currentUser} toast={toast} />;
       case "attendance": return <AttendanceView currentUser={currentUser} toast={toast} isLecturer={isLecturer||isAdmin} />;
       case "leaderboard": return <LeaderboardStreaks currentUser={currentUser} />;
       case "progress": return <ProgressDashboard currentUser={currentUser} />;
@@ -841,6 +843,7 @@ self.addEventListener('notificationclick', e => {
     { icon:"📊", label:"Results", key:"results" },
     ...(!isAdmin ? [{ icon:"🧪", label:"CBT Exams", key:"cbt" }] : []),
     { icon:"🏫", label:"School Past Questions", key:"questions" },
+    { icon:"🎓", label:"Courses", key:"courses" },
     { icon:"🔔", label:"Notifications", key:"notifications" },
     { icon:"💬", label:"Messages", key:"messages" },
     { icon:"🔬", label:"Research Club", key:"research-club" },
