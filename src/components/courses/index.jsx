@@ -8,6 +8,8 @@ import {
 import { auth } from "../../config/firebaseClient";
 import { loadPaystack } from "../../services/paystackService";
 import { PAYSTACK_PUBLIC_KEY } from "../../config/keys";
+import { asgSave, asgSubscribeByCourse, asgSubmit, asgLoadMySubmission, asgLoadSubmissions, asgGrade } from "../../services/backend";
+import { ls } from "../../utils/storage";
 
 // ═══════════════════════════════════════════════════════════════════
 // CourseManager — admin/lecturer UI to create and manage courses,
@@ -20,6 +22,7 @@ export function CourseManager({ toast, currentUser, isAdmin }) {
   const [showModal, setShowModal] = useState(false);
   const [edit, setEdit] = useState(null);
   const [openCourse, setOpenCourse] = useState(null); // courseId whose modules are expanded
+  const [openAssignments, setOpenAssignments] = useState(null); // courseId whose assignments are expanded
 
   const blank = { title: "", description: "", instructorId: "", price: 0, status: "draft" };
   const [form, setForm] = useState(blank);
@@ -100,11 +103,19 @@ export function CourseManager({ toast, currentUser, isAdmin }) {
                   <button className="btn btn-sm" onClick={() => setOpenCourse(openCourse === c.id ? null : c.id)}>
                     {openCourse === c.id ? "▲ Hide" : "▼ Modules"}
                   </button>
+                  <button className="btn btn-sm" onClick={() => setOpenAssignments(openAssignments === c.id ? null : c.id)}>
+                    {openAssignments === c.id ? "▲ Hide" : "📝 Assignments"}
+                  </button>
                   <button className="btn btn-sm" onClick={() => startEdit(c)}>✏️ Edit</button>
                   <button className="btn btn-sm btn-danger" onClick={() => del(c)}>🗑️</button>
                 </div>
               </div>
               {openCourse === c.id && <ModuleManager courseId={c.id} toast={toast} />}
+              {openAssignments === c.id && (
+                <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--border,#eee)" }}>
+                  <CourseAssignments courseId={c.id} currentUser={currentUser} isStaff={true} toast={toast} />
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -383,6 +394,8 @@ function CourseDetail({ courseId, toast, onBack }) {
     }
   };
 
+  const [tab, setTab] = useState("content"); // "content" | "assignments"
+
   if (!course) return <div className="card">Loading…</div>;
 
   if (activeLesson) {
@@ -414,13 +427,29 @@ function CourseDetail({ courseId, toast, onBack }) {
         )}
       </div>
 
-      <div className="sec-title" style={{ fontSize: 15, marginBottom: 10 }}>Course Content</div>
-      {modules.length === 0 ? (
-        <div style={{ fontSize: 12.5, color: "var(--text3)" }}>No modules published yet.</div>
+      {isEnrolled && (
+        <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+          <button className={`btn btn-sm${tab === "content" ? " btn-purple" : ""}`} onClick={() => setTab("content")}>📚 Content</button>
+          <button className={`btn btn-sm${tab === "assignments" ? " btn-purple" : ""}`} onClick={() => setTab("assignments")}>📝 Assignments</button>
+          <button className={`btn btn-sm${tab === "grades" ? " btn-purple" : ""}`} onClick={() => setTab("grades")}>📊 Grades</button>
+        </div>
+      )}
+
+      {tab === "assignments" && isEnrolled ? (
+        <CourseAssignments courseId={courseId} currentUser={auth.currentUser?.email} isStaff={false} toast={toast} />
+      ) : tab === "grades" && isEnrolled ? (
+        <CourseGrades courseId={courseId} currentUser={auth.currentUser?.email} />
       ) : (
-        modules.map(m => (
-          <StudentModuleRow key={m.id} courseId={courseId} module={m} isEnrolled={isEnrolled} onOpenLesson={setActiveLesson} />
-        ))
+        <>
+          <div className="sec-title" style={{ fontSize: 15, marginBottom: 10 }}>Course Content</div>
+          {modules.length === 0 ? (
+            <div style={{ fontSize: 12.5, color: "var(--text3)" }}>No modules published yet.</div>
+          ) : (
+            modules.map(m => (
+              <StudentModuleRow key={m.id} courseId={courseId} module={m} isEnrolled={isEnrolled} onOpenLesson={setActiveLesson} />
+            ))
+          )}
+        </>
       )}
     </div>
   );
@@ -504,6 +533,236 @@ function LessonPlayer({ lesson, onBack, courseTitle }) {
             )}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CourseAssignments — reuses the existing classId-scoped assignment
+// backend (asgSave/asgSubmit/asgGrade etc.), filtered by courseId
+// instead. Same submission/grading logic, just a different scope.
+// ═══════════════════════════════════════════════════════════════════
+export function CourseAssignments({ courseId, currentUser, isStaff, toast }) {
+  const [assignments, setAssignments] = useState([]);
+  const [selAsgn, setSelAsgn] = useState(null);
+  const [submissions, setSubmissions] = useState([]);
+  const [mySubmission, setMySubmission] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ title: "", desc: "", dueAt: "", maxScore: 100 });
+  const [uploading, setUploading] = useState(false);
+  const [gradingId, setGradingId] = useState(null);
+  const [gradeForm, setGradeForm] = useState({ grade: "", feedback: "" });
+  const allUsers = ls("nv-users", []);
+
+  useEffect(() => {
+    const unsub = asgSubscribeByCourse(courseId, setAssignments);
+    return () => unsub();
+  }, [courseId]);
+
+  useEffect(() => {
+    if (!selAsgn) return;
+    if (isStaff) asgLoadSubmissions(selAsgn.id).then(setSubmissions);
+    else asgLoadMySubmission(selAsgn.id, currentUser).then(setMySubmission);
+  }, [selAsgn?.id, isStaff]);
+
+  const createAsgn = async () => {
+    if (!form.title.trim()) return toast("Title required", "error");
+    if (!form.dueAt) return toast("Due date required", "error");
+    const id = "asgn_" + Date.now();
+    const asgn = { id, courseId, title: form.title.trim(), desc: form.desc.trim(), dueAt: new Date(form.dueAt).getTime(), maxScore: +form.maxScore || 100, createdBy: currentUser, createdAt: Date.now() };
+    const ok = await asgSave(asgn);
+    if (ok) { toast("Assignment posted ✅", "success"); setShowForm(false); setForm({ title: "", desc: "", dueAt: "", maxScore: 100 }); }
+    else toast("Failed to post", "error");
+  };
+
+  const submitWork = async (asgn) => {
+    const input = document.createElement("input"); input.type = "file"; input.accept = ".pdf,.doc,.docx,.png,.jpg,.txt";
+    input.onchange = async (e) => {
+      const file = e.target.files[0]; if (!file) return;
+      if (file.size > 2 * 1024 * 1024) return toast("File too large — max 2MB", "error");
+      setUploading(true);
+      const reader = new FileReader();
+      reader.onload = async (ev) => {
+        const ok = await asgSubmit(asgn.id, currentUser, ev.target.result, file.name);
+        if (ok) { toast("Submitted ✅", "success"); asgLoadMySubmission(asgn.id, currentUser).then(setMySubmission); }
+        else toast("Submit failed", "error");
+        setUploading(false);
+      };
+      reader.readAsDataURL(file);
+    };
+    input.click();
+  };
+
+  const saveGrade = async () => {
+    if (!gradeForm.grade) return toast("Enter a grade", "error");
+    const ok = await asgGrade(selAsgn.id, gradingId, +gradeForm.grade, gradeForm.feedback);
+    if (ok) { toast("Graded ✅", "success"); asgLoadSubmissions(selAsgn.id).then(setSubmissions); setGradingId(null); }
+  };
+
+  const statusOf = (a) => {
+    const now = Date.now();
+    if (now > a.dueAt) return { label: "Overdue", color: "var(--danger)" };
+    if (a.dueAt - now < 86400000) return { label: "Due soon", color: "var(--warn)" };
+    return { label: "Open", color: "var(--success)" };
+  };
+
+  if (selAsgn) {
+    const st = statusOf(selAsgn);
+    return (
+      <div>
+        <button className="btn btn-sm" style={{ marginBottom: 12 }} onClick={() => { setSelAsgn(null); setSubmissions([]); setMySubmission(null); }}>← Back to assignments</button>
+        <div className="card" style={{ marginBottom: 14 }}>
+          <div style={{ fontWeight: 800, fontSize: 16 }}>{selAsgn.title}</div>
+          <div style={{ fontSize: 13, color: "var(--text2)", margin: "8px 0" }}>{selAsgn.desc}</div>
+          <div style={{ fontSize: 12, color: st.color, fontWeight: 700 }}>{st.label} — due {new Date(selAsgn.dueAt).toLocaleString()} • Max score {selAsgn.maxScore}</div>
+        </div>
+
+        {isStaff ? (
+          <div>
+            <div style={{ fontWeight: 800, marginBottom: 10 }}>Submissions ({submissions.length})</div>
+            {submissions.length === 0 && <div style={{ textAlign: "center", padding: 20, color: "var(--text3)" }}>No submissions yet</div>}
+            {submissions.map(sub => (
+              <div key={sub.student} className="card" style={{ marginBottom: 8, padding: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>{allUsers.find(u => u.username === sub.student)?.displayName || sub.student}</div>
+                  {sub.grade != null ? <span style={{ fontWeight: 800, color: "var(--success)" }}>{sub.grade}/{selAsgn.maxScore}</span> :
+                    <button className="btn btn-sm btn-purple" onClick={() => { setGradingId(sub.student); setGradeForm({ grade: "", feedback: "" }); }}>Grade</button>}
+                </div>
+                <a href={sub.fileData} download={sub.fileName} style={{ fontSize: 12, color: "var(--accent)" }}>📎 {sub.fileName}</a>
+                {gradingId === sub.student && (
+                  <div style={{ marginTop: 8 }}>
+                    <input className="inp" type="number" placeholder={`Grade (out of ${selAsgn.maxScore})`} value={gradeForm.grade} onChange={e => setGradeForm(f => ({ ...f, grade: e.target.value }))} />
+                    <textarea className="inp" placeholder="Feedback (optional)" value={gradeForm.feedback} onChange={e => setGradeForm(f => ({ ...f, feedback: e.target.value }))} />
+                    <button className="btn btn-sm btn-purple" onClick={saveGrade}>Save Grade</button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="card">
+            {mySubmission ? (
+              <div>
+                <div style={{ fontSize: 13 }}>✅ Submitted: <a href={mySubmission.fileData} download={mySubmission.fileName}>{mySubmission.fileName}</a></div>
+                {mySubmission.grade != null && <div style={{ marginTop: 8, fontWeight: 800, color: "var(--success)" }}>Grade: {mySubmission.grade}/{selAsgn.maxScore}</div>}
+                {mySubmission.feedback && <div style={{ fontSize: 12.5, color: "var(--text3)", marginTop: 4 }}>💬 {mySubmission.feedback}</div>}
+              </div>
+            ) : (
+              <button className="btn btn-purple" onClick={() => submitWork(selAsgn)} disabled={uploading}>{uploading ? "Uploading…" : "📎 Submit Work"}</button>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {isStaff && (
+        <div style={{ marginBottom: 12 }}>
+          {!showForm ? <button className="btn btn-sm btn-purple" onClick={() => setShowForm(true)}>+ New Assignment</button> : (
+            <div className="card">
+              <input className="inp" placeholder="Title" value={form.title} onChange={e => setForm(f => ({ ...f, title: e.target.value }))} />
+              <textarea className="inp" placeholder="Description" value={form.desc} onChange={e => setForm(f => ({ ...f, desc: e.target.value }))} />
+              <input className="inp" type="datetime-local" value={form.dueAt} onChange={e => setForm(f => ({ ...f, dueAt: e.target.value }))} />
+              <input className="inp" type="number" placeholder="Max score" value={form.maxScore} onChange={e => setForm(f => ({ ...f, maxScore: e.target.value }))} />
+              <div style={{ display: "flex", gap: 6 }}>
+                <button className="btn btn-sm btn-purple" onClick={createAsgn}>Post</button>
+                <button className="btn btn-sm" onClick={() => setShowForm(false)}>Cancel</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {assignments.length === 0 ? (
+        <div style={{ fontSize: 12.5, color: "var(--text3)" }}>No assignments posted yet.</div>
+      ) : assignments.map(a => {
+        const st = statusOf(a);
+        return (
+          <div key={a.id} className="card" style={{ marginBottom: 8, padding: 12, cursor: "pointer" }} onClick={() => setSelAsgn(a)}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <div style={{ fontWeight: 700, fontSize: 13.5 }}>{a.title}</div>
+              <span style={{ fontSize: 11, fontWeight: 700, color: st.color }}>{st.label}</span>
+            </div>
+            <div style={{ fontSize: 11.5, color: "var(--text3)" }}>Due {new Date(a.dueAt).toLocaleDateString()}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CourseGrades — student's own grade summary for one course, built
+// from graded assignment submissions. Computes a simple percentage
+// and letter grade. (Quiz results aren't factored in yet — no
+// course-scoped quiz system has been built, only the assignment one.)
+// ═══════════════════════════════════════════════════════════════════
+export function CourseGrades({ courseId, currentUser }) {
+  const [rows, setRows] = useState(null); // null = loading
+
+  useEffect(() => {
+    let cancelled = false;
+    const unsub = asgSubscribeByCourse(courseId, async (assignments) => {
+      const withGrades = await Promise.all(assignments.map(async a => {
+        const sub = await asgLoadMySubmission(a.id, currentUser).catch(() => null);
+        return { ...a, grade: sub?.grade ?? null, feedback: sub?.feedback || "" };
+      }));
+      if (!cancelled) setRows(withGrades);
+    });
+    return () => { cancelled = true; unsub(); };
+  }, [courseId, currentUser]);
+
+  if (rows === null) return <div className="card">Loading grades…</div>;
+
+  const graded = rows.filter(r => r.grade != null);
+  const totalEarned = graded.reduce((s, r) => s + Number(r.grade), 0);
+  const totalPossible = graded.reduce((s, r) => s + Number(r.maxScore || 100), 0);
+  const pct = totalPossible > 0 ? (totalEarned / totalPossible) * 100 : null;
+
+  const letterFor = (p) => {
+    if (p == null) return "—";
+    if (p >= 70) return "A";
+    if (p >= 60) return "B";
+    if (p >= 50) return "C";
+    if (p >= 45) return "D";
+    return "F";
+  };
+  const gpaFor = (p) => {
+    if (p == null) return "—";
+    if (p >= 70) return "5.0";
+    if (p >= 60) return "4.0";
+    if (p >= 50) return "3.0";
+    if (p >= 45) return "2.0";
+    return "1.0";
+  };
+
+  return (
+    <div>
+      <div className="card" style={{ marginBottom: 14, textAlign: "center" }}>
+        <div style={{ fontSize: 11, color: "var(--text3)", textTransform: "uppercase", letterSpacing: ".05em" }}>Course Average</div>
+        <div style={{ fontSize: 32, fontWeight: 800, margin: "4px 0" }}>{pct != null ? `${pct.toFixed(1)}%` : "—"}</div>
+        <div style={{ fontSize: 13, color: "var(--text2)" }}>Grade: <b>{letterFor(pct)}</b> • GPA points: <b>{gpaFor(pct)}</b></div>
+        {graded.length < rows.length && <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 6 }}>{rows.length - graded.length} assignment(s) not yet graded — excluded from average</div>}
+      </div>
+
+      {rows.length === 0 ? (
+        <div style={{ fontSize: 12.5, color: "var(--text3)" }}>No assignments in this course yet.</div>
+      ) : rows.map(r => (
+        <div key={r.id} className="card" style={{ marginBottom: 6, padding: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 13 }}>{r.title}</div>
+            {r.feedback && <div style={{ fontSize: 11.5, color: "var(--text3)" }}>💬 {r.feedback}</div>}
+          </div>
+          <div style={{ fontWeight: 800, color: r.grade != null ? "var(--success)" : "var(--text3)" }}>
+            {r.grade != null ? `${r.grade}/${r.maxScore}` : "Ungraded"}
+          </div>
+        </div>
+      ))}
+
+      <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 10, textAlign: "center" }}>
+        GPA scale shown is illustrative (5.0 max, NUC-style) — adjust letterFor()/gpaFor() in CourseGrades to match your institution's actual scale.
       </div>
     </div>
   );

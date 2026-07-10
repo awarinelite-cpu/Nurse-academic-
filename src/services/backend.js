@@ -531,6 +531,11 @@ export const asgSave = async (asgn) => {
 };
 export const asgSubscribe = (classId, onData) =>
   _mkSub(db => db.collection("assignments").where("classId","==",classId).orderBy("dueAt","asc").onSnapshot(snap => onData(snap.docs.map(d=>({id:d.id,...d.data()}))), () => {}));
+// Course-scoped variant — same collection, filtered by courseId instead
+// of classId. Assignment docs can carry either field (or both, though
+// in practice a given assignment is one or the other).
+export const asgSubscribeByCourse = (courseId, onData) =>
+  _mkSub(db => db.collection("assignments").where("courseId","==",courseId).orderBy("dueAt","asc").onSnapshot(snap => onData(snap.docs.map(d=>({id:d.id,...d.data()}))), () => {}));
 export const asgSubmit = async (asgnId, student, fileData, fileName) => {
   const ready = await _loadFirebase(); if (!ready) return false;
   try {
