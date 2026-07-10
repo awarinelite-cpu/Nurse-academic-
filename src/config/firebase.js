@@ -13,8 +13,10 @@
 //  8. Paste each value into the FIREBASE_CONFIG below
 //  9. Redeploy to Render — sync will work immediately!
 //
-// IMPORTANT: After testing, go to Firestore → Rules and set:
-//   allow read, write: if true;   ← keeps it open (fine for internal school use)
+// IMPORTANT: This app previously ran with open Firestore rules
+// (allow read, write: if true). We are migrating to real Firebase
+// Auth + locked-down rules — see firestore.rules and
+// src/config/firebaseClient.js for the new modular SDK setup.
 
 // ── MAIN SITE Firebase config ──────────────────────────────────────────
 export const FIREBASE_CONFIG_MAIN = {

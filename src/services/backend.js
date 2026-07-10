@@ -8,47 +8,36 @@
 // ─────────────────────────────────────────────────────────────────────
 import { useState, useEffect } from "react";
 import { FIREBASE_CONFIG } from "../config/firebase";
+import { compatDb } from "../config/firestoreCompatShim";
 import { ls, lsSet } from "../utils/storage";
 import { DEFAULT_CLASSES, DEFAULT_DRUGS, DEFAULT_LABS, DEFAULT_PQ, DEFAULT_SKILLS, DEFAULT_ANNOUNCEMENTS } from "../data/defaults";
 
-// ── Firebase SDK loader (loaded once from CDN) ──────────────────────
-export let _db = null;           // Firestore instance
-export let _fbReady = false;     // true once SDK is loaded & db initialised
+// ── Firebase SDK loader ──────────────────────────────────────────────
+// Previously loaded firebase-compat from a CDN at runtime. Now the
+// real npm `firebase` package is initialised once in firebaseClient.js
+// at import time, and this just exposes the compat-shaped `_db` that
+// the rest of this file's ~65 call sites already expect.
+export let _db = null;           // Firestore instance (compat-shaped shim)
+export let _fbReady = false;     // true once db is available
 export let _fbReadyPromise = null;
 
 export const _loadFirebase = () => {
   if (_fbReadyPromise) return _fbReadyPromise;
   _fbReadyPromise = new Promise((resolve) => {
-    // Check if already configured
     const cfg = FIREBASE_CONFIG;
     if (!cfg.apiKey || !cfg.projectId) {
-      console.warn("[Firebase] Not configured — fill in FIREBASE_CONFIG in App.jsx");
+      console.warn("[Firebase] Not configured — fill in FIREBASE_CONFIG in config/firebase.js");
       resolve(false); return;
     }
-    // Load Firebase SDKs from CDN
-    const load = (src) => new Promise((res, rej) => {
-      if (document.querySelector(`script[src="${src}"]`)) { res(); return; }
-      const s = document.createElement("script");
-      s.src = src; s.onload = res; s.onerror = rej;
-      document.head.appendChild(s);
-    });
-    Promise.all([
-      load("https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"),
-      load("https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js"),
-    ]).then(() => {
-      try {
-        const app = !window.firebase.apps.length
-          ? window.firebase.initializeApp(cfg)
-          : window.firebase.app();
-        _db = window.firebase.firestore(app);
-        _fbReady = true;
-        console.log("[Firebase] Connected ✅");
-        resolve(true);
-      } catch (e) {
-        console.error("[Firebase] Init failed:", e.message);
-        resolve(false);
-      }
-    }).catch(e => { console.error("[Firebase] SDK load failed:", e.message); resolve(false); });
+    try {
+      _db = compatDb;
+      _fbReady = true;
+      console.log("[Firebase] Connected ✅ (npm modular SDK)");
+      resolve(true);
+    } catch (e) {
+      console.error("[Firebase] Init failed:", e.message);
+      resolve(false);
+    }
   });
   return _fbReadyPromise;
 };
@@ -542,6 +531,11 @@ export const asgSave = async (asgn) => {
 };
 export const asgSubscribe = (classId, onData) =>
   _mkSub(db => db.collection("assignments").where("classId","==",classId).orderBy("dueAt","asc").onSnapshot(snap => onData(snap.docs.map(d=>({id:d.id,...d.data()}))), () => {}));
+// Course-scoped variant — same collection, filtered by courseId instead
+// of classId. Assignment docs can carry either field (or both, though
+// in practice a given assignment is one or the other).
+export const asgSubscribeByCourse = (courseId, onData) =>
+  _mkSub(db => db.collection("assignments").where("courseId","==",courseId).orderBy("dueAt","asc").onSnapshot(snap => onData(snap.docs.map(d=>({id:d.id,...d.data()}))), () => {}));
 export const asgSubmit = async (asgnId, student, fileData, fileName) => {
   const ready = await _loadFirebase(); if (!ready) return false;
   try {

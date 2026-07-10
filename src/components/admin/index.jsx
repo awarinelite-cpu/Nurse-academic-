@@ -9,6 +9,7 @@ import { _h } from "../../shared/deviceFingerprint";
 import { NC_PAPER_TYPES, NC_YEARS, NURSING_EXAM_META, emptyOsce, getYearData, isPaperArchived, setYearPaperData } from "../../shared/ncExamData";
 import { RR_STATUSES } from "../../shared/researchStatuses";
 import { robustParseQuestions } from "../../utils/examParsing";
+import { CourseManager } from "../courses";
 
 export function AdminPanel({ toast, currentUser }) {
   const [tab, setTab] = useState("overview");
@@ -17,6 +18,7 @@ export function AdminPanel({ toast, currentUser }) {
     { key:"overview", label:"📊 Overview" },
     { key:"users", label:"👥 Users" },
     { key:"classes", label:"🏫 Classes" },
+    { key:"courses", label:"🎓 Courses" },
     { key:"drugs", label:"💊 Drugs" },
     { key:"labs", label:"🧪 Labs" },
     { key:"schoolpq", label:"🏫 School Past Questions" },
@@ -46,6 +48,7 @@ export function AdminPanel({ toast, currentUser }) {
       {tab==="overview" && <AdminOverview toast={toast} />}
       {tab==="users" && <AdminUsers toast={toast} currentUser={currentUser} />}
       {tab==="classes" && <AdminClasses toast={toast} />}
+      {tab==="courses" && <CourseManager toast={toast} currentUser={currentUser} isAdmin={true} />}
       {tab==="drugs" && <AdminDrugs toast={toast} />}
       {tab==="labs" && <AdminLabs toast={toast} />}
       {tab==="schoolpq" && <AdminSchoolPQ toast={toast} />}

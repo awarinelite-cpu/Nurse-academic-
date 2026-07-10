@@ -1,6 +1,9 @@
 /* @jsxRuntime classic */
 import React, { useState, useEffect, useCallback, useRef, Fragment } from "react";
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, sendPasswordResetEmail, signOut } from "firebase/auth";
+import { doc, setDoc } from "firebase/firestore";
 
+import { auth, db } from "./config/firebaseClient";
 import { FCM_VAPID_KEY } from "./config/firebase";
 import { EMAILJS_PUBLIC_KEY, EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID } from "./config/keys";
 import { DEFAULT_CLASSES, initData } from "./data/defaults";
@@ -15,6 +18,7 @@ import { PaymentHistory, PerformanceAnalytics, StudyTimer, Toasts } from "./comp
 import { CbtExamManager, CbtStudentView } from "./components/exams";
 import { LecturerPanel } from "./components/lecturer";
 import { Messages, Notifications } from "./components/messaging";
+import { CourseCatalog } from "./components/courses";
 import { NursingCouncilSite, NursingExamsStandaloneView, SchoolOnlyPastQuestionsView } from "./components/nursing-council";
 import { DrugGuideView, GPACalc, LabReferenceView, MedCalc, SkillsView } from "./components/reference";
 import { ResearchClub, ResearchRequestPage } from "./components/research";
@@ -521,14 +525,36 @@ self.addEventListener('notificationclick', e => {
   // ── Forgot Password ──
   const sendResetCode = async () => {
     if (!forgotEmail.trim()) return toast("Enter your email","error");
-    const users = ls("nv-users",[]);
-    const user = users.find(u=>u.username===forgotEmail.trim());
-    if (!user) return toast("No account found with that email","error");
+    const email = forgotEmail.trim();
     setForgotLoading(true);
+
+    // ── Try real Firebase Auth reset first (works on free Spark plan —
+    // no Cloud Function needed. Firebase sends the email and hosts the
+    // reset page itself). Only accounts already migrated to real Auth
+    // will succeed here. ──
+    try {
+      await sendPasswordResetEmail(auth, email);
+      setForgotLoading(false);
+      setForgotMode("sent");
+      toast("📧 Reset link sent! Check your inbox (and spam folder).", "success");
+      return;
+    } catch (e) {
+      if (e.code !== "auth/user-not-found") {
+        setForgotLoading(false);
+        return toast("Couldn't send reset email — check your connection and try again", "error");
+      }
+      // auth/user-not-found → this account hasn't been migrated yet.
+      // Fall through to the legacy code-based flow below, which still
+      // works against the old nv-users array.
+    }
+
+    const users = ls("nv-users",[]);
+    const user = users.find(u=>u.username===email);
+    if (!user) { setForgotLoading(false); return toast("No account found with that email","error"); }
     // Generate 6-digit code and store in backend (10-min expiry)
     const code = String(Math.floor(100000+Math.random()*900000));
     _setResetCode(code);
-    await examBsSet(`reset:${forgotEmail.trim()}`, {code, expires: Date.now()+600000});
+    await examBsSet(`reset:${email}`, {code, expires: Date.now()+600000});
 
     // ── Send real email via EmailJS ──
     const emailConfigured =
@@ -538,7 +564,7 @@ self.addEventListener('notificationclick', e => {
 
     if (emailConfigured) {
       try {
-        await sendResetEmail(forgotEmail.trim(), code);
+        await sendResetEmail(email, code);
         setForgotLoading(false);
         setForgotMode("code");
         toast("📧 Reset code sent! Check your inbox (and spam folder).","success");
@@ -579,9 +605,57 @@ self.addEventListener('notificationclick', e => {
 
   const login = async () => {
     if (!username || !password) return toast("Fill in all fields", "error");
-    // Step 1: Check localStorage instantly (sub 100ms)
+
+    // ── Step 0: verify identity with real Firebase Auth ──────────────
+    // Replaces the old plaintext password comparison. If this account
+    // hasn't been through the migration script yet, fall back to the
+    // legacy check once, then lazily create the real Auth account
+    // using the password they just proved they know — so every
+    // subsequent login goes through the fast, secure path above.
+    try {
+      await signInWithEmailAndPassword(auth, username, password);
+    } catch (e) {
+      if (e.code === "auth/user-not-found") {
+        const localUsers = ls("nv-users", []);
+        let legacyUser = localUsers.find(u => u.username === username && u.password === password);
+        if (!legacyUser) {
+          try {
+            const fresh = await Promise.race([
+              loadShared("users", [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]),
+              new Promise((_,reject) => setTimeout(()=>reject(new Error("timeout")), 4000))
+            ]);
+            legacyUser = (fresh||[]).find(u => u.username === username && u.password === password);
+          } catch {}
+        }
+        if (!legacyUser) return toast("Invalid email or password", "error");
+        try {
+          const created = await createUserWithEmailAndPassword(auth, username, password);
+          // Security rules key admin/lecturer checks off users/{uid}.role —
+          // without this doc, a lazily-migrated user would pass auth but
+          // fail every role-gated rule.
+          await setDoc(doc(db, "users", created.user.uid), {
+            username: legacyUser.username,
+            displayName: legacyUser.displayName || legacyUser.username,
+            role: legacyUser.role || "student",
+            class: legacyUser.class || "",
+            isPublicHealth: !!legacyUser.isPublicHealth,
+            matricNumber: legacyUser.matricNumber || "",
+            joined: legacyUser.joined || null,
+            migratedAt: Date.now(),
+          }, { merge: true });
+        } catch (createErr) {
+          console.warn("[Auth] Lazy account creation failed:", createErr.message);
+        }
+      } else if (e.code === "auth/wrong-password" || e.code === "auth/invalid-credential") {
+        return toast("Invalid email or password", "error");
+      } else {
+        return toast("Login failed — check your connection and try again", "error");
+      }
+    }
+
+    // ── Step 1: check localStorage instantly for profile/role (sub 100ms) ──
     const localUsers = ls("nv-users", []);
-    const localUser = localUsers.find(u => u.username === username && u.password === password);
+    const localUser = localUsers.find(u => u.username === username);
     if (localUser) {
       // Instant login from cache
       if (loginType === "admin" && localUser.role !== "admin" && localUser.role !== "sub-admin") return toast("Not an admin account", "error");
@@ -614,7 +688,7 @@ self.addEventListener('notificationclick', e => {
         loadShared("users", [{username:"admin@gmail.com",password:"admin123",role:"admin",class:"",joined:"System"}]),
         new Promise((_,reject) => setTimeout(()=>reject(new Error("timeout")), 4000))
       ]);
-      const remoteUser = (fresh||[]).find(u => u.username === username && u.password === password);
+      const remoteUser = (fresh||[]).find(u => u.username === username);
       if (!remoteUser) return toast("Invalid email or password", "error");
       if (loginType === "admin" && remoteUser.role !== "admin" && remoteUser.role !== "sub-admin") return toast("Not an admin account", "error");
       setCurrentUserRef(username); setCurrentUser(username);
@@ -637,18 +711,34 @@ self.addEventListener('notificationclick', e => {
     }
   };
 
-  const register = () => {
+  const register = async () => {
     if (!regName.trim()) return toast("Enter your full name", "error");
     if (!regUser || !regPw) return toast("Fill in all fields", "error");
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(regUser)) return toast("Enter a valid email address", "error");
+    if (regPw.length < 6) return toast("Password must be at least 6 characters", "error");
     if (!regMatric.trim()) return toast("Enter your matric number", "error");
     if (regStudentType !== "phn" && !regClass) return toast("Please select your class", "error");
     const users = ls("nv-users", []);
     if (users.find(u => u.username === regUser)) return toast("Email already registered", "error");
     if (users.find(u => u.matricNumber && u.matricNumber.toLowerCase() === regMatric.trim().toLowerCase())) return toast("Matric number already registered", "error");
+    let newUid = null;
+    try {
+      const created = await createUserWithEmailAndPassword(auth, regUser, regPw);
+      newUid = created.user.uid;
+    } catch (e) {
+      if (e.code === "auth/email-already-in-use") return toast("Email already registered", "error");
+      if (e.code === "auth/weak-password") return toast("Password must be at least 6 characters", "error");
+      return toast("Registration failed — check your connection and try again", "error");
+    }
     const isPHN = regStudentType === "phn";
     const assignedClass = isPHN ? "publichealth" : regClass;
-    const newUsers = [...users, { username: regUser, password: regPw, role: "student", class: assignedClass, isPublicHealth: isPHN, displayName: regName.trim(), matricNumber: regMatric.trim().toUpperCase(), joined: new Date().toLocaleDateString() }];
+    const profile = { username: regUser, role: "student", class: assignedClass, isPublicHealth: isPHN, displayName: regName.trim(), matricNumber: regMatric.trim().toUpperCase(), joined: new Date().toLocaleDateString() };
+    try {
+      await setDoc(doc(db, "users", newUid), profile, { merge: true });
+    } catch (e) {
+      console.warn("[Auth] users/{uid} profile write failed:", e.message);
+    }
+    const newUsers = [...users, profile];
     saveShared("users", newUsers);
     setCurrentUserRef(regUser); setCurrentUser(regUser);
     setIsAdmin(false); setIsLecturer(false);
@@ -739,6 +829,7 @@ self.addEventListener('notificationclick', e => {
       case "study-groups": return <StudyGroups currentUser={currentUser} toast={toast} />;
       case "timetable": return <Timetable currentUser={currentUser} toast={toast} isLecturer={isLecturer||isAdmin} />;
       case "assignments": return <Assignments currentUser={currentUser} toast={toast} isLecturer={isLecturer||isAdmin} />;
+      case "courses": return <CourseCatalog currentUser={currentUser} toast={toast} />;
       case "attendance": return <AttendanceView currentUser={currentUser} toast={toast} isLecturer={isLecturer||isAdmin} />;
       case "leaderboard": return <LeaderboardStreaks currentUser={currentUser} />;
       case "progress": return <ProgressDashboard currentUser={currentUser} />;
@@ -752,6 +843,7 @@ self.addEventListener('notificationclick', e => {
     { icon:"📊", label:"Results", key:"results" },
     ...(!isAdmin ? [{ icon:"🧪", label:"CBT Exams", key:"cbt" }] : []),
     { icon:"🏫", label:"School Past Questions", key:"questions" },
+    { icon:"🎓", label:"Courses", key:"courses" },
     { icon:"🔔", label:"Notifications", key:"notifications" },
     { icon:"💬", label:"Messages", key:"messages" },
     { icon:"🔬", label:"Research Club", key:"research-club" },
@@ -801,10 +893,10 @@ self.addEventListener('notificationclick', e => {
             {forgotMode ? (
               <>
                 <div style={{textAlign:"center",marginBottom:16}}>
-                  <div style={{fontSize:32,marginBottom:6}}>{forgotMode==="code"?"🔑":"📧"}</div>
-                  <div style={{fontWeight:800,fontSize:16,marginBottom:4}}>{forgotMode==="code"?"Enter Reset Code":"Reset Password"}</div>
+                  <div style={{fontSize:32,marginBottom:6}}>{forgotMode==="code"?"🔑":forgotMode==="sent"?"✅":"📧"}</div>
+                  <div style={{fontWeight:800,fontSize:16,marginBottom:4}}>{forgotMode==="code"?"Enter Reset Code":forgotMode==="sent"?"Check Your Email":"Reset Password"}</div>
                   <div style={{fontSize:12,color:"var(--text3)"}}>
-                    {forgotMode==="code"?`We sent a 6-digit code to ${forgotEmail}`:"Enter your registered email address"}
+                    {forgotMode==="code"?`We sent a 6-digit code to ${forgotEmail}`:forgotMode==="sent"?`We sent a password reset link to ${forgotEmail}. Click the link in that email to set a new password, then come back here to sign in.`:"Enter your registered email address"}
                   </div>
                 </div>
                 {forgotMode==="email"&&(
@@ -814,7 +906,7 @@ self.addEventListener('notificationclick', e => {
                       onChange={e=>setForgotEmail(e.target.value)}
                       onKeyDown={e=>e.key==="Enter"&&sendResetCode()} />
                     <button className="btn-primary" onClick={sendResetCode} disabled={forgotLoading}>
-                      {forgotLoading?"📤 Sending...":"📧 Send Reset Code"}
+                      {forgotLoading?"📤 Sending...":"📧 Send Reset Link"}
                     </button>
                   </>
                 )}
@@ -947,7 +1039,7 @@ self.addEventListener('notificationclick', e => {
         runSync={runSync}
         syncing={syncing}
         syncError={syncError}
-        onSignOut={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);lsSet("nv-session-user","");lsSet("nv-session-page","auth");lsSet("nv-session-admin",false);lsSet("nv-session-lecturer",false);}}
+        onSignOut={()=>{signOut(auth).catch(()=>{});setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);lsSet("nv-session-user","");lsSet("nv-session-page","auth");lsSet("nv-session-admin",false);lsSet("nv-session-lecturer",false);}}
       />
     );
   }
@@ -1048,7 +1140,7 @@ self.addEventListener('notificationclick', e => {
             <div className="nav-item" style={{color:"#7bc950",background:"rgba(90,158,53,.15)",borderRadius:9,marginBottom:4}} onClick={switchToNursing}>
               <span className="nav-icon">🏛️</span>NC Exam Centre
             </div>
-            <div className="nav-item" style={{color:"var(--danger)",marginBottom:12}} onClick={()=>{setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);setNavHistory([]);lsSet("nv-session-user","");lsSet("nv-session-page","auth");lsSet("nv-session-admin",false);lsSet("nv-session-lecturer",false);}}>
+            <div className="nav-item" style={{color:"var(--danger)",marginBottom:12}} onClick={()=>{signOut(auth).catch(()=>{});setPage("auth");setCurrentUser("");setIsAdmin(false);setIsLecturer(false);setNavHistory([]);lsSet("nv-session-user","");lsSet("nv-session-page","auth");lsSet("nv-session-admin",false);lsSet("nv-session-lecturer",false);}}>
               <span className="nav-icon">🚪</span>Sign Out
             </div>
 
