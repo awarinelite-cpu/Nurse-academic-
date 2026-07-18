@@ -9,7 +9,10 @@ import {
   collection, doc, addDoc, setDoc, updateDoc, deleteDoc, getDoc, getDocs,
   query, where, orderBy, onSnapshot, serverTimestamp,
 } from "firebase/firestore";
-import { db } from "../config/firebaseClient";
+import { getFunctions, httpsCallable } from "firebase/functions";
+import { db, app } from "../config/firebaseClient";
+
+const functions = getFunctions(app);
 
 // ── Enrollments ──────────────────────────────────────────────────────
 // Doc id convention: {uid}_{courseId} — one enrollment per user per course.
@@ -26,18 +29,29 @@ export async function createPendingEnrollment(uid, courseId) {
   return id;
 }
 
-// NOTE: this flips status client-side after the Paystack popup reports
-// success — no server-side verification exists yet (see firestore.rules
-// comment on the enrollments match block for why, and what to do if you
-// add one later: research/nursing-council payment flows in this app work
-// the same way today).
-export async function activateEnrollment(uid, courseId, paymentRef) {
-  const id = enrollmentId(uid, courseId);
-  await updateDoc(doc(db, "enrollments", id), {
-    status: "active",
-    paymentRef: paymentRef || null,
-    activatedAt: serverTimestamp(),
-  });
+// Activation is verified server-side: this calls the
+// verifyEnrollmentPayment Cloud Function, which checks the transaction
+// with Paystack directly (secret key never touches the client) before
+// using the Admin SDK to flip the enrollment to "active". The client
+// can no longer set status to "active" itself (see firestore.rules).
+//
+// "free" enrollments (course.price === 0) skip Paystack entirely and
+// are activated by the function without a verify call — see the
+// isFreeEnrollment path in enrollFree() below.
+export async function activateEnrollment(courseId, paymentRef) {
+  const verify = httpsCallable(functions, "verifyEnrollmentPayment");
+  const { data } = await verify({ courseId, reference: paymentRef });
+  return data; // { status: "active", alreadyActive: bool }
+}
+
+// Free courses don't go through Paystack — this activates directly via
+// the Cloud Function using a fixed "free" reference the function
+// recognizes as not needing Paystack verification, keeping a single
+// activation code path (and single set of rules) for both cases.
+export async function activateFreeEnrollment(courseId) {
+  const verify = httpsCallable(functions, "verifyFreeEnrollment");
+  const { data } = await verify({ courseId });
+  return data;
 }
 
 export async function getEnrollment(uid, courseId) {

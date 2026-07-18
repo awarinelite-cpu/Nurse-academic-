@@ -3,7 +3,7 @@ import {
   createCourse, updateCourse, deleteCourse, listCourses, listLecturers, getCourse,
   createModule, updateModule, deleteModule, subscribeModules,
   createLesson, updateLesson, deleteLesson, subscribeLessons,
-  subscribeCourses, createPendingEnrollment, activateEnrollment, getEnrollment,
+  subscribeCourses, createPendingEnrollment, activateEnrollment, activateFreeEnrollment, getEnrollment,
 } from "../../services/courses";
 import { auth } from "../../config/firebaseClient";
 import { loadPaystack } from "../../services/paystackService";
@@ -366,9 +366,9 @@ function CourseDetail({ courseId, toast, onBack }) {
         amount: Math.round((course.price || 0) * 100), // kobo
         ref: `enroll_${courseId}_${Date.now()}`,
         callback: (response) => {
-          activateEnrollment(uid, courseId, response.reference)
+          activateEnrollment(courseId, response.reference)
             .then(() => { setEnrollment({ status: "active", paymentRef: response.reference }); toast("🎉 Enrolled!", "success"); })
-            .catch(e => toast("Payment succeeded but enrollment failed to activate: " + e.message, "error"));
+            .catch(e => toast("Payment received, but verification failed: " + e.message + " — contact support with reference " + response.reference, "error"));
         },
         onClose: () => setEnrolling(false),
       });
@@ -384,7 +384,7 @@ function CourseDetail({ courseId, toast, onBack }) {
     setEnrolling(true);
     try {
       await createPendingEnrollment(uid, courseId);
-      await activateEnrollment(uid, courseId, "free");
+      await activateFreeEnrollment(courseId);
       setEnrollment({ status: "active" });
       toast("🎉 Enrolled!", "success");
     } catch (e) {
